@@ -19,7 +19,7 @@ import {
   OBJECT_PUT,
   OBJECT_UPLOAD_PART,
 } from '@sentry/conventions/op';
-import { isObjectLike, SEMANTIC_ATTRIBUTE_SENTRY_ORIGIN, startSpan } from '@sentry/core';
+import { getActiveSpan, isObjectLike, SEMANTIC_ATTRIBUTE_SENTRY_ORIGIN, spanIsSampled, startSpan } from '@sentry/core';
 
 const ORIGIN = 'auto.faas.cloudflare.r2';
 
@@ -72,6 +72,11 @@ function createSpanOptions(bindingName: string, r2Op: R2OperationKey, key?: stri
   };
 }
 
+function isUnsampled(): boolean {
+  const activeSpan = getActiveSpan();
+  return !!activeSpan && !spanIsSampled(activeSpan);
+}
+
 function instrumentR2MultipartUpload(upload: R2MultipartUpload, bindingName: string): R2MultipartUpload {
   const { key } = upload;
 
@@ -81,6 +86,10 @@ function instrumentR2MultipartUpload(upload: R2MultipartUpload, bindingName: str
         const original = Reflect.get(target, prop, receiver);
 
         return function (this: unknown, ...args: Parameters<R2MultipartUpload['uploadPart']>) {
+          if (isUnsampled()) {
+            return Reflect.apply(original, target, args);
+          }
+
           const [partNumber] = args;
           const spanOptions = createSpanOptions(bindingName, 'uploadPart', key);
 
@@ -101,6 +110,10 @@ function instrumentR2MultipartUpload(upload: R2MultipartUpload, bindingName: str
         const original = Reflect.get(target, prop, receiver);
 
         return function (this: unknown) {
+          if (isUnsampled()) {
+            return Reflect.apply(original, target, []);
+          }
+
           return startSpan(createSpanOptions(bindingName, 'abortMultipartUpload', key), () =>
             Reflect.apply(original, target, []),
           );
@@ -111,6 +124,10 @@ function instrumentR2MultipartUpload(upload: R2MultipartUpload, bindingName: str
         const original = Reflect.get(target, prop, receiver);
 
         return function (this: unknown, ...args: Parameters<R2MultipartUpload['complete']>) {
+          if (isUnsampled()) {
+            return Reflect.apply(original, target, args);
+          }
+
           return startSpan(createSpanOptions(bindingName, 'completeMultipartUpload', key), () =>
             Reflect.apply(original, target, args),
           );
@@ -135,6 +152,10 @@ export function instrumentR2Bucket<T extends R2Bucket>(bucket: T, bindingName: s
         const original = Reflect.get(target, prop, receiver);
 
         return function (this: unknown, ...args: Parameters<R2Bucket[typeof prop]>) {
+          if (isUnsampled()) {
+            return Reflect.apply(original, target, args);
+          }
+
           const [key] = args;
 
           return startSpan(createSpanOptions(bindingName, prop, key), () => Reflect.apply(original, target, args));
@@ -145,6 +166,12 @@ export function instrumentR2Bucket<T extends R2Bucket>(bucket: T, bindingName: s
         const original = Reflect.get(target, prop, receiver) as R2Bucket['createMultipartUpload'];
 
         return function (this: unknown, ...args: Parameters<R2Bucket['createMultipartUpload']>) {
+          if (isUnsampled()) {
+            return Reflect.apply(original, target, args).then(upload =>
+              instrumentR2MultipartUpload(upload, bindingName),
+            );
+          }
+
           const [key] = args;
 
           return startSpan(createSpanOptions(bindingName, 'createMultipartUpload', key), async () => {

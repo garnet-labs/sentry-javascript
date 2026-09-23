@@ -1,7 +1,7 @@
 import type { SqlStorage } from '@cloudflare/workers-types';
 import { SENTRY_OP } from '@sentry/conventions/attributes';
 import { DB_QUERY } from '@sentry/conventions/op';
-import { getClient, SEMANTIC_ATTRIBUTE_SENTRY_ORIGIN, startSpan } from '@sentry/core';
+import { getActiveSpan, getClient, SEMANTIC_ATTRIBUTE_SENTRY_ORIGIN, spanIsSampled, startSpan } from '@sentry/core';
 import { getSqlQuerySummary, sanitizeSqlQuery } from '@sentry/server-utils';
 import type { CloudflareClientOptions } from '../client';
 import { targetsCloudflareInternalTable } from '../utils/internalSqlQuery';
@@ -23,6 +23,11 @@ export function instrumentSqlStorage(sql: SqlStorage): SqlStorage {
 
       return function (this: unknown, ...args: unknown[]) {
         const [query, ...bindings] = args as [string, ...unknown[]];
+
+        const activeSpan = getActiveSpan();
+        if (activeSpan && !spanIsSampled(activeSpan)) {
+          return (original as (...a: unknown[]) => ReturnType<SqlStorage['exec']>).apply(target, args);
+        }
 
         const sanitizedQuery = sanitizeSqlQuery(query);
         const querySummary = getSqlQuerySummary(sanitizedQuery);
