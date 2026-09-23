@@ -138,9 +138,6 @@ export const httpIntegration = defineIntegration((options: HttpOptions = {}) => 
       // needed.
       instrumentHttpOutgoingRequests(outgoingRequestOptions);
     },
-    afterAllSetup(client: NodeClient) {
-      server.instrumentServersWithoutDiagnosticsChannel(client);
-    },
     processEvent(event) {
       // Always run this, even if spans are disabled
       // The reason being that e.g. the remix integration disables span
