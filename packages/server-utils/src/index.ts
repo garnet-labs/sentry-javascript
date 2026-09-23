@@ -13,6 +13,8 @@ export type { InstrumentationConfig } from './orchestrion/apmTypes';
 // `orchestrion/bundler/moduleInjectedTransform.ts`); it is a plain runtime
 // helper with no orchestrion build-time dependency.
 export { orchestrionModuleInjected } from './utils/moduleInjected';
+export { subscribe as subscribeDiagnosticsChannel } from './utils/diagnosticsChannel';
+export { instrumentHttpServersOnEmit } from './utils/instrumentHttpServersOnEmit';
 export { eveConversationHook, eveIntegration } from './eve';
 export { getInstrumentedModuleNames } from './orchestrion/config';
 export {

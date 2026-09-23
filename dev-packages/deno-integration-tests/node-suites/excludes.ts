@@ -4,31 +4,17 @@
 // Node-only features: ANR and native thread watchdogs, child process and worker thread breadcrumbs.
 const NODE_ONLY = ['suites/anr/test.ts', 'suites/breadcrumbs/**', 'suites/thread-blocked-native/test.ts'];
 
-// `@sentry/node` instruments `fetch` through undici's diagnostics channels, which Deno's `fetch`
-// does not publish. `@sentry/deno` has its own `fetchIntegration` for this. These suites check
-// spans, breadcrumbs or headers of outgoing `fetch` requests.
-const NO_FETCH_INSTRUMENTATION = [
-  'suites/tracing/double-baggage/**',
-  'suites/tracing/http-client-span-streamed/test.ts',
-  'suites/tracing/http-client-spans/fetch-basic-streamed/test.ts',
-  'suites/tracing/http-client-spans/fetch-basic/test.ts',
-  'suites/tracing/http-client-spans/fetch-error/test.ts',
+// Deno's `fetch` does not use undici, so `nativeNodeFetchIntegration` patches the global `fetch`
+// there. That fallback does not support `requestHook`, `responseHook` and `headersToSpanAttributes`,
+// and its breadcrumb and span data differ from the undici instrumentation in these suites.
+const FETCH_FALLBACK_DIFFERENCES = [
   'suites/tracing/http-client-spans/fetch-forward-request-hook/test.ts',
   'suites/tracing/http-client-spans/fetch-headers-to-span-attributes/test.ts',
   'suites/tracing/http-client-spans/fetch-strip-query/test.ts',
-  'suites/tracing/ignoreSpans-streamed/continued-trace-child/test.ts',
   'suites/tracing/ignoreSpans-streamed/continued-trace-http-client/test.ts',
-  'suites/tracing/ignoreSpans-streamed/continued-trace-segment/test.ts',
-  'suites/tracing/no-parent-span-client-report/test.ts',
   'suites/tracing/requests/fetch-breadcrumbs/test.ts',
   'suites/tracing/requests/fetch-no-trace-propagation/test.ts',
-  'suites/tracing/requests/fetch-no-tracing-no-spans/test.ts',
-  'suites/tracing/requests/fetch-no-tracing/test.ts',
   'suites/tracing/requests/fetch-sampled-no-active-span/test.ts',
-  'suites/tracing/requests/fetch-unsampled/test.ts',
-  'suites/tracing/requests/traceparent/test.ts',
-  'suites/tracing/sample-rand-propagation/test.ts',
-  'suites/tracing/sample-rate-propagation/**',
 ];
 
 // In the ESM tests Deno cannot find `PrismaClient`, a CommonJS export of `@prisma/client`.
@@ -71,7 +57,7 @@ const FLAKY = ['suites/tracing/tracePropagationTargets/**'];
 export const NODE_SUITES_EXCLUDE = [
   '**/node_modules/**',
   ...NODE_ONLY,
-  ...NO_FETCH_INSTRUMENTATION,
+  ...FETCH_FALLBACK_DIFFERENCES,
   ...PRISMA_ESM_INTEROP,
   ...REQUIRE_OF_ESM_ONLY_DEPENDENCY,
   ...NOT_TRIAGED,

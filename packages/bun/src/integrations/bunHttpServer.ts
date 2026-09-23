@@ -1,10 +1,10 @@
 import { errorMonitor } from 'node:events';
-import * as http from 'node:http';
-import * as https from 'node:https';
+import type * as http from 'node:http';
 import type { IntegrationFn, Span } from '@sentry/core';
 import { defineIntegration } from '@sentry/core';
 import type { HttpIncomingMessage, HttpServerResponse } from '@sentry/core/server';
 import { getHttpServerSubscriptions, HTTP_ON_SERVER_REQUEST } from '@sentry/core/server';
+import { instrumentHttpServersOnEmit } from '@sentry/server-utils';
 
 const INTEGRATION_NAME = 'BunHttpServer' as const;
 
@@ -73,8 +73,6 @@ interface BunHttpServerOptions {
   onSpanEnd?: (span: Span, request: HttpIncomingMessage, response: HttpServerResponse) => void;
 }
 
-let hasPatched = false;
-
 const _bunHttpServerIntegration = ((options: BunHttpServerOptions = {}) => {
   return {
     name: INTEGRATION_NAME,
@@ -119,7 +117,7 @@ export const bunHttpServerIntegration = defineIntegration(_bunHttpServerIntegrat
  */
 export function instrumentBunHttpServer(options: BunHttpServerOptions = {}): void {
   // This only makes sense under Bun; on Node the diagnostics channel already handles this.
-  if (!process.versions.bun || hasPatched) {
+  if (!process.versions.bun) {
     return;
   }
 
@@ -130,31 +128,5 @@ export function instrumentBunHttpServer(options: BunHttpServerOptions = {}): voi
     errorMonitor,
   });
 
-  // Track which servers we have already handed to core, so we instrument each server exactly once.
-  // After core instruments a server it installs its own `emit` on the instance, which shadows this
-  // prototype patch for all subsequent requests to that server.
-  const instrumented = new WeakSet<object>();
-
-  const patchEmitOn = (ServerClass: typeof http.Server): void => {
-    // oxlint-disable-next-line typescript/unbound-method
-    const originalEmit = ServerClass.prototype.emit;
-    ServerClass.prototype.emit = function (this: http.Server, event: string, ...args: unknown[]): boolean {
-      if (event === 'request' && !instrumented.has(this)) {
-        instrumented.add(this);
-        // Hand the server to core, which patches this instance's `emit` to isolate requests.
-        onServerRequest({ server: this }, HTTP_ON_SERVER_REQUEST);
-        // Re-dispatch the in-flight request through the instance emit core just installed.
-        return this.emit(event, ...args);
-      }
-      return originalEmit.call(this, event, ...args) as boolean;
-    } as typeof originalEmit;
-  };
-
-  patchEmitOn(http.Server);
-  // In Bun `https.Server` reuses `http.Server`, but patch it explicitly in case that ever diverges.
-  if (https.Server !== http.Server) {
-    patchEmitOn(https.Server);
-  }
-
-  hasPatched = true;
+  instrumentHttpServersOnEmit(server => onServerRequest({ server }, HTTP_ON_SERVER_REQUEST));
 }

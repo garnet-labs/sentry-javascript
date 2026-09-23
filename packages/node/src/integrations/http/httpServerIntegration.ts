@@ -1,10 +1,10 @@
-import { subscribe } from 'node:diagnostics_channel';
 import type { RequestOptions } from 'node:http';
 import { context, createContextKey, propagation } from '@opentelemetry/api';
-import type { Integration, IntegrationFn } from '@sentry/core';
+import type { Client, Integration, IntegrationFn } from '@sentry/core';
 import { addNonEnumerableProperty, debug, getClient } from '@sentry/core';
 import type { HttpIncomingMessage, HttpServerResponse } from '@sentry/core/server';
 import { getHttpServerSubscriptions, HTTP_ON_SERVER_REQUEST, recordRequestSession } from '@sentry/core/server';
+import { instrumentHttpServersOnEmit, subscribeDiagnosticsChannel } from '@sentry/server-utils';
 import type { RequestEventData } from '@sentry/core';
 import { DEBUG_BUILD } from '../../debug-build';
 
@@ -139,11 +139,21 @@ const _httpServerIntegration = ((options: HttpServerIntegrationOptions = {}) => 
     },
   };
 
+  function instrumentServersWithoutDiagnosticsChannel(client: Client): void {
+    // Bun does not publish `http.server.request.start`, so the channel subscription never runs
+    // there. `@sentry/bun` handles this with `bunHttpServerIntegration`, which takes precedence.
+    if (!process.versions.bun || client.getIntegrationByName('BunHttpServer')) {
+      return;
+    }
+    const { [HTTP_ON_SERVER_REQUEST]: onHttpServerRequestStart } = getHttpServerSubscriptions(_options);
+    instrumentHttpServersOnEmit(server => onHttpServerRequestStart({ server }, HTTP_ON_SERVER_REQUEST));
+  }
+
   return {
     name: INTEGRATION_NAME,
     setupOnce() {
       const { [HTTP_ON_SERVER_REQUEST]: onHttpServerRequestStart } = getHttpServerSubscriptions(_options);
-      subscribe(HTTP_ON_SERVER_REQUEST, onHttpServerRequestStart);
+      subscribeDiagnosticsChannel(HTTP_ON_SERVER_REQUEST, onHttpServerRequestStart);
     },
     afterAllSetup(client) {
       if (DEBUG_BUILD && client.getIntegrationByName('Http')) {
@@ -151,7 +161,9 @@ const _httpServerIntegration = ((options: HttpServerIntegrationOptions = {}) => 
           'It seems that you have manually added `httpServerIntegration` while `httpIntegration` is also present. Make sure to remove `httpServerIntegration` when adding `httpIntegration`.',
         );
       }
+      instrumentServersWithoutDiagnosticsChannel(client);
     },
+    instrumentServersWithoutDiagnosticsChannel,
   };
 }) satisfies IntegrationFn;
 
@@ -168,4 +180,9 @@ export const httpServerIntegration = _httpServerIntegration as (
 ) => Integration & {
   name: 'Http.Server';
   setupOnce: () => void;
+  /**
+   * Instruments incoming requests on runtimes without the `http.server.request.start` diagnostics
+   * channel (Bun). `httpIntegration` calls it, because it runs this integration's `setupOnce` only.
+   */
+  instrumentServersWithoutDiagnosticsChannel: (client: Client) => void;
 };

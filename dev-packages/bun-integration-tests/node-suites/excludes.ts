@@ -12,44 +12,19 @@ const NODE_ONLY = [
   'suites/tracing/flue/test.ts',
 ];
 
-// Bun does not publish `http.server.request.start`, so `@sentry/node` creates no `http.server`
-// span and does not isolate incoming requests. `@sentry/bun` has `bunHttpServerIntegration` for this.
-const NO_HTTP_SERVER_SPANS = [
-  'suites/sessions/**',
-  'suites/tracing/envelope-header/sampleRate-propagation/test.ts',
-  'suites/tracing/httpIntegration-streamed/test.ts',
-  'suites/tracing/httpIntegration/test.ts',
-  'suites/tracing/httpServerSpans-streamed-unrouted/test.ts',
-  'suites/tracing/ignoreSpans-streamed/**',
-  'suites/tracing/meta-tags-twp-errors/test.ts',
-  'suites/tracing/meta-tags/test.ts',
-  'suites/tracing/requestData-streamed/test.ts',
-  'suites/tracing/sample-rand-propagation/test.ts',
-  'suites/tracing/sample-rate-propagation/**',
-  'suites/tracing/sampling-static/test.ts',
-  'suites/tracing/sampling-streamed/test.ts',
-  'suites/tracing/traceid-recycling-with-spans/test.ts',
-  'suites/tracing/traceid-recycling/test.ts',
-];
-
-// `@sentry/node` instruments `fetch` through undici's diagnostics channels, which Bun's `fetch`
-// does not publish. `@sentry/bun` has its own `fetchIntegration` for this.
-const NO_FETCH_INSTRUMENTATION = [
-  'suites/tracing/double-baggage/**',
-  'suites/tracing/http-client-span-streamed/test.ts',
-  'suites/tracing/http-client-spans/fetch-basic-streamed/test.ts',
-  'suites/tracing/http-client-spans/fetch-basic/test.ts',
-  'suites/tracing/http-client-spans/fetch-error/test.ts',
+// Bun's `fetch` does not use undici, so `nativeNodeFetchIntegration` patches the global `fetch`
+// there. That fallback does not support `requestHook`, `responseHook` and `headersToSpanAttributes`,
+// and its breadcrumb and span data differ from the undici instrumentation in these suites. Some of
+// them also send outgoing `node:http` requests (JS-3507).
+const FETCH_FALLBACK_DIFFERENCES = [
+  'suites/tracing/double-baggage/spans-parent/test.ts',
   'suites/tracing/http-client-spans/fetch-forward-request-hook/test.ts',
   'suites/tracing/http-client-spans/fetch-headers-to-span-attributes/test.ts',
   'suites/tracing/http-client-spans/fetch-strip-query/test.ts',
   'suites/tracing/no-parent-span-client-report/test.ts',
   'suites/tracing/requests/fetch-breadcrumbs/test.ts',
   'suites/tracing/requests/fetch-no-trace-propagation/test.ts',
-  'suites/tracing/requests/fetch-no-tracing-no-spans/test.ts',
-  'suites/tracing/requests/fetch-no-tracing/test.ts',
   'suites/tracing/requests/fetch-sampled-no-active-span/test.ts',
-  'suites/tracing/requests/fetch-unsampled/test.ts',
   'suites/tracing/requests/traceparent/test.ts',
 ];
 
@@ -75,6 +50,7 @@ const NO_OUTGOING_HTTP_INSTRUMENTATION = [
 // See https://github.com/getsentry/sentry-javascript/issues/23882
 const NO_AUTO_INSTRUMENTATION = [
   'suites/express/**',
+  'suites/tracing/httpIntegration-streamed/test.ts',
   'suites/fs-instrumentation/test.ts',
   'suites/hono-sdk/test.ts',
   'suites/pino/test.ts',
@@ -136,13 +112,15 @@ const NO_AUTO_INSTRUMENTATION = [
 
 // Fail on Bun, cause not investigated yet. `system-error` and `tracer-start-active-span-error`
 // fail on Bun 1.3.14 and pass on Bun 1.4.2. With the `@sentry/bun` alias, `system-error` also
-// fails because `@sentry/bun` does not include `nodeSystemErrorIntegration`.
+// fails because `@sentry/bun` does not include `nodeSystemErrorIntegration`. In `httpIntegration`
+// the outgoing request tests fail (JS-3507), and the tests that overwrite `server.emit` time out.
 const NOT_TRIAGED = [
   'suites/contextLines/filename-with-spaces/test.ts',
   'suites/modules/test.ts',
-  'suites/proxy/test.ts',
   'suites/system-error/test.ts',
+  'suites/tracing/graphql-tracing-channel/**',
   'suites/tracing/tracer-start-active-span-error/test.ts',
+  'suites/tracing/traceid-recycling-with-spans/test.ts',
 ];
 
 // Bun garbage-collects a diagnostics channel that no code references, and its subscribers with it.
@@ -153,10 +131,10 @@ const CHANNEL_GARBAGE_COLLECTED = ['suites/tracing/graphql-tracing-channel/**'];
 export const NODE_SUITES_EXCLUDE = [
   '**/node_modules/**',
   ...NODE_ONLY,
-  ...NO_HTTP_SERVER_SPANS,
-  ...NO_FETCH_INSTRUMENTATION,
+  ...FETCH_FALLBACK_DIFFERENCES,
   ...NO_OUTGOING_HTTP_INSTRUMENTATION,
   ...NO_AUTO_INSTRUMENTATION,
   ...NOT_TRIAGED,
   ...CHANNEL_GARBAGE_COLLECTED,
 ];
+
