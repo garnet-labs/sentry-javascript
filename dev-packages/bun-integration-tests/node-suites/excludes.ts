@@ -12,20 +12,27 @@ const NODE_ONLY = [
   'suites/tracing/flue/test.ts',
 ];
 
-// Bun's `fetch` does not use undici, so `nativeNodeFetchIntegration` patches the global `fetch`
-// there. That fallback does not support `requestHook`, `responseHook` and `headersToSpanAttributes`,
-// and its breadcrumb and span data differ from the undici instrumentation in these suites. Some of
-// them also send outgoing `node:http` requests (JS-3507).
-const FETCH_FALLBACK_DIFFERENCES = [
-  'suites/tracing/double-baggage/spans-parent/test.ts',
+// `@sentry/node` instruments `fetch` through undici's diagnostics channels, which Bun's `fetch`
+// does not publish. `@sentry/bun` has its own `fetchIntegration` for this.
+const NO_FETCH_INSTRUMENTATION = [
+  'suites/tracing/double-baggage/**',
+  'suites/tracing/http-client-span-streamed/test.ts',
+  'suites/tracing/http-client-spans/fetch-basic-streamed/test.ts',
+  'suites/tracing/http-client-spans/fetch-basic/test.ts',
+  'suites/tracing/http-client-spans/fetch-error/test.ts',
   'suites/tracing/http-client-spans/fetch-forward-request-hook/test.ts',
   'suites/tracing/http-client-spans/fetch-headers-to-span-attributes/test.ts',
   'suites/tracing/http-client-spans/fetch-strip-query/test.ts',
   'suites/tracing/no-parent-span-client-report/test.ts',
   'suites/tracing/requests/fetch-breadcrumbs/test.ts',
   'suites/tracing/requests/fetch-no-trace-propagation/test.ts',
+  'suites/tracing/requests/fetch-no-tracing-no-spans/test.ts',
+  'suites/tracing/requests/fetch-no-tracing/test.ts',
   'suites/tracing/requests/fetch-sampled-no-active-span/test.ts',
+  'suites/tracing/requests/fetch-unsampled/test.ts',
   'suites/tracing/requests/traceparent/test.ts',
+  'suites/tracing/sample-rand-propagation/test.ts',
+  'suites/tracing/sample-rate-propagation/**',
 ];
 
 // Bun 1.3.14 (the CI version) does not instrument outgoing `node:http` requests. These suites pass
@@ -131,7 +138,7 @@ const CHANNEL_GARBAGE_COLLECTED = ['suites/tracing/graphql-tracing-channel/**'];
 export const NODE_SUITES_EXCLUDE = [
   '**/node_modules/**',
   ...NODE_ONLY,
-  ...FETCH_FALLBACK_DIFFERENCES,
+  ...NO_FETCH_INSTRUMENTATION,
   ...NO_OUTGOING_HTTP_INSTRUMENTATION,
   ...NO_AUTO_INSTRUMENTATION,
   ...NOT_TRIAGED,

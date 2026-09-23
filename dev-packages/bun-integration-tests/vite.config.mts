@@ -72,11 +72,6 @@ export default defineConfig({
             'suites/public-api/logs/test.ts',
             // `@sentry/bun` has `bunRuntimeMetricsIntegration` instead of `nodeRuntimeMetricsIntegration`.
             'suites/node-runtime-metrics/test.ts',
-            // `@sentry/bun` instruments `fetch` with its own `fetchIntegration`, which uses another span
-            // origin, and it does not export `nativeNodeFetchIntegration`.
-            'suites/tracing/http-client-spans/fetch-basic/test.ts',
-            'suites/tracing/http-client-spans/fetch-error/test.ts',
-            'suites/tracing/requests/fetch-no-tracing-no-spans/test.ts',
           ],
           env: {
             RUNTIME: 'bun',
