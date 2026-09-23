@@ -162,6 +162,11 @@ export const NODE_SUITES_EXCLUDE = [
 // they wait until their module loads.
 const BUN_BUILD_EAGER_SUBSCRIPTION = ['suites/tracing/orchestrion-lazy-registration/test.ts'];
 
+// The first `init()` has no DSN, so `bunHttpServerIntegration` is not set up, and the suite then
+// adds only `httpIntegration`. On Bun that does not isolate requests, because Bun does not publish
+// `http.server.request.start`.
+const BUN_BUILD_NO_HTTP_SERVER_INTEGRATION = ['suites/express/multiple-init/test.ts'];
+
 // Some or all tests fail with the bundled scenarios, cause not investigated yet. In
 // `express/tracing` only the request data tests fail: they set `httpIntegration` options, and with
 // `@sentry/bun` the request body comes from `bunHttpServerIntegration`.
@@ -194,4 +199,9 @@ const BUN_BUILD_NOT_TRIAGED = [
   'suites/tracing/vercelai/v6_v7/test.ts',
 ];
 
-export const BUN_BUILD_EXCLUDE = ['**/node_modules/**', ...BUN_BUILD_EAGER_SUBSCRIPTION, ...BUN_BUILD_NOT_TRIAGED];
+export const BUN_BUILD_EXCLUDE = [
+  '**/node_modules/**',
+  ...BUN_BUILD_EAGER_SUBSCRIPTION,
+  ...BUN_BUILD_NO_HTTP_SERVER_INTEGRATION,
+  ...BUN_BUILD_NOT_TRIAGED,
+];
