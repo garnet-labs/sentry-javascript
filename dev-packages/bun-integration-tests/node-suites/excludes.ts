@@ -120,7 +120,8 @@ const NO_AUTO_INSTRUMENTATION = [
 // Fail on Bun, cause not investigated yet. `system-error` and `tracer-start-active-span-error`
 // fail on Bun 1.3.14 and pass on Bun 1.4.2. With the `@sentry/bun` alias, `system-error` also
 // fails because `@sentry/bun` does not include `nodeSystemErrorIntegration`. In `httpIntegration`
-// the outgoing request tests fail (JS-3507), and the tests that overwrite `server.emit` time out.
+// the outgoing request tests fail for the reason of `NO_OUTGOING_HTTP_INSTRUMENTATION`, and the
+// tests that overwrite `server.emit` time out.
 const NOT_TRIAGED = [
   'suites/contextLines/filename-with-spaces/test.ts',
   'suites/modules/test.ts',
