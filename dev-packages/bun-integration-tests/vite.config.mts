@@ -85,7 +85,8 @@ export default defineConfig({
         test: {
           ...nodeSuitesTest,
           // The auto-instrumentation suites, with each scenario bundled by `@sentry/bun/plugin` before
-          // it starts, as Bun apps must be built to get these spans (JS-3508).
+          // it starts, as Bun apps must be built to get these spans.
+          // See https://github.com/getsentry/sentry-javascript/issues/23882
           name: 'node-suites-bun-build',
           include: NO_AUTO_INSTRUMENTATION.map(glob => (glob.endsWith('/**') ? `${glob}/test.ts` : glob)),
           exclude: BUN_BUILD_EXCLUDE,
