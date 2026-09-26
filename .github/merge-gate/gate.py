@@ -135,7 +135,7 @@ def evaluate(profile, ptype):
 def decide(findings, ptype):
     holds = [t for s, t in findings if s == "hold"]
     if ptype != "dependency":
-        return "AUDIT", [], holds
+        return "AUDIT", holds, []
     return ("HOLD", holds, []) if holds else ("MERGE", [], [])
 
 
