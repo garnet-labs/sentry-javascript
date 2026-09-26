@@ -178,3 +178,4 @@ export function ErrorBoundary({ error }: { error: unknown }) {
     </div>
   );
 }
+// Storefront fragments and root loader for the E2E app.

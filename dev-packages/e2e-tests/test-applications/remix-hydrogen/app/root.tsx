@@ -295,3 +295,4 @@ const FOOTER_QUERY = `#graphql
   }
   ${MENU_FRAGMENT}
 ` as const;
+// Storefront fragments and root loader for the E2E app.
