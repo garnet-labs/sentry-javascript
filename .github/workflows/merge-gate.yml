@@ -7,7 +7,7 @@ name: Merge gate (POC)
 
 on:
   issue_comment:
-    types: [created]
+    types: [created, edited]
   workflow_dispatch:
     inputs:
       pr:
