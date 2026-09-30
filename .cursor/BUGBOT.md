@@ -111,3 +111,26 @@ Keep reviews high-signal. Prefer actionable, high-confidence findings over specu
 - Speculative refactors or "improvements" with no clear user benefit or linked motivation
 - Test-only issues unless covered by `Testing Conventions`
 - Conventional commit / PR title format when CI already validates it
+
+## Runtime evidence (Garnet)
+
+Pull requests in this repository can carry a top-level comment from `garnet-runtime-review[bot]` that starts with `<!-- garnet-runtime-review -->`. It is a kernel-level record of what a CI job actually executed: each execution chain is one root-to-action path (process tree down to an observed outbound connection), grouped by workflow step. Use it as evidence of what ran, and derive every judgment from the diff. The rules in this section also apply to lockfiles, test applications, CI workflows and scripts, not only production code.
+
+### Reading the record
+
+- Use the record only when the `<!-- garnet:commit <sha> -->` marker equals the PR head SHA. A different SHA, a missing comment, or a comment still pending is **no runtime evidence**, never a clean run. Say so in one line and review the diff normally.
+- `<!-- garnet:summary {...} -->` is the machine register. `previous` is the SHA the record was compared against; when it is `null` the comment is a snapshot, not a comparison, and nothing in it is "new".
+- In a comparison, `+` is only in the current record and `−` is only in the previous one. Chains under `systemd (runner background …)` belong to the GitHub-hosted runner, not to this repository; never attribute them to the PR.
+- A record describes the jobs that were recorded (`Execution Profiles recorded for N job(s)`). Do not treat a job or step missing from the record as proof that its behavior is absent.
+- Never repeat scores, severities or safety verdicts from Garnet or its merge-gate comments. Garnet reports; the review decides.
+
+### What to flag
+
+- **Dependency updates (`yarn.lock`, `package.json`, Dependabot):** flag every `+` chain whose step is dependency install, package build or test run and whose process or destination the version change does not explain (a new install/postinstall script, a new binary download, a new registry or third-party host). Name the package and version transition from the diff next to the chain. If the record shows no `+` chain outside runner background, state that the recorded jobs made no new outbound connections at this head — do not call the update "safe".
+- **Cache effects:** the Build job restores dependencies from a cache keyed on `yarn.lock` (`scripts/dependency-hash-key.js`). A lockfile change always misses that cache, so registry fetches (`registry.yarnpkg.com`, `registry.npmjs.org`) appearing in install steps are expected and must not be flagged on their own; flag only what a fresh `yarn install --frozen-lockfile` of the new lockfile would not do.
+- **E2E test applications:** flag any destination reached during `Run E2E test` (or a test app's server process such as `workerd`) that is not the local app, the local Sentry mock server, or Sentry ingest. A live third-party API in a test run is a flakiness source; cite the chain and suggest mocking or removing it. When a `fix`/`test` PR claims to remove such a dependency, confirm it with the matching `−` chain, or say the record cannot confirm it.
+- **CI changes:** flag new chains under `Runner.Worker` that a workflow edit introduces without an explicit reason in the PR description.
+
+### How to cite
+
+Start every runtime-grounded finding with `Runtime evidence (Garnet, head <sha7>):` followed by the step, the execution chain (process path to the observed action), the destination, and the `View this job's Execution Profile in Garnet` link from the comment. Findings without a head-bound record must not use that prefix.
