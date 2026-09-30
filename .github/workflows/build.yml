@@ -73,6 +73,9 @@ jobs:
     name: Build
     needs: job_get_metadata
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
     timeout-minutes: 15
     if: |
       needs.job_get_metadata.outputs.changed_any_code == 'true' ||
@@ -91,6 +94,7 @@ jobs:
         with:
           ref: ${{ env.HEAD_COMMIT }}
 
+      - uses: garnet-org/action@245ad6be82de3200c205109c8ca7ac816dc692ea # v2.3.0
       - name: Set up Node
         uses: actions/setup-node@v7
         with:
