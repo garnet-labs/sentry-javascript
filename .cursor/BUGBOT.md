@@ -134,3 +134,7 @@ Pull requests in this repository can carry a top-level comment from `garnet-runt
 ### How to cite
 
 Start every runtime-grounded finding with `Runtime evidence (Garnet, head <sha7>):` followed by the step, the execution chain (process path to the observed action), the destination, and the `View this job's Execution Profile in Garnet` link from the comment. Findings without a head-bound record must not use that prefix.
+
+### Always show the runtime note
+
+Do not finish silently. Every review of a PR that carries a head-bound Garnet record must post a review comment — even when there is nothing to flag. Start it with `Runtime evidence (Garnet, head <sha7>):` and state in one or two lines what the record shows: how many jobs were recorded, and whether any `+` chain sits outside runner background and the explained install, build, and test steps. A clean record is reported as observed facts only — never call the update "safe", and never repeat Garnet verdicts or scores. If the record is missing, stale, or still pending, say so in one line per `Reading the record` and review the diff normally.
