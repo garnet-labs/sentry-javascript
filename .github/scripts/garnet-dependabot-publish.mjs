@@ -1399,6 +1399,10 @@ export function main(argv = process.argv.slice(2)) {
       artifacts[side] = artifact;
       check(artifact.files['receipt.json']?.length <= MB, 'receipt_missing_or_oversized');
       sides[side] = {receipt: parse(artifact.files['receipt.json'])};
+      const r = sides[side].receipt;
+      const blocked = r?.status === 'blocked-or-failed' && typeof r.failure === 'string' &&
+        /^BLOCKED: ([a-z0-9_]+)(?::|$)/.exec(r.failure)?.[1];
+      if (blocked) failures.push(`${side}: not_recordable_${blocked}`);
     } catch (e) { recordFailure(side, e); }
   }
   let verification = [], snapshot = sides.head?.receipt?.snapshot ?? sides.base?.receipt?.snapshot;
