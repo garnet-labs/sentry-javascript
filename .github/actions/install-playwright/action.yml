@@ -28,7 +28,7 @@ runs:
 
     - name: Mount Playwright cache
       uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1.7.0
-      if: steps.playwright-version.outputs.version != ''
+      if: steps.playwright-version.outputs.version != '' && runner.environment == 'self-hosted'
       with:
         cache: |
           playwright

@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   track-updates:
-    runs-on: namespace-profile-sentry-javascript-small
+    runs-on: ubuntu-24.04
     environment: ci-triage
     permissions:
       contents: read
