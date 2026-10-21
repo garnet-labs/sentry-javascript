@@ -14,7 +14,8 @@
     "packages/bundler-plugins/test/core/fixtures/**",
     "**/test.ts-snapshots/**",
     "/.nx/cache",
-    "/.nx/workspace-data"
+    "/.nx/workspace-data",
+    ".github/scripts/garnet-*.mjs"
   ],
   "overrides": [
     {
