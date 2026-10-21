@@ -86,7 +86,9 @@ export {
   instrumentSupabaseClient,
   zodErrorsIntegration,
   consoleIntegration,
+  // oxlint-disable-next-line typescript/no-deprecated
   SEMANTIC_ATTRIBUTE_SENTRY_OP,
+  // oxlint-disable-next-line typescript/no-deprecated
   SEMANTIC_ATTRIBUTE_SENTRY_ORIGIN,
   SEMANTIC_ATTRIBUTE_SENTRY_SAMPLE_RATE,
   spanToStaticSpanJSON,
@@ -122,11 +124,14 @@ export { httpServerIntegration } from './integrations/httpServer';
 export { fetchIntegration } from './integrations/fetch';
 export type { FetchIntegrationOptions } from '@sentry/core';
 export { spotlightIntegration } from './integrations/spotlight';
+export { cronTriggersIntegration } from './integrations/cronTriggers';
+export type { CronTriggerMonitorSettings, CronTriggersOptions } from './integrations/cronTriggers';
 export {
   openTelemetryIntegration,
   getOtlpTracesEndpoint,
   prismaIntegration,
   instrumentMistralAiClient,
+  instrumentTypeSafeClient,
   instrumentOpenAiClient,
   instrumentAnthropicAiClient,
   instrumentGoogleGenAIClient,
@@ -136,6 +141,8 @@ export {
   instrumentStateGraph,
   instrumentCreateReactAgent,
   vercelAIIntegration,
+  honoIntegration,
+  honoMiddleware,
   eveConversationHook,
   eveIntegration,
   getInstrumentedModuleNames,

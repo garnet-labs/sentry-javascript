@@ -64,10 +64,13 @@ export {
   openAIIntegration,
   groqIntegration,
   togetherAIIntegration,
+  typesafeIntegration,
   langChainIntegration,
   langGraphIntegration,
   createFlueInstrumentation,
   mastraIntegration,
+  piDurableIntegration,
+  mcpServerIntegration,
   SentryMastraExporter,
   modulesIntegration,
   contextLinesIntegration,
@@ -93,7 +96,9 @@ export {
   getAutoPerformanceIntegrations,
   cron,
   parameterize,
+  // oxlint-disable-next-line typescript/no-deprecated
   SEMANTIC_ATTRIBUTE_SENTRY_OP,
+  // oxlint-disable-next-line typescript/no-deprecated
   SEMANTIC_ATTRIBUTE_SENTRY_ORIGIN,
   SEMANTIC_ATTRIBUTE_SENTRY_SAMPLE_RATE,
   dataloaderIntegration,
@@ -106,6 +111,8 @@ export {
   // oxlint-disable-next-line typescript/no-deprecated
   setupFastifyErrorHandler,
   firebaseIntegration,
+  honoIntegration,
+  honoMiddleware,
   koaIntegration,
   // oxlint-disable-next-line typescript/no-deprecated
   setupKoaErrorHandler,
@@ -118,10 +125,12 @@ export {
   mongooseIntegration,
   mysqlIntegration,
   mysql2Integration,
+  nitroIntegration,
   redisIntegration,
   tediousIntegration,
   postgresIntegration,
   postgresJsIntegration,
+  neonIntegration,
   prismaIntegration,
   processSessionIntegration,
   hapiIntegration,
@@ -138,6 +147,7 @@ export {
   supabaseIntegration,
   instrumentSupabaseClient,
   instrumentMistralAiClient,
+  instrumentTypeSafeClient,
   instrumentOpenAiClient,
   instrumentAnthropicAiClient,
   instrumentGoogleGenAIClient,
@@ -168,6 +178,8 @@ export {
   // oxlint-disable-next-line typescript/no-deprecated
   withStreamedSpan,
   bunServerIntegration,
+  bunRuntimeMetricsIntegration,
+  type BunRuntimeMetricsOptions,
   makeFetchTransport,
 } from '@sentry/bun';
 

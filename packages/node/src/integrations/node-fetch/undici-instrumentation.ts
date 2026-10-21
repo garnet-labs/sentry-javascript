@@ -16,7 +16,6 @@
 
 /* eslint-disable max-lines */
 
-import * as diagch from 'diagnostics_channel';
 import { URL } from 'url';
 
 import type { Span, SpanAttributes } from '@sentry/core';
@@ -32,7 +31,6 @@ import {
   parseUrl,
   safeCallback,
   SEMANTIC_ATTRIBUTE_SENTRY_CUSTOM_SPAN_NAME,
-  SEMANTIC_ATTRIBUTE_SENTRY_ORIGIN,
   SPAN_STATUS_ERROR,
   startInactiveSpan,
   stripDataUrlContent,
@@ -42,6 +40,7 @@ import {
   filterCollectedUrlQuery,
   httpHeadersToSpanAttributes,
 } from '@sentry/core';
+import { subscribeDiagnosticsChannel } from '@sentry/server-utils';
 import { addFetchRequestBreadcrumb, addTracePropagationHeadersToFetchRequest } from '../../utils/outgoingFetchRequest';
 import {
   HTTP_REQUEST_METHOD,
@@ -59,6 +58,7 @@ import {
   URL_QUERY,
   URL_SCHEME,
   USER_AGENT_ORIGINAL,
+  SENTRY_ORIGIN,
 } from '@sentry/conventions/attributes';
 import { HTTP_CLIENT } from '@sentry/conventions/op';
 import { DEBUG_BUILD } from '../../debug-build';
@@ -118,7 +118,7 @@ function subscribeToChannel(
   diagnosticChannel: string,
   onMessage: (message: unknown, name: string | symbol) => void,
 ): void {
-  diagch.subscribe?.(diagnosticChannel, onMessage);
+  subscribeDiagnosticsChannel(diagnosticChannel, onMessage);
 }
 
 function parseRequestHeaders(request: UndiciRequest): Map<string, string | string[]> {
@@ -220,7 +220,7 @@ function onRequestCreated(config: NodeFetchOptions, { request }: RequestMessage)
     [URL_QUERY]: filterCollectedUrlQuery(getUrlQuery(requestUrl.search)),
     [URL_FRAGMENT]: getUrlFragment(requestUrl.hash),
     [URL_SCHEME]: urlScheme,
-    [SEMANTIC_ATTRIBUTE_SENTRY_ORIGIN]: 'auto.http.node_fetch',
+    [SENTRY_ORIGIN]: 'auto.http.node_fetch',
   };
 
   // Sanitize data URLs to prevent long base64 strings in span attributes
@@ -414,13 +414,25 @@ function onDone({ request }: RequestTrailersMessage): void {
 // This is the event we get when something is wrong in the request like
 // - invalid options when calling `fetch` global API or any undici method for request
 // - connectivity errors such as unreachable host
-// - requests aborted through an `AbortController.signal`
+// - requests aborted through an `AbortController.signal`, or a response body cancelled by the caller
 // NOTE: server errors are considered valid responses and it's the lib consumer
-// who should deal with that.
+// who should deal with that. Aborts initiated by the caller are not errors either, so they end the
+// span without an error status.
 function onError({ request, error }: RequestErrorMessage): void {
   const span = spanFromReq.get(request);
 
   if (!span) {
+    return;
+  }
+
+  // An intentional cancellation (`AbortController.abort()` or cancelling the response body) is not
+  // a failure of the request, so don't flip the span (which may already carry a 2xx status) to error.
+  const isAbort =
+    error.name === 'AbortError' ||
+    (typeof DOMException !== 'undefined' && error instanceof DOMException && error.code === DOMException.ABORT_ERR);
+  if (isAbort) {
+    span.end();
+    spanFromReq.delete(request);
     return;
   }
 
