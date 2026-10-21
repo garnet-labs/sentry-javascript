@@ -15,7 +15,9 @@
     "**/test.ts-snapshots/**",
     "/.nx/cache",
     "/.nx/workspace-data",
-    ".github/scripts/garnet-*.mjs"
+    ".github/scripts/garnet-*.mjs",
+    ".github/workflows/garnet-*.yml",
+    ".github/workflows/merge-gate.yml"
   ],
   "overrides": [
     {
