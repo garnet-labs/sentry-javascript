@@ -203,6 +203,10 @@ Work in this release was contributed by @4ktLuffy, @adityareddy-dev, @dasilvalui
 
   `ignoreStaticAssets` defaults to `true`, so `Bun.serve` no longer creates spans for `GET` requests to common static assets such as `favicon.ico`, `robots.txt` or `*.js` files. To keep these spans, set `bunServerIntegration({ ignoreStaticAssets: false })`. `Bun.serve` spans also follow the client's tracing configuration by default, so the integration does not start spans when tracing is disabled. Errors thrown for `OPTIONS` and `HEAD` requests are now captured.
 
+- **feat(node): Add `onSpanEnd` to `httpIntegration`**
+
+  `httpIntegration` and `httpServerSpansIntegration` now accept `onSpanEnd`, a hook that runs when the response for an incoming request finishes, before its span ends. Use it to change the span based on the response. Deno and Bun already have this option.
+
 ## 11.8.0
 
 ### Important Changes
@@ -7927,4 +7931,3 @@ A full list of changes in the `5.x` release of the SDK can be found in the [5.x 
 ## 4.x
 
 A full list of changes in the `4.x` release of the SDK can be found in the [4.x Changelog](./docs/changelog/v4.md).
-<!-- -->
