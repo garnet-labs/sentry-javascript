@@ -64,4 +64,3 @@ describe('instrumentAgentWithSentry', () => {
     expect((obj as any).rpcMethod()).toBe('rpc');
   });
 });
-//

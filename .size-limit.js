@@ -467,6 +467,7 @@ module.exports = [
     ignore: [...builtinModules, ...nodePrefixedBuiltinModules],
     gzip: false,
     brotli: false,
+    limit: '521 KiB',
     disablePlugins: ['@size-limit/webpack'],
     webpack: false,
     modifyEsbuildConfig: function (config) {
@@ -511,4 +512,3 @@ function createImport(...args) {
 function createCDNPath(name) {
   return `packages/browser/build/bundles/${name}`;
 }
-//
