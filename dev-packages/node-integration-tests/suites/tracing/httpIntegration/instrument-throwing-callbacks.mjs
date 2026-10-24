@@ -15,9 +15,7 @@ Sentry.init({
       onSpanCreated: () => {
         throw new Error('onSpanCreated error');
       },
-      onSpanEnd: () => {
-        throw new Error('onSpanEnd error');
-      },
     }),
   ],
 });
+//

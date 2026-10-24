@@ -93,7 +93,13 @@ interface HttpOptions extends HttpServerIntegrationOptions, HttpServerSpansInteg
 // shared field fails to compile here, until this integration supports
 // it or lists it as unsupported.
 type _ServerRequestOptionsCheck = AssertTrue<
-  CheckServerRequestOptions<HttpOptions, HttpIncomingMessage, HttpServerResponse>
+  CheckServerRequestOptions<
+    HttpOptions,
+    HttpIncomingMessage,
+    HttpServerResponse,
+    // Not supported yet.
+    'onSpanEnd'
+  >
 >;
 
 /**
@@ -159,3 +165,4 @@ export const httpIntegration = defineIntegration((options: HttpOptions = {}) => 
     },
   };
 });
+//
