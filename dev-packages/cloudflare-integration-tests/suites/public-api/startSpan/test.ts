@@ -291,3 +291,4 @@ it('sends a streamed span envelope with correct spans for a manually started spa
     name: 'GET /',
   });
 });
+//

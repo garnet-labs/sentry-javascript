@@ -17,3 +17,4 @@ it('does not capture spans emitted through @opentelemetry/api inside wrapRequest
   await runner.makeRequest('get', '/');
   await runner.completed();
 });
+//
