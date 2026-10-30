@@ -600,7 +600,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           ref: ${{ env.HEAD_COMMIT }}
-      - uses: garnet-org/action@8cccc85403e4ac4e05fb7822c994d3c199f9aa57 # v2.4.0
+      - uses: garnet-org/action@96e9f81ec0f59f2322e8c67b43c4d4017d932ad3 # v2.4.1
         if: matrix.node == '20.19'
       - name: Set up Node
         uses: actions/setup-node@v7
@@ -1056,7 +1056,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           ref: ${{ env.HEAD_COMMIT }}
-      - uses: garnet-org/action@8cccc85403e4ac4e05fb7822c994d3c199f9aa57 # v2.4.0
+      - uses: garnet-org/action@96e9f81ec0f59f2322e8c67b43c4d4017d932ad3 # v2.4.1
         if: (matrix.label || matrix.test-application) == needs.job_build.outputs.e2e-record-entry
       - name: Prepare E2E test application
         uses: ./.github/actions/prepare-e2e-test
