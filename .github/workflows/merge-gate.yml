@@ -3,7 +3,7 @@
 # decision. Fires when garnet-runtime-review[bot] posts a Runtime Review, or when
 # someone comments /merge-gate on a PR. Manual re-runs via workflow_dispatch.
 # Proof of concept only. Garnet reports; the reviewer decides.
-name: Merge gate (POC)
+name: Merge gate
 
 on:
   issue_comment:
