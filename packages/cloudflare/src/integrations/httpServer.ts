@@ -1,6 +1,6 @@
-import type { Client, IntegrationFn, MaxRequestBodySize } from '@sentry/core';
-import { captureBodyFromWinterCGRequest, defineIntegration, getIsolationScope } from '@sentry/core';
-import type { AssertTrue, CheckServerRequestOptions } from '@sentry/core/server';
+import type { Client, Integration, IntegrationFn, MaxRequestBodySize, Span } from '@sentry/core';
+import { defineIntegration } from '@sentry/core';
+import type { AssertTrue, CheckServerRequestOptions, ServerRequestOptions } from '@sentry/core/server';
 
 const INTEGRATION_NAME = 'HttpServer' as const;
 
@@ -39,6 +39,42 @@ export interface HttpServerIntegrationOptions {
    * ```
    */
   ignoreRequestBody?: (url: string, request: Request) => boolean;
+
+  /**
+   * Do not create spans for incoming requests whose URL path makes the given callback return `true`.
+   *
+   * `urlPath` is the path of the request, including the query string. `request` is the incoming
+   * {@link Request}. Errors thrown by the handler are still captured.
+   */
+  ignoreIncomingRequests?: (urlPath: string, request: Request) => boolean;
+
+  /**
+   * Whether to automatically ignore common static asset requests (favicon.ico, robots.txt, etc.)
+   * when creating spans.
+   *
+   * @default `true`
+   */
+  ignoreStaticAssets?: boolean;
+
+  /**
+   * Whether to create spans for incoming requests.
+   * Errors are still captured and request data is still attached when this is `false`.
+   * Defaults to the client's tracing configuration (`hasSpansEnabled`).
+   */
+  spans?: boolean;
+
+  /**
+   * A hook that can be used to mutate the span for incoming requests.
+   * This is triggered after the span is created, before the request handler runs.
+   */
+  onSpanCreated?: (span: Span, request: Request) => void;
+
+  /**
+   * A hook that can be used to mutate the span one last time before it ends.
+   * For a streamed response, this runs when the stream finishes.
+   * It is not called when the request handler throws.
+   */
+  onSpanEnd?: (span: Span, request: Request, response: Response) => void;
 }
 
 // Checks these options against the shared `ServerRequestOptions`. A new
@@ -49,30 +85,51 @@ type _ServerRequestOptionsCheck = AssertTrue<
     HttpServerIntegrationOptions,
     Request,
     Response,
-    // Not supported yet.
-    | 'spans'
-    | 'ignoreIncomingRequests'
-    | 'ignoreStaticAssets'
-    | 'onSpanCreated'
-    | 'onSpanEnd'
     // Not supported. A worker has no long-lived process to run the timer
     // that flushes session aggregates.
-    | 'sessions'
-    | 'sessionFlushingDelayMS'
+    'sessions' | 'sessionFlushingDelayMS'
   >
 >;
 
-interface HttpServerIntegrationInstance {
-  name: string;
-  maxRequestBodySize: MaxRequestBodySize | undefined;
-  ignoreRequestBody?: (url: string, request: Request) => boolean;
+type SupportedServerRequestOptions = Omit<
+  ServerRequestOptions<Request, Response>,
+  'sessions' | 'sessionFlushingDelayMS'
+>;
+
+// Every supported shared option is a required key, so a new one fails to compile below until the
+// integration passes it on.
+type HttpServerRequestOptions = {
+  [K in keyof Required<SupportedServerRequestOptions>]: SupportedServerRequestOptions[K];
+};
+
+interface HttpServerIntegration extends Integration {
+  requestOptions: HttpServerRequestOptions;
 }
 
-const _httpServerIntegration = ((options: HttpServerIntegrationOptions = {}): HttpServerIntegrationInstance => {
+/**
+ * The incoming request options of the client's `httpServerIntegration`. Without the integration,
+ * the SDK attaches no request body, so users can turn body capture off by removing it.
+ */
+export function getHttpServerRequestOptions(client: Client): ServerRequestOptions<Request, Response> {
+  return (
+    client.getIntegrationByName<HttpServerIntegration>(INTEGRATION_NAME)?.requestOptions ?? {
+      maxRequestBodySize: 'none',
+    }
+  );
+}
+
+const _httpServerIntegration = ((options: HttpServerIntegrationOptions = {}): HttpServerIntegration => {
   return {
     name: INTEGRATION_NAME,
-    maxRequestBodySize: options.maxRequestBodySize,
-    ignoreRequestBody: options.ignoreRequestBody,
+    requestOptions: {
+      maxRequestBodySize: options.maxRequestBodySize,
+      ignoreRequestBody: options.ignoreRequestBody,
+      ignoreIncomingRequests: options.ignoreIncomingRequests,
+      ignoreStaticAssets: options.ignoreStaticAssets ?? true,
+      spans: options.spans,
+      onSpanCreated: options.onSpanCreated,
+      onSpanEnd: options.onSpanEnd,
+    },
   };
 }) satisfies IntegrationFn;
 
@@ -95,37 +152,3 @@ const _httpServerIntegration = ((options: HttpServerIntegrationOptions = {}): Ht
  * ```
  */
 export const httpServerIntegration = defineIntegration(_httpServerIntegration);
-
-/**
- * Capture the request body based on the HttpServer integration config.
- * Called internally by `wrapRequestHandler`.
- */
-export async function captureIncomingRequestBody(client: Client, request: Request): Promise<void> {
-  const integration = client.getIntegrationByName<HttpServerIntegrationInstance>(INTEGRATION_NAME);
-
-  if (!integration) {
-    return;
-  }
-
-  const configuredBodySize = integration.maxRequestBodySize;
-  const effectiveBodySize: MaxRequestBodySize =
-    configuredBodySize ??
-    (client.getDataCollectionOptions().httpBodies.includes('incomingRequest') ? 'medium' : 'none');
-
-  if (effectiveBodySize === 'none') {
-    return;
-  }
-
-  // Skip GET and HEAD requests - they don't have bodies
-  // Also skip OPTIONS, even if they may have a body, they might not give a lot of extra value
-  if (request.method === 'GET' || request.method === 'HEAD' || request.method === 'OPTIONS') {
-    return;
-  }
-
-  if (integration.ignoreRequestBody?.(request.url, request)) {
-    return;
-  }
-
-  const isolationScope = getIsolationScope();
-  await captureBodyFromWinterCGRequest(request, isolationScope, effectiveBodySize);
-}
