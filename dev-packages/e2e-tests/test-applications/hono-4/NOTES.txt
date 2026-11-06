@@ -1,0 +1,1 @@
+Maintenance notes for the hono-4 E2E application.
