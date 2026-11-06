@@ -1,0 +1,1 @@
+Maintenance notes for the nextjs-16 E2E application.
