@@ -30,7 +30,7 @@ env:
   HEAD_COMMIT: ${{ github.event.inputs.commit || github.sha }}
 
   # build-output artifact paths are computed in job_build (step output from
-  # pnpm run ci:print-build-artifact-paths — Nx merged outputs for build:transpile, and build:types).
+  # pnpm run ci:print-build-artifact-paths - Nx merged outputs for build:transpile, and build:types).
 
   # upload-artifact globs drop the path through the first `*` (see upload-artifact
   # README). Tarballs therefore land in the artifact as <pkg>/*.tgz; download
@@ -800,11 +800,11 @@ jobs:
           df -h /
           avail_kb=$(df -k --output=avail / | tail -1)
           if [ "$avail_kb" -lt $((40 * 1024 * 1024)) ]; then
-            echo "Low disk space (<40GB free) — reclaiming unused toolchains"
+            echo "Low disk space (<40GB free) - reclaiming unused toolchains"
             sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
             df -h /
           else
-            echo "Sufficient disk space — skipping cleanup"
+            echo "Sufficient disk space - skipping cleanup"
           fi
       - name: Set up Node
         uses: actions/setup-node@v7
