@@ -1,0 +1,1 @@
+Maintenance notes for the sveltekit-3 E2E application.
