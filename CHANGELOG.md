@@ -207,11 +207,67 @@ Work in this release was contributed by @4ktLuffy, @adityareddy-dev, @dasilvalui
 
   `httpIntegration` and `httpServerSpansIntegration` now accept `onSpanEnd`, a hook that runs when the response for an incoming request finishes, before its span ends. Use it to change the span based on the response. Deno and Bun already have this option.
 
-- **feat(bun): Inject debug IDs and upload source maps in `sentryBunPlugin` ([#25670](https://github.com/getsentry/sentry-javascript/pull/25670))**
+- **feat(cloudflare): Add incoming request span options to `httpServerIntegration`**
 
-  `sentryBunPlugin` from `@sentry/bun/plugin` now accepts the same options as `sentryEsbuildPlugin` (`org`, `project`, `authToken`, `release`, `sourcemaps`, ...). When `Bun.build` writes source maps to `outdir`, the plugin injects the debug ID that Bun writes into each bundle, injects the release, and uploads the source maps at the end of the build. You no longer need to run `sentry sourcemap inject` and `sentry sourcemap upload` after the build.
+  Cloudflare's `httpServerIntegration` now accepts `ignoreIncomingRequests`, `ignoreStaticAssets`, `spans`, `onSpanCreated` and `onSpanEnd`, with the same meaning as in the Node, Deno and Bun integrations. The callbacks receive the web `Request`.
 
-  Like the other bundler plugins, `sentryBunPlugin` now sends build telemetry and injects the release it detects (for example, from git). To turn off telemetry, set `telemetry: false`.
+  `ignoreStaticAssets` defaults to `true`, so workers no longer create spans for `GET` requests to common static assets such as `favicon.ico`, `robots.txt` or `*.js` files. To keep these spans, set `httpServerIntegration({ ignoreStaticAssets: false })`. Request spans also follow the client's tracing configuration by default, so the SDK does not start them when tracing is disabled. If `ignoreRequestBody` throws, the request no longer fails, and the SDK skips the body.
+
+- **feat(node, bun, deno, cloudflare): Align portable exports across server SDKs**
+
+  Node, Bun, Deno and Cloudflare now export the same helpers from `@sentry/core` and `@sentry/server-utils` where they work on that runtime:
+
+  - Node and Bun now export `moduleMetadataIntegration`, `instrumentPostgresJsSql`, `instrumentCreateReactAgent`, `awsIntegration` and the `FlueOptions` type. `awsIntegration` was already in their default integrations.
+  - Deno and Cloudflare now export `parameterize` and `instrumentStateGraphCompile`.
+  - Bun and Cloudflare now export the `Log` and `LogSeverityLevel` types.
+  - Deno now exports `fastifyIntegration`, which was already in its default integrations.
+
+- **feat(cloudflare): Export the channel integrations**
+
+  When the `@sentry/cloudflare/vite` plugin bundles an instrumented package (for example `pg` or `openai`), the SDK adds the matching integration with its default options. `@sentry/cloudflare` now exports these integrations, so you can set their options, for example:
+
+  ```ts
+  Sentry.withSentry(
+    env => ({
+      dsn: env.SENTRY_DSN,
+      integrations: [Sentry.openAIIntegration({ recordInputs: false, recordOutputs: false })],
+    }),
+    handler,
+  );
+  ```
+
+  These integrations need the vite plugin. Without it, they record nothing, and with `debug: true` the SDK logs a warning.
+
+- **fix(cloudflare): Do not add back channel integrations the user removed**
+
+  When an instrumented package loaded after `init()` (for example through a dynamic `import()`), the SDK added its integration even if the user had removed it. This applied to an `integrations` function that filtered it out, `defaultIntegrations: false`, and a custom `defaultIntegrations` list. The SDK now applies the same rules to a late-loaded integration as to the defaults at `init()`. To do this, it calls an `integrations` function again, once for each package that loads after `init()`.
+
+- **ref(deno): Use the shared request handler wrapper for `Deno.serve`**
+
+  `Deno.serve` now uses a request handler wrapper that `Bun.serve` and Cloudflare will also use. Three small changes for Deno users:
+
+  - When the source of a streamed response fails, the SDK now captures the error and marks the span as failed.
+  - The SDK no longer reads a streamed response ahead of the client.
+  - Errors in `OPTIONS` and `HEAD` requests now carry the request data.
+
+- **ref(bun): Use the shared request handler wrapper for `Bun.serve`**
+
+  `Bun.serve` now uses the same request handler wrapper as `Deno.serve`. Bun spans now follow the Sentry span conventions for `http.server` spans, so some attributes change:
+
+  - The matched route is in `http.route` instead of `url.template`. Routes without parameters now also set `http.route`, with the `route` source.
+  - The host is in `server.address` instead of `url.domain`.
+  - A request to `/` is named after the route (for example `GET /`), as on the other runtimes.
+  - Spans now also have `user_agent.original` and `http.request.body.size`.
+
+  If you query Bun spans by `url.template` or `url.domain`, use `http.route` or `server.address` instead. Errors in `OPTIONS` and `HEAD` requests now carry the request data. On all three runtimes, the span now lists every `Set-Cookie` header of a response, not only the last one.
+
+- **ref(cloudflare): Use the shared request handler wrapper**
+
+  Cloudflare Workers now use the same request handler wrapper as `Deno.serve` and `Bun.serve`. Changes for Cloudflare users:
+
+  - Request spans now set `client.address` from the `CF-Connecting-IP` header (or another forwarding header), as on the other runtimes. This follows `dataCollection.userInfo`, which is `true` by default. To leave it out, set `dataCollection: { userInfo: false }`.
+  - Request spans now have the response header attributes, and events have the `response` context with the status code.
+  - When the source of a streamed response fails, the SDK now captures the error and marks the span as failed. With `captureErrors: false`, it does not capture it.
 
 ## 11.8.0
 
