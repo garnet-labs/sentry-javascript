@@ -1,0 +1,50 @@
+// Note that these are the serialized attributes and not attributes directly on
+// the DOM Node. Attributes we are interested in:
+const ATTRIBUTES_TO_RECORD = new Set([
+  'id',
+  'class',
+  'aria-label',
+  'role',
+  'name',
+  'alt',
+  'title',
+  'data-test-id',
+  'data-testid',
+  'disabled',
+  'aria-disabled',
+  'data-sentry-component',
+]);
+
+/**
+ * Attributes that can end up in a click breadcrumb. This is `ATTRIBUTES_TO_RECORD` plus
+ * `data-sentry-element`, which is not recorded itself but is used as a fallback for
+ * `data-sentry-component`.
+ */
+export const BREADCRUMB_RELEVANT_ATTRIBUTES = new Set([...ATTRIBUTES_TO_RECORD, 'data-sentry-element']);
+
+/**
+ * Inclusion list of attributes that we want to record from the DOM element
+ */
+export function getAttributesToRecord(attributes: Record<string, unknown>): Record<string, unknown> {
+  const obj: Record<string, unknown> = {};
+
+  for (const key in attributes) {
+    if (ATTRIBUTES_TO_RECORD.has(key)) {
+      let normalizedKey = key;
+
+      if (key === 'data-testid' || key === 'data-test-id') {
+        normalizedKey = 'testId';
+      }
+
+      obj[normalizedKey] = attributes[key];
+    }
+  }
+
+  // `attributes` is the serialized node held by rrweb's mirror, which is the same object that was
+  // emitted in an earlier `adds` payload, so this fallback must not be written back onto it.
+  if (!obj['data-sentry-component'] && attributes['data-sentry-element']) {
+    obj['data-sentry-component'] = attributes['data-sentry-element'];
+  }
+
+  return obj;
+}

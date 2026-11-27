@@ -1,0 +1,45 @@
+import * as Sentry from '@sentry/node';
+import knex from 'knex';
+
+const pgClient = knex({
+  client: 'pg',
+  connection: {
+    host: 'localhost',
+    port: 5445,
+    user: 'test',
+    password: 'test',
+    database: 'tests',
+  },
+});
+
+async function run() {
+  await Sentry.startSpan(
+    {
+      name: 'Test Transaction',
+      op: 'transaction',
+    },
+    async () => {
+      try {
+        await pgClient.schema.createTable('User', table => {
+          table.increments('id').notNullable().primary({ constraintName: 'User_pkey' });
+          table.timestamp('createdAt', { precision: 3 }).notNullable().defaultTo(pgClient.fn.now(3));
+          table.text('email').notNullable();
+          table.text('name').notNullable();
+        });
+
+        await pgClient('User').insert({ name: 'bob', email: 'bob@domain.com' });
+        await pgClient('User').select('*');
+
+        // Trigger a failing query to capture the error span (table does not exist).
+        await pgClient('DoesNotExist')
+          .select('*')
+          .catch(() => {});
+        await pgClient.schema.dropTable('User');
+      } finally {
+        await pgClient.destroy();
+      }
+    },
+  );
+}
+
+run();

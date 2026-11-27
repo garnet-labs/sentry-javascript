@@ -1,0 +1,13 @@
+name: 'Restore dependency & build cache'
+description: 'Installs dependencies from the Namespace cache volume and restores the build output.'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Restore build artifacts
+      uses: actions/download-artifact@v7
+      with:
+        name: build-output
+
+    - name: Install dependencies
+      uses: ./.github/actions/install-dependencies

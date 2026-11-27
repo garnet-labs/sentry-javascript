@@ -1,0 +1,362 @@
+import {
+  HTTP_REQUEST_METHOD,
+  HTTP_ROUTE,
+  SERVER_ADDRESS,
+  URL_DOMAIN,
+  URL_FRAGMENT,
+  URL_FULL,
+  URL_PATH,
+  URL_PORT,
+  URL_QUERY,
+  SENTRY_SEGMENT_NAME_SOURCE,
+  URL_SCHEME,
+  URL_TEMPLATE,
+  SENTRY_ORIGIN,
+} from '@sentry/conventions/attributes';
+import type { Client } from '../client';
+import type { SpanAttributes } from '../types/span';
+import type { TransactionSource } from '../types/transaction';
+import { filterCollectedUrl, filterCollectedUrlQuery } from './data-collection/filterCollectedUrl';
+
+type PartialURL = {
+  host?: string;
+  path?: string;
+  protocol?: string;
+  relative?: string;
+  search?: string;
+  hash?: string;
+};
+
+interface URLwithCanParse extends URL {
+  canParse: (url: string, base?: string | URL | undefined) => boolean;
+}
+
+// A subset of the URL object that is valid for relative URLs
+// The URL object cannot handle relative URLs, so we need to handle them separately
+type RelativeURL = {
+  isRelative: true;
+  pathname: URL['pathname'];
+  search: URL['search'];
+  hash: URL['hash'];
+};
+
+type URLObject = RelativeURL | URL;
+
+// Curious about `thismessage:/`? See: https://www.rfc-editor.org/rfc/rfc2557.html
+//  > When the methods above do not yield an absolute URI, a base URL
+//  > of "thismessage:/" MUST be employed. This base URL has been
+//  > defined for the sole purpose of resolving relative references
+//  > within a multipart/related structure when no other base URI is
+//  > specified.
+//
+// We need to provide a base URL to `parseStringToURLObject` because the fetch API gives us a
+// relative URL sometimes.
+//
+// This is the only case where we need to provide a base URL to `parseStringToURLObject`
+// because the relative URL is not valid on its own.
+const DEFAULT_BASE_URL = 'thismessage:/';
+
+/**
+ * Checks if the URL object is relative
+ *
+ * @param url - The URL object to check
+ * @returns True if the URL object is relative, false otherwise
+ */
+export function isURLObjectRelative(url: URLObject): url is RelativeURL {
+  return 'isRelative' in url;
+}
+
+/**
+ * Parses string to a URL object
+ *
+ * @param url - The URL to parse
+ * @returns The parsed URL object or undefined if the URL is invalid
+ */
+export function parseStringToURLObject(url: string, urlBase?: string | URL | undefined): URLObject | undefined {
+  const isRelative = url.indexOf('://') <= 0 && url.indexOf('//') !== 0;
+  const base = urlBase ?? (isRelative ? DEFAULT_BASE_URL : undefined);
+  try {
+    // Use `canParse` to short-circuit the URL constructor if it's not a valid URL
+    // This is faster than trying to construct the URL and catching the error
+    // Node 20+, Chrome 120+, Firefox 115+, Safari 17+
+    if ('canParse' in URL && !(URL as unknown as URLwithCanParse).canParse(url, base)) {
+      return undefined;
+    }
+
+    const fullUrlObject = new URL(url, base);
+    if (isRelative) {
+      // Because we used a fake base URL, we need to return a relative URL object.
+      // We cannot return anything about the origin, host, etc. because it will refer to the fake base URL.
+      return {
+        isRelative,
+        pathname: fullUrlObject.pathname,
+        search: fullUrlObject.search,
+        hash: fullUrlObject.hash,
+      };
+    }
+    return fullUrlObject;
+  } catch {
+    // empty body
+  }
+
+  return undefined;
+}
+
+/**
+ * Takes a URL object and returns a sanitized string which is safe to use as span name
+ * see: https://develop.sentry.dev/sdk/data-handling/#structuring-data
+ */
+export function getSanitizedUrlStringFromUrlObject(url: URLObject): string {
+  if (isURLObjectRelative(url)) {
+    return url.pathname;
+  }
+
+  const newUrl = new URL(url);
+  newUrl.search = '';
+  newUrl.hash = '';
+  if (['80', '443'].includes(newUrl.port)) {
+    newUrl.port = '';
+  }
+  if (newUrl.password) {
+    newUrl.password = '%filtered%';
+  }
+  if (newUrl.username) {
+    newUrl.username = '%filtered%';
+  }
+
+  return newUrl.toString();
+}
+
+/**
+ * Normalizes a query string for the `url.query` attribute, which is specced without the leading `?`.
+ *
+ * Accepts either a raw query string (`URL.search`, which includes the `?`) or an already-stripped one.
+ * Empty results become `undefined` so callers can assign the return value to an attribute
+ * unconditionally — setting an attribute to `undefined` is a no-op.
+ */
+export function getUrlQuery(query: string | undefined): string | undefined {
+  return query?.replace(/^\?/, '') || undefined;
+}
+
+/**
+ * Normalizes a fragment for the `url.fragment` attribute, which is specced without the leading `#`.
+ *
+ * Accepts either a raw fragment (`URL.hash`, which includes the `#`) or an already-stripped one.
+ * Empty results become `undefined` so callers can assign the return value to an attribute
+ * unconditionally — setting an attribute to `undefined` is a no-op.
+ */
+export function getUrlFragment(fragment: string | undefined): string | undefined {
+  return fragment?.replace(/^#/, '') || undefined;
+}
+
+/**
+ * The domain a request goes to, for the `url.domain` attribute and low-cardinality span names.
+ *
+ * Relative URLs need a `base` to resolve against — browsers have the page origin, server runtimes do
+ * not. URLs with no domain at all, such as data URLs, return `undefined`.
+ */
+export function getUrlDomain(url: string, base?: string): string | undefined {
+  try {
+    return new URL(url, base).hostname || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+type PartialRequest = {
+  method?: string;
+};
+
+function getHttpSpanNameFromUrlObject(
+  urlObject: URLObject | undefined,
+  kind: 'server' | 'client',
+  request?: PartialRequest,
+  routeName?: string,
+): string {
+  const method = request?.method?.toUpperCase() ?? 'GET';
+  const route = routeName
+    ? routeName
+    : urlObject
+      ? kind === 'client'
+        ? getSanitizedUrlStringFromUrlObject(urlObject)
+        : urlObject.pathname
+      : '/';
+
+  return `${method} ${route}`;
+}
+
+/**
+ * Takes a parsed URL object and returns a set of attributes for the span
+ * that represents the HTTP request for that url. This is used for both server
+ * and client http spans.
+ *
+ * Follows https://opentelemetry.io/docs/specs/semconv/http/.
+ *
+ * @param urlObject - see {@link parseStringToURLObject}
+ * @param kind - The type of HTTP operation (server or client)
+ * @param spanOrigin - The origin of the span
+ * @param request - The request object, see {@link PartialRequest}
+ * @param routeName - The name of the route, must be low cardinality
+ * @param client - The client the span belongs to, used to resolve `dataCollection.urlQueryParams`.
+ * Falls back to the current scope's client when omitted, which is the wrong one in a multi-client setup.
+ * @returns The span name and attributes for the HTTP operation
+ */
+export function getHttpSpanDetailsFromUrlObject(
+  urlObject: URLObject | undefined,
+  kind: 'server' | 'client',
+  spanOrigin: string,
+  request?: PartialRequest,
+  routeName?: string,
+  client?: Client,
+): [name: string, attributes: SpanAttributes] {
+  const attributes: SpanAttributes = {
+    [SENTRY_ORIGIN]: spanOrigin,
+  };
+
+  let nameSource: TransactionSource = 'url';
+
+  if (routeName) {
+    // This is based on https://opentelemetry.io/docs/specs/semconv/http/http-spans/#name
+    attributes[kind === 'server' ? HTTP_ROUTE : URL_TEMPLATE] = routeName;
+    nameSource = 'route';
+  }
+
+  if (request?.method) {
+    attributes[HTTP_REQUEST_METHOD] = request.method.toUpperCase();
+  }
+
+  if (urlObject) {
+    // Relative URLs have no meaningful `href`, so fall back to the sanitized path.
+    attributes[URL_FULL] = filterCollectedUrl(
+      isURLObjectRelative(urlObject) ? getSanitizedUrlStringFromUrlObject(urlObject) : urlObject.href,
+      client,
+    );
+
+    attributes[URL_QUERY] = filterCollectedUrlQuery(getUrlQuery(urlObject.search), client);
+    attributes[URL_FRAGMENT] = getUrlFragment(urlObject.hash);
+    if (urlObject.pathname) {
+      attributes[URL_PATH] = urlObject.pathname;
+      if (urlObject.pathname === '/') {
+        nameSource = 'route';
+      }
+    }
+
+    if (!isURLObjectRelative(urlObject)) {
+      if (urlObject.port) {
+        attributes[URL_PORT] = urlObject.port;
+      }
+      if (urlObject.protocol) {
+        attributes[URL_SCHEME] = urlObject.protocol;
+      }
+      if (urlObject.hostname) {
+        attributes[kind === 'server' ? SERVER_ADDRESS : URL_DOMAIN] = urlObject.hostname;
+      }
+    }
+  }
+
+  // Outgoing HTTP (`kind === 'client'`) is not a segment span. Incoming HTTP usually is;
+  // if it is nested under a local parent, `addChildSpanToSpan` strips this attribute.
+  if (kind === 'server') {
+    attributes[SENTRY_SEGMENT_NAME_SOURCE] = nameSource;
+  }
+
+  return [getHttpSpanNameFromUrlObject(urlObject, kind, request, routeName), attributes];
+}
+
+/**
+ * Parses string form of URL into an object
+ * // borrowed from https://tools.ietf.org/html/rfc3986#appendix-B
+ * // intentionally using regex and not <a/> href parsing trick because React Native and other
+ * // environments where DOM might not be available
+ * @returns parsed URL object
+ */
+export function parseUrl(url: string): PartialURL {
+  if (!url) {
+    return {};
+  }
+
+  const match = url.match(/^(([^:/?#]+):)?(\/\/([^/?#]*))?([^?#]*)(\?([^#]*))?(#(.*))?$/);
+
+  if (!match) {
+    return {};
+  }
+
+  // coerce to undefined values to empty string so we don't get 'undefined'
+  const query = match[6] || '';
+  const fragment = match[8] || '';
+  return {
+    host: match[4],
+    path: match[5],
+    protocol: match[2],
+    search: query,
+    hash: fragment,
+    relative: match[5] + query + fragment, // everything minus origin
+  };
+}
+
+/**
+ * Strip the query string and fragment off of a given URL or path (if present)
+ *
+ * @param urlPath Full URL or path, including possible query string and/or fragment
+ * @returns URL or path without query string or fragment
+ */
+export function stripUrlQueryAndFragment(urlPath: string): string {
+  return (urlPath.split(/[?#]/, 1) as [string, ...string[]])[0];
+}
+
+/**
+ * Takes a URL object and returns a sanitized string which is safe to use as span name
+ * see: https://develop.sentry.dev/sdk/data-handling/#structuring-data
+ */
+export function getSanitizedUrlString(url: PartialURL): string {
+  const { protocol, host, path } = url;
+
+  const filteredHost =
+    host
+      // Always filter out authority
+      ?.replace(/^.*@/, '[filtered]:[filtered]@')
+      // Don't show standard :80 (http) and :443 (https) ports to reduce the noise
+      // TODO: Use new URL global if it exists
+      .replace(/(:80)$/, '')
+      .replace(/(:443)$/, '') || '';
+
+  // `parseUrl` returns `{}` for an empty or unparseable URL, and interpolating a missing path
+  // would render the string 'undefined'.
+  return `${protocol ? `${protocol}://` : ''}${filteredHost}${path || ''}`;
+}
+
+/**
+ * Strips the content from a data URL, returning a placeholder with the MIME type.
+ *
+ * Data URLs can be very long (e.g. base64 encoded scripts for Web Workers),
+ * with little valuable information, often leading to envelopes getting dropped due
+ * to size limit violations. Therefore, we strip data URLs and replace them with a
+ * placeholder.
+ *
+ * @param url - The URL to process
+ * @param includeDataPrefix - If true, includes the first 10 characters of the data stream
+ *                            for debugging (e.g., to identify magic bytes like WASM's AGFzbQ).
+ *                            Defaults to true.
+ * @returns For data URLs, returns a short format like `data:text/javascript;base64,SGVsbG8gV2... [truncated]`.
+ *          For non-data URLs, returns the original URL unchanged.
+ */
+export function stripDataUrlContent(url: string, includeDataPrefix: boolean = true): string {
+  if (url.startsWith('data:')) {
+    // Match the MIME type (everything after 'data:' until the first ';' or ',')
+    const match = url.match(/^data:([^;,]+)/);
+    const mimeType = match ? match[1] : 'text/plain';
+    const isBase64 = url.includes(';base64,');
+
+    // Find where the actual data starts (after the comma)
+    const dataStart = url.indexOf(',');
+    let dataPrefix = '';
+    if (includeDataPrefix && dataStart !== -1) {
+      const data = url.slice(dataStart + 1);
+      // Include first 10 chars of data to help identify content (e.g., magic bytes)
+      dataPrefix = data.length > 10 ? `${data.slice(0, 10)}... [truncated]` : data;
+    }
+
+    return `data:${mimeType}${isBase64 ? ',base64' : ''}${dataPrefix ? `,${dataPrefix}` : ''}`;
+  }
+  return url;
+}

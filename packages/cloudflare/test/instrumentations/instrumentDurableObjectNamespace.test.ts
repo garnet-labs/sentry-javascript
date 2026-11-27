@@ -1,0 +1,365 @@
+import * as SentryCore from '@sentry/core';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { instrumentDurableObjectNamespace } from '../../src/instrumentations/instrumentDurableObjectNamespace';
+
+const { getTraceDataMock } = vi.hoisted(() => ({
+  getTraceDataMock: vi.fn(),
+}));
+
+/**
+ * `_INTERNAL_getTracingHeadersForFetchRequest` imports `getTraceData` from this module, not from the
+ * `@sentry/core` barrel — spying on `SentryCore.getTraceData` does not affect it.
+ */
+vi.mock('../../../core/build/esm/utils/traceData.js', () => ({
+  getTraceData: getTraceDataMock,
+}));
+vi.mock('../../../core/build/cjs/utils/traceData.js', () => ({
+  getTraceData: getTraceDataMock,
+}));
+
+describe('instrumentDurableObjectNamespace', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    getTraceDataMock.mockReturnValue({});
+  });
+
+  function createMockNamespace() {
+    const mockStub = {
+      id: { toString: () => 'mock-id', equals: () => false, name: 'test' },
+      name: 'test-name',
+      fetch: vi.fn().mockResolvedValue(new Response('ok')),
+    };
+
+    return {
+      namespace: {
+        idFromName: vi.fn().mockReturnValue({ toString: () => 'id-from-name', equals: () => false, name: 'test' }),
+        idFromString: vi.fn().mockReturnValue({ toString: () => 'id-from-string', equals: () => false }),
+        newUniqueId: vi.fn().mockReturnValue({ toString: () => 'unique-id', equals: () => false }),
+        get: vi.fn().mockReturnValue(mockStub),
+        getByName: vi.fn().mockReturnValue(mockStub),
+        jurisdiction: vi.fn(),
+      },
+      mockStub,
+    };
+  }
+
+  describe('idFromName', () => {
+    it('delegates to original', () => {
+      const { namespace } = createMockNamespace();
+      const instrumented = instrumentDurableObjectNamespace(namespace);
+
+      const result = instrumented.idFromName('global-counter');
+
+      expect(namespace.idFromName).toHaveBeenCalledWith('global-counter');
+      expect(result).toEqual({ toString: expect.any(Function), equals: expect.any(Function), name: 'test' });
+    });
+  });
+
+  describe('idFromString', () => {
+    it('delegates to original', () => {
+      const { namespace } = createMockNamespace();
+      const instrumented = instrumentDurableObjectNamespace(namespace);
+
+      instrumented.idFromString('some-hex-id');
+
+      expect(namespace.idFromString).toHaveBeenCalledWith('some-hex-id');
+    });
+  });
+
+  describe('newUniqueId', () => {
+    it('delegates to original', () => {
+      const { namespace } = createMockNamespace();
+      const instrumented = instrumentDurableObjectNamespace(namespace);
+
+      instrumented.newUniqueId();
+
+      expect(namespace.newUniqueId).toHaveBeenCalled();
+    });
+  });
+
+  describe('get', () => {
+    it('delegates to original', () => {
+      const { namespace } = createMockNamespace();
+      const instrumented = instrumentDurableObjectNamespace(namespace);
+
+      const mockId = { toString: () => 'test-id', equals: () => false };
+      instrumented.get(mockId as any);
+
+      expect(namespace.get).toHaveBeenCalledWith(mockId);
+    });
+
+    it('returns an instrumented stub', async () => {
+      const { namespace, mockStub } = createMockNamespace();
+      const instrumented = instrumentDurableObjectNamespace(namespace);
+
+      const mockId = { toString: () => 'test-id', equals: () => false };
+      const stub = instrumented.get(mockId as any);
+
+      await (stub as any).fetch('https://example.com/path');
+
+      expect(mockStub.fetch).toHaveBeenCalledWith('https://example.com/path', expect.any(Object));
+    });
+  });
+
+  describe('getByName', () => {
+    it('delegates to original', () => {
+      const { namespace } = createMockNamespace();
+      const instrumented = instrumentDurableObjectNamespace(namespace);
+
+      instrumented.getByName('my-counter');
+
+      expect(namespace.getByName).toHaveBeenCalledWith('my-counter');
+    });
+  });
+
+  describe('jurisdiction', () => {
+    function createJurisdictionNamespace() {
+      const rpcMethod = vi.fn().mockReturnValue('rpc-result');
+      const { namespace: subnamespace } = createMockNamespace();
+      subnamespace.get.mockReturnValue({
+        id: { toString: () => 'mock-id', equals: () => false, name: 'test' },
+        fetch: vi.fn(),
+        myRpcMethod: rpcMethod,
+      });
+      const { namespace } = createMockNamespace();
+      namespace.jurisdiction.mockReturnValue(subnamespace);
+
+      return { namespace, subnamespace, rpcMethod };
+    }
+
+    it('propagates RPC trace context from stubs of the jurisdiction-restricted namespace', () => {
+      vi.spyOn(SentryCore, 'getTraceData').mockReturnValue({
+        'sentry-trace': '12345678901234567890123456789012-1234567890123456-1',
+        baggage: 'sentry-environment=production',
+      });
+      const { namespace, subnamespace, rpcMethod } = createJurisdictionNamespace();
+      const instrumented = instrumentDurableObjectNamespace(namespace, true);
+
+      const eu = instrumented.jurisdiction('eu');
+      const stub = eu.get({ toString: () => 'id', equals: () => false } as any);
+      (stub as any).myRpcMethod('arg1');
+
+      expect(namespace.jurisdiction).toHaveBeenCalledWith('eu');
+      expect(subnamespace.get).toHaveBeenCalledOnce();
+      expect(rpcMethod).toHaveBeenCalledWith('arg1', {
+        __sentry_rpc_meta__: {
+          'sentry-trace': '12345678901234567890123456789012-1234567890123456-1',
+          baggage: 'sentry-environment=production',
+        },
+      });
+    });
+
+    it('does not propagate RPC trace context when propagation is off for the binding', () => {
+      vi.spyOn(SentryCore, 'getTraceData').mockReturnValue({
+        'sentry-trace': '12345678901234567890123456789012-1234567890123456-1',
+      });
+      const { namespace, rpcMethod } = createJurisdictionNamespace();
+      const instrumented = instrumentDurableObjectNamespace(namespace);
+
+      const stub = instrumented.jurisdiction('eu').get({ toString: () => 'id', equals: () => false } as any);
+      (stub as any).myRpcMethod('arg1');
+
+      expect(rpcMethod).toHaveBeenCalledWith('arg1');
+    });
+  });
+
+  describe('stub instrumentation', () => {
+    it('calls stub.fetch with URL object', async () => {
+      const { namespace, mockStub } = createMockNamespace();
+      const instrumented = instrumentDurableObjectNamespace(namespace);
+
+      const mockId = { toString: () => 'test-id', equals: () => false };
+      const stub = instrumented.get(mockId as any);
+
+      const url = new URL('https://example.com/api/test');
+      await (stub as any).fetch(url);
+
+      expect(mockStub.fetch).toHaveBeenCalledWith(url, expect.any(Object));
+    });
+
+    it('calls stub.fetch with Request object', async () => {
+      getTraceDataMock.mockReturnValue({});
+
+      const { namespace, mockStub } = createMockNamespace();
+      const instrumented = instrumentDurableObjectNamespace(namespace);
+
+      const mockId = { toString: () => 'test-id', equals: () => false };
+      const stub = instrumented.get(mockId as any);
+
+      const request = new Request('https://example.com/api/data');
+      await (stub as any).fetch(request);
+
+      // When there are no trace headers and input is a Request, instrumentFetcher
+      // passes the request through without an init object.
+      expect(mockStub.fetch).toHaveBeenCalled();
+      const [passedRequest, passedInit] = mockStub.fetch.mock.calls[0]!;
+      expect(passedRequest).toBe(request);
+      expect(passedInit).toBeUndefined();
+    });
+
+    it('propagates trace headers on stub.fetch', async () => {
+      getTraceDataMock.mockReturnValue({
+        'sentry-trace': '12345678901234567890123456789012-1234567890123456-1',
+        baggage: 'sentry-environment=production',
+      });
+
+      const { namespace, mockStub } = createMockNamespace();
+      const instrumented = instrumentDurableObjectNamespace(namespace);
+
+      const mockId = { toString: () => 'test-id', equals: () => false };
+      const stub = instrumented.get(mockId as any);
+
+      await (stub as any).fetch('https://example.com/api');
+
+      const [, init] = mockStub.fetch.mock.calls[0]!;
+      const headers = new Headers(init?.headers);
+      expect(headers.get('sentry-trace')).toBe('12345678901234567890123456789012-1234567890123456-1');
+      expect(headers.get('baggage')).toBe('sentry-environment=production');
+    });
+
+    it('passes non-fetch properties through', () => {
+      const { namespace, mockStub } = createMockNamespace();
+      const instrumented = instrumentDurableObjectNamespace(namespace);
+
+      const mockId = { toString: () => 'test-id', equals: () => false };
+      const stub = instrumented.get(mockId as any);
+
+      expect((stub as any).id).toBe(mockStub.id);
+      expect((stub as any).name).toBe(mockStub.name);
+    });
+  });
+
+  describe('RPC method instrumentation', () => {
+    it('injects Sentry RPC meta into RPC method calls', () => {
+      vi.spyOn(SentryCore, 'getTraceData').mockReturnValue({
+        'sentry-trace': '12345678901234567890123456789012-1234567890123456-1',
+        baggage: 'sentry-environment=production',
+      });
+
+      const rpcMethod = vi.fn().mockReturnValue('rpc-result');
+      const { namespace: originalNamespace } = createMockNamespace();
+      const namespace = {
+        ...originalNamespace,
+        get: vi.fn().mockReturnValue({
+          id: { toString: () => 'mock-id', equals: () => false, name: 'test' },
+          fetch: vi.fn(),
+          myRpcMethod: rpcMethod,
+        }),
+      };
+      const instrumented = instrumentDurableObjectNamespace(namespace, true);
+
+      const stub = instrumented.get({ toString: () => 'id', equals: () => false } as any);
+      (stub as any).myRpcMethod('arg1', 42);
+
+      expect(rpcMethod).toHaveBeenCalledWith('arg1', 42, {
+        __sentry_rpc_meta__: {
+          'sentry-trace': '12345678901234567890123456789012-1234567890123456-1',
+          baggage: 'sentry-environment=production',
+        },
+      });
+    });
+
+    it('does not inject meta when no active trace', () => {
+      vi.spyOn(SentryCore, 'getTraceData').mockReturnValue({});
+
+      const rpcMethod = vi.fn().mockReturnValue('result');
+      const { namespace: originalNamespace } = createMockNamespace();
+      const namespace = {
+        ...originalNamespace,
+        get: vi.fn().mockReturnValue({
+          id: { toString: () => 'mock-id', equals: () => false, name: 'test' },
+          fetch: vi.fn(),
+          myRpcMethod: rpcMethod,
+        }),
+      };
+      const instrumented = instrumentDurableObjectNamespace(namespace, true);
+
+      const stub = instrumented.get({ toString: () => 'id', equals: () => false } as any);
+      (stub as any).myRpcMethod('arg1');
+
+      expect(rpcMethod).toHaveBeenCalledWith('arg1');
+    });
+
+    it('does not inject meta when RPC trace propagation is off for the binding', () => {
+      vi.spyOn(SentryCore, 'getTraceData').mockReturnValue({
+        'sentry-trace': '12345678901234567890123456789012-1234567890123456-1',
+      });
+
+      const rpcMethod = vi.fn();
+      const { namespace: originalNamespace } = createMockNamespace();
+      const namespace = {
+        ...originalNamespace,
+        get: vi.fn().mockReturnValue({
+          id: { toString: () => 'mock-id', equals: () => false, name: 'test' },
+          fetch: vi.fn(),
+          myRpcMethod: rpcMethod,
+        }),
+      };
+      const instrumented = instrumentDurableObjectNamespace(namespace);
+
+      const stub = instrumented.get({ toString: () => 'id', equals: () => false } as any);
+      (stub as any).myRpcMethod('arg1', 42);
+
+      expect(rpcMethod).toHaveBeenCalledWith('arg1', 42);
+    });
+
+    it('does not wrap built-in stub methods (connect, dup)', () => {
+      vi.spyOn(SentryCore, 'getTraceData').mockReturnValue({
+        'sentry-trace': 'abc-def-1',
+      });
+
+      const connectFn = vi.fn();
+      const dupFn = vi.fn();
+      const { namespace: originalNamespace } = createMockNamespace();
+      const namespace = {
+        ...originalNamespace,
+        get: vi.fn().mockReturnValue({
+          id: { toString: () => 'mock-id', equals: () => false, name: 'test' },
+          fetch: vi.fn(),
+          connect: connectFn,
+          dup: dupFn,
+        }),
+      };
+      const instrumented = instrumentDurableObjectNamespace(namespace, true);
+
+      const stub = instrumented.get({ toString: () => 'id', equals: () => false } as any);
+      (stub as any).connect('127.0.0.1:9');
+
+      expect(connectFn).toHaveBeenCalledWith('127.0.0.1:9');
+      expect((stub as any).dup).toBe(dupFn);
+    });
+
+    it('calls connect with the underlying stub as `this`', () => {
+      const { namespace: originalNamespace } = createMockNamespace();
+      const rawStub = {
+        id: { toString: () => 'mock-id', equals: () => false, name: 'test' },
+        fetch: vi.fn(),
+        connect(this: unknown) {
+          if (this !== rawStub) {
+            throw new TypeError('Illegal invocation: function called with incorrect `this` reference.');
+          }
+          return 'socket';
+        },
+      };
+      const namespace = { ...originalNamespace, get: vi.fn().mockReturnValue(rawStub) };
+      const instrumented = instrumentDurableObjectNamespace(namespace);
+
+      const stub = instrumented.get({ toString: () => 'id', equals: () => false } as any);
+
+      expect((stub as any).connect('127.0.0.1:9')).toBe('socket');
+    });
+  });
+
+  describe('non-function properties', () => {
+    it('returns non-function properties unchanged', () => {
+      const { namespace: originalNamespace } = createMockNamespace();
+      const namespace = {
+        ...originalNamespace,
+        someProperty: 'value',
+      };
+      const instrumented = instrumentDurableObjectNamespace(namespace, true);
+
+      expect((instrumented as any).someProperty).toBe('value');
+    });
+  });
+});

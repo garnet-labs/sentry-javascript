@@ -1,0 +1,261 @@
+import type { Nuxt, ResolvedNuxtTemplate } from '@nuxt/schema';
+import { consoleSandbox } from '@sentry/core';
+import * as fs from 'fs';
+import * as path from 'path';
+import { fileURLToPath } from 'node:url';
+import type { SentryNuxtModuleOptions } from '../common/types';
+import { addTemplate, resolvePath, resolveServerVariant } from '@nuxt/kit';
+import { NUXT_DEV_MODE_FLAG, NUXT_PRERENDER_FLAG } from '../common/devMode';
+
+const SERVER_API_VARIANTS = { nitro2: 'nitro2', nitro3: 'nitro3', nuxt: 'nuxt' } as const;
+
+/** The upstream server API the host runs. `nuxt` means the host runs no Nitro, for example the Vite server. */
+export type ServerApi = keyof typeof SERVER_API_VARIANTS;
+
+/**
+ * Resolves the server API of the current Nuxt host. Call it once in the module setup and pass the result on.
+ */
+export function resolveServerApi(): ServerApi {
+  // Kit returns `undefined` only when the host runs none of the given keys, and every host runs one of these.
+  return resolveServerVariant(SERVER_API_VARIANTS) ?? 'nitro2';
+}
+
+/**
+ *  Find the default SDK init file for the given type (client or server).
+ */
+export async function findDefaultSdkInitFile(
+  type: 'server' | 'client',
+  nuxt?: Nuxt,
+  options?: SentryNuxtModuleOptions,
+): Promise<string | undefined> {
+  const possibleFileExtensions = ['ts', 'js', 'mjs', 'cjs', 'mts', 'cts'];
+  const relativePaths = possibleFileExtensions.map(ext => `sentry.${type}.config.${ext}`);
+
+  // Get layers from highest priority to lowest
+  const layers = [...(nuxt?.options._layers ?? [])].reverse();
+
+  for (const layer of layers) {
+    for (const relativePath of relativePaths) {
+      const fullPath = path.resolve(layer.cwd, relativePath);
+      if (fs.existsSync(fullPath)) {
+        return fullPath;
+      }
+    }
+  }
+
+  // As a fallback, also check CWD (left for pure compatibility)
+  const rootDir = options?.configDir ? await resolvePath(options.configDir, { type: 'dir' }) : process.cwd();
+  for (const relativePath of relativePaths) {
+    const fullPath = path.resolve(rootDir, relativePath);
+    if (fs.existsSync(fullPath)) {
+      return fullPath;
+    }
+  }
+
+  return undefined;
+}
+
+export const SERVER_CONFIG_FILENAME = 'sentry.server.config';
+
+/** Whether a resolved Nitro preset targets Cloudflare (workerd). Nitro normalizes preset names, so any `cloudflare*` spelling matches. */
+export function isCloudflarePreset(preset: string | undefined): boolean {
+  return !!preset?.replace(/-/g, '_').startsWith('cloudflare');
+}
+
+/** Builds the value for `node --import`. Node reads it as a URL, so it needs forward slashes on Windows too. */
+export function toImportSpecifier(fromDir: string, filePath: string): string {
+  return `./${path.relative(fromDir, filePath).split(/[\\/]/).join('/')}`;
+}
+
+/**
+ *  Extracts the filename from a node command with a path.
+ */
+export function getFilenameFromNodeStartCommand(nodeCommand: string): string | null {
+  const regex = /[^/\\]+\.[^/\\]+$/;
+  const match = nodeCommand.match(regex);
+  return match ? match[0] : null;
+}
+
+export const SENTRY_WRAPPED_ENTRY = '?sentry-query-wrapped-entry';
+export const SENTRY_WRAPPED_FUNCTIONS = '?sentry-query-wrapped-functions=';
+export const SENTRY_REEXPORTED_FUNCTIONS = '?sentry-query-reexported-functions=';
+export const QUERY_END_INDICATOR = 'SENTRY-QUERY-END';
+
+/**
+ * Strips the Sentry query part from a path.
+ * Example: example/path?sentry-query-wrapped-entry?sentry-query-functions-reexport=foo,SENTRY-QUERY-END -> /example/path
+ *
+ * Only exported for testing.
+ */
+export function removeSentryQueryFromPath(url: string): string {
+  // oxlint-disable-next-line sdk/no-regexp-constructor
+  const regex = new RegExp(`\\${SENTRY_WRAPPED_ENTRY}.*?\\${QUERY_END_INDICATOR}`);
+  return url.replace(regex, '');
+}
+
+/**
+ * Extracts and sanitizes function re-export and function wrap query parameters from a query string.
+ * If it is a default export, it is not considered for re-exporting.
+ *
+ * Only exported for testing.
+ */
+export function extractFunctionReexportQueryParameters(query: string): { wrap: string[]; reexport: string[] } {
+  // Regex matches the comma-separated params between the functions query
+  // oxlint-disable-next-line sdk/no-regexp-constructor
+  const wrapRegex = new RegExp(
+    `\\${SENTRY_WRAPPED_FUNCTIONS}(.*?)(\\${QUERY_END_INDICATOR}|\\${SENTRY_REEXPORTED_FUNCTIONS})`,
+  );
+  // oxlint-disable-next-line sdk/no-regexp-constructor
+  const reexportRegex = new RegExp(`\\${SENTRY_REEXPORTED_FUNCTIONS}(.*?)(\\${QUERY_END_INDICATOR})`);
+
+  const wrapMatch = query.match(wrapRegex);
+  const reexportMatch = query.match(reexportRegex);
+
+  const wrap =
+    wrapMatch?.[1]
+      ?.split(',')
+      .filter(param => param !== '')
+      // Sanitize, as code could be injected with another rollup plugin
+      .map((str: string) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')) || [];
+
+  const reexport =
+    reexportMatch?.[1]
+      ?.split(',')
+      .filter(param => param !== '' && param !== 'default')
+      // Sanitize, as code could be injected with another rollup plugin
+      .map((str: string) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')) || [];
+
+  return { wrap, reexport };
+}
+
+/**
+ *  Constructs a comma-separated string with all functions that need to be re-exported later from the server entry.
+ *  It uses Rollup's `exportedBindings` to determine the functions to re-export. Functions which should be wrapped
+ *  (e.g. serverless handlers) are wrapped by Sentry.
+ */
+export function constructWrappedFunctionExportQuery(
+  exportedBindings: Record<string, string[]> | null,
+  entrypointWrappedFunctions: string[],
+  debug?: boolean,
+): string {
+  const functionsToExport: { wrap: string[]; reexport: string[] } = {
+    wrap: [],
+    reexport: [],
+  };
+
+  // `exportedBindings` can look like this:  `{ '.': [ 'handler' ] }` or `{ '.': [], './firebase-gen-1.mjs': [ 'server' ] }`
+  // The key `.` refers to exports within the current file, while other keys show from where exports were imported first.
+  Object.values(exportedBindings || {}).forEach(functions =>
+    functions.forEach(fn => {
+      if (entrypointWrappedFunctions.includes(fn)) {
+        functionsToExport.wrap.push(fn);
+      } else {
+        functionsToExport.reexport.push(fn);
+      }
+    }),
+  );
+
+  if (debug && functionsToExport.wrap.length === 0) {
+    consoleSandbox(() =>
+      // eslint-disable-next-line no-console
+      console.warn(
+        "[Sentry] No functions found to wrap. In case the server needs to export async functions other than `handler` or  `server`, consider adding the name(s) to Sentry's build options `sentry.experimental_entrypointWrappedFunctions` in `nuxt.config.ts`.",
+      ),
+    );
+  }
+
+  const wrapQuery = functionsToExport.wrap.length
+    ? `${SENTRY_WRAPPED_FUNCTIONS}${functionsToExport.wrap.join(',')}`
+    : '';
+  const reexportQuery = functionsToExport.reexport.length
+    ? `${SENTRY_REEXPORTED_FUNCTIONS}${functionsToExport.reexport.join(',')}`
+    : '';
+
+  return [wrapQuery, reexportQuery].join('');
+}
+
+/**
+ * Constructs a code snippet with function reexports (can be used in Rollup plugins as a return value for `load()`)
+ */
+export function constructFunctionReExport(pathWithQuery: string, entryId: string): string {
+  const { wrap: wrapFunctions, reexport: reexportFunctions } = extractFunctionReexportQueryParameters(pathWithQuery);
+
+  return wrapFunctions
+    .reduce(
+      (functionsCode, currFunctionName) =>
+        functionsCode.concat(
+          `async function ${currFunctionName}_sentryWrapped(...args) {\n` +
+            `  const res = await import(${JSON.stringify(entryId)});\n` +
+            `  return res.${currFunctionName}.call(this, ...args);\n` +
+            '}\n' +
+            `export { ${currFunctionName}_sentryWrapped as ${currFunctionName} };\n`,
+        ),
+      '',
+    )
+    .concat(
+      reexportFunctions.reduce(
+        (functionsCode, currFunctionName) =>
+          functionsCode.concat(`export { ${currFunctionName} } from ${JSON.stringify(entryId)};`),
+        '',
+      ),
+    );
+}
+
+/**
+ * `load()` emits `file://` specifiers because Node's ESM loader rejects bare Windows
+ * paths (`ERR_UNSUPPORTED_ESM_URL_SCHEME`), but Rollup's resolver only understands
+ * filesystem paths. Returns `undefined` for a malformed `file://` URL.
+ *
+ * Only exported for testing.
+ */
+export function toResolvablePath(source: string): { path: string; wasFileUrl: boolean } | undefined {
+  if (!source.startsWith('file://')) {
+    return { path: source, wasFileUrl: false };
+  }
+  if (source === 'file://' || source === 'file:///') {
+    return undefined;
+  }
+  try {
+    const filePath = fileURLToPath(source);
+    if (!filePath || filePath === '/' || filePath === '\\') {
+      return undefined;
+    }
+    return { path: filePath, wasFileUrl: true };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Nitro v3 bundles every dependency by default, but `@sentry/server-runtime-injection` must load
+ * from `node_modules`: on Node versions without `Module.registerHooks` it registers its ESM loader
+ * hook by file, and that file does not exist next to a bundled copy. Nitro v2 already keeps
+ * dependencies external.
+ */
+export function addRuntimeInjectionTraceDep(nuxt: Nuxt, isNitroV3: boolean): void {
+  if (!isNitroV3) {
+    return;
+  }
+
+  // Nuxt types `nitro` against Nitro v2, which has no `traceDeps`.
+  const nitroOptions = nuxt.options.nitro as { traceDeps?: (string | RegExp)[] };
+  nitroOptions.traceDeps = [...(nitroOptions.traceDeps ?? []), '@sentry/server-runtime-injection'];
+}
+
+/**
+ * Generates the module that sets the runtime flags `Sentry.init` reads. Import it before the
+ * Sentry server config: a statement above the config import would not survive import hoisting.
+ */
+export function addRuntimeFlagsTemplate(): ResolvedNuxtTemplate {
+  return addTemplate({
+    filename: 'sentry-runtime-flags.mjs',
+    write: true,
+    getContents: () =>
+      [
+        '// Generated by @sentry/nuxt. Sets runtime flags before the Sentry server config evaluates.',
+        `globalThis.${NUXT_DEV_MODE_FLAG} = import.meta.dev === true;`,
+        `globalThis.${NUXT_PRERENDER_FLAG} = import.meta.prerender === true;`,
+        '',
+      ].join('\n'),
+  });
+}

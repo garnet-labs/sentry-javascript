@@ -1,0 +1,151 @@
+import { addNonEnumerableProperty, getClient, hasSpanStreamingEnabled, startSpan } from '@sentry/core';
+import { flushIfServerless } from '@sentry/core/server';
+import {
+  SENTRY_SEGMENT_NAME_SOURCE,
+  CODE_FUNCTION_NAME,
+  HTTP_REQUEST_METHOD,
+  HTTP_ROUTE,
+  SENTRY_DESCRIPTION,
+  SENTRY_OP,
+  URL_PATH,
+  SENTRY_ORIGIN,
+} from '@sentry/conventions/attributes';
+import { FUNCTION } from '@sentry/conventions/op';
+import type { LoadEvent, ServerLoadEvent } from '@sveltejs/kit';
+import type { SentryWrappedFlag } from '../common/utils';
+import { getPathname, getRouteId } from '../common/utils';
+import { sendErrorToSentry } from './utils';
+
+type PatchedLoadEvent = LoadEvent & SentryWrappedFlag;
+type PatchedServerLoadEvent = ServerLoadEvent & SentryWrappedFlag;
+
+/**
+ * @inheritdoc
+ */
+// The liberal generic typing of `T` is necessary because we cannot let T extend `Load`.
+// This function needs to tell TS that it returns exactly the type that it was called with
+// because SvelteKit generates the narrowed down `PageLoad` or `LayoutLoad` types
+// at build time for every route.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function wrapLoadWithSentry<T extends (...args: any) => any>(origLoad: T): T {
+  return new Proxy(origLoad, {
+    apply: async (wrappingTarget, thisArg, args: Parameters<T>) => {
+      // Type casting here because `T` cannot extend `Load` (see comment above function signature)
+      // Also, this event possibly already has a sentry wrapped flag attached
+      const event = args[0] as PatchedLoadEvent;
+
+      if (event.__sentry_wrapped__) {
+        return wrappingTarget.apply(thisArg, args);
+      }
+
+      addNonEnumerableProperty(event, '__sentry_wrapped__', true);
+
+      const routeId = getRouteId(event) ?? undefined;
+      const pathname = getPathname(event);
+      const routeOrPathname = routeId ? routeId : pathname;
+
+      const client = getClient();
+      const hasSpanStreaming = !!client && hasSpanStreamingEnabled(client);
+
+      try {
+        // We need to await before returning, otherwise we won't catch any errors thrown by the load function
+        return await startSpan(
+          {
+            name: hasSpanStreaming ? 'load' : routeOrPathname,
+            attributes: {
+              [SENTRY_OP]: FUNCTION,
+              [CODE_FUNCTION_NAME]: 'load',
+              [SENTRY_ORIGIN]: 'auto.function.sveltekit',
+              [SENTRY_SEGMENT_NAME_SOURCE]: routeId ? 'route' : 'url',
+              [URL_PATH]: pathname,
+              [HTTP_ROUTE]: routeId,
+              // Relay infers the description from `code.function.name`, which would drop the route.
+              ...(hasSpanStreaming && { [SENTRY_DESCRIPTION]: routeOrPathname }),
+            },
+          },
+          () => wrappingTarget.apply(thisArg, args),
+        );
+      } catch (e) {
+        sendErrorToSentry(e, 'load');
+        throw e;
+      } finally {
+        await flushIfServerless();
+      }
+    },
+  });
+}
+
+/**
+ * Wrap a server-only load function (e.g. +page.server.js or +layout.server.js) with Sentry functionality
+ *
+ * Usage:
+ *
+ * ```js
+ * // +page.serverjs
+ *
+ * import { wrapServerLoadWithSentry }
+ *
+ * export const load = wrapServerLoadWithSentry((event) => {
+ *   // your load code
+ * });
+ * ```
+ *
+ * @param origServerLoad SvelteKit user defined server-only load function
+ */
+// The liberal generic typing of `T` is necessary because we cannot let T extend `ServerLoad`.
+// This function needs to tell TS that it returns exactly the type that it was called with
+// because SvelteKit generates the narrowed down `PageServerLoad` or `LayoutServerLoad` types
+// at build time for every route.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function wrapServerLoadWithSentry<T extends (...args: any) => any>(origServerLoad: T): T {
+  return new Proxy(origServerLoad, {
+    apply: async (wrappingTarget, thisArg, args: Parameters<T>) => {
+      // Type casting here because `T` cannot extend `ServerLoad` (see comment above function signature)
+      // Also, this event possibly already has a sentry wrapped flag attached
+      const event = args[0] as PatchedServerLoadEvent;
+
+      if (event.__sentry_wrapped__) {
+        return wrappingTarget.apply(thisArg, args);
+      }
+
+      addNonEnumerableProperty(event, '__sentry_wrapped__', true);
+
+      // Accessing any member of `event.route` causes SvelteKit to invalidate the
+      // server `load` function's data on every route change. We use `getRouteId` which uses
+      // SvelteKit 2's `untrack` when available, otherwise getOwnPropertyDescriptor for 1.x.
+      const routeId = getRouteId(event) ?? undefined;
+      const pathname = getPathname(event);
+      const routeOrPathname = routeId ? routeId : pathname;
+
+      const client = getClient();
+      const hasSpanStreaming = !!client && hasSpanStreamingEnabled(client);
+
+      try {
+        // We need to await before returning, otherwise we won't catch any errors thrown by the load function
+        return await startSpan(
+          {
+            attributes: {
+              [SENTRY_OP]: FUNCTION,
+              [CODE_FUNCTION_NAME]: 'load',
+              [SENTRY_ORIGIN]: 'auto.function.sveltekit.server',
+              [SENTRY_SEGMENT_NAME_SOURCE]: routeId ? 'route' : 'url',
+              [HTTP_REQUEST_METHOD]: event.request.method,
+              [URL_PATH]: pathname,
+              [HTTP_ROUTE]: routeId,
+              // Relay infers the description from `code.function.name`, which would drop the route.
+              ...(hasSpanStreaming && { [SENTRY_DESCRIPTION]: routeOrPathname }),
+            },
+            // With span streaming, span names have to be low cardinality, so we use the function name.
+            name: hasSpanStreaming ? 'load' : routeOrPathname,
+          },
+          () => wrappingTarget.apply(thisArg, args),
+        );
+      } catch (e: unknown) {
+        sendErrorToSentry(e, 'load');
+        throw e;
+      } finally {
+        await flushIfServerless();
+      }
+    },
+  });
+}

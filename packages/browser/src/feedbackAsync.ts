@@ -1,0 +1,10 @@
+import { buildFeedbackIntegration } from '@sentry/feedback';
+import { lazyLoadIntegration } from './utils/lazyLoadIntegration';
+
+/**
+ * An integration to add user feedback to your application,
+ * while loading most of the code lazily only when it's needed.
+ */
+export const feedbackAsyncIntegration: ReturnType<typeof buildFeedbackIntegration> = buildFeedbackIntegration({
+  lazyLoadIntegration,
+});

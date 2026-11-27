@@ -1,0 +1,12 @@
+{
+  "extends": "../../tsconfig.json",
+
+  "include": ["**/*.ts", "src/**/*"],
+
+  "exclude": ["patch-vitest.ts", "setup-test.ts"],
+
+  "compilerOptions": {
+    // package-specific options
+    "experimentalDecorators": true
+  }
+}
