@@ -1,0 +1,35 @@
+import { expect } from '@playwright/test';
+import { sentryTest } from '../../../../utils/fixtures';
+import { shouldSkipTracingTest } from '../../../../utils/helpers';
+
+type WindowWithSpan = Window & {
+  firstWaitingSpan: any;
+  secondWaitingSpan: any;
+  thirdWaitingSpan: any;
+};
+
+sentryTest(
+  'async spans with different durations lead to unexpected behavior in browser (no "asynchronous context tracking")',
+  async ({ getLocalTestUrl, page }) => {
+    if (shouldSkipTracingTest()) {
+      sentryTest.skip();
+    }
+
+    const url = await getLocalTestUrl({ testDir: __dirname });
+    await page.goto(url);
+
+    await page.waitForFunction(() => !!(window as unknown as WindowWithSpan).secondWaitingSpan);
+
+    const firstWaitingSpanValue = await page.evaluate(
+      () => (window as unknown as WindowWithSpan).firstWaitingSpan.name,
+    );
+    const secondWaitingSpanName = await page.evaluate(
+      () => (window as unknown as WindowWithSpan).secondWaitingSpan.name,
+    );
+    const thirdWaitingSpanName = await page.evaluate(() => (window as unknown as WindowWithSpan).thirdWaitingSpan.name);
+
+    expect(firstWaitingSpanValue).toBe('span 2');
+    expect(secondWaitingSpanName).toBe('span 1');
+    expect(thirdWaitingSpanName).toBe('span 3');
+  },
+);

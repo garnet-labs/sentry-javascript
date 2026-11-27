@@ -1,0 +1,47 @@
+{
+  "$schema": "../../node_modules/oxlint/configuration_schema.json",
+  "extends": ["../../.oxlintrc.base.json"],
+  "jsPlugins": [
+    {
+      "name": "sdk",
+      "specifier": "@sentry/eslint-plugin-sdk"
+    }
+  ],
+  "env": {
+    "node": true
+  },
+  "rules": {
+    "sdk/no-unsafe-random-apis": "error"
+  },
+  "overrides": [
+    {
+      "files": ["**/src/**"],
+      "rules": {
+        "sdk/no-class-field-initializers": "off",
+        "no-restricted-imports": [
+          "error",
+          {
+            "paths": [
+              {
+                "name": "node:diagnostics_channel",
+                "allowTypeImports": true,
+                "message": "Bun garbage-collects a channel that no code references, together with its subscribers. Use `subscribeDiagnosticsChannel` or `diagnosticsTracingChannel` from `@sentry/server-utils` instead. See https://github.com/oven-sh/bun/issues/43086"
+              },
+              {
+                "name": "diagnostics_channel",
+                "allowTypeImports": true,
+                "message": "Bun garbage-collects a channel that no code references, together with its subscribers. Use `subscribeDiagnosticsChannel` or `diagnosticsTracingChannel` from `@sentry/server-utils` instead. See https://github.com/oven-sh/bun/issues/43086"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["test/**/*.ts", "test/**/*.tsx"],
+      "rules": {
+        "sdk/no-unsafe-random-apis": "off"
+      }
+    }
+  ]
+}

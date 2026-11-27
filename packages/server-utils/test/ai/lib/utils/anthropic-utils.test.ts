@@ -1,0 +1,129 @@
+import { describe, expect, it } from 'vitest';
+import {
+  getMessagesAttributes,
+  getProviderName,
+  mapAnthropicErrorToStatusMessage,
+  messagesFromParams,
+} from '../../../../src/ai/anthropic-ai/utils';
+
+describe('anthropic-ai-utils', () => {
+  describe('getProviderName', () => {
+    it('reads the provider name of the client that owns the resource', () => {
+      expect(getProviderName({ _client: { _genAIProviderName: 'aws.bedrock' } })).toBe('aws.bedrock');
+    });
+
+    it.each([
+      undefined,
+      null,
+      {},
+      { _client: {} },
+      { _client: { _genAIProviderName: '' } },
+      { _client: { _genAIProviderName: 1 } },
+    ])('falls back to anthropic for %j', resource => {
+      expect(getProviderName(resource)).toBe('anthropic');
+    });
+  });
+
+  describe('mapAnthropicErrorToStatusMessage', () => {
+    it('maps known Anthropic error types to SpanStatusType values', () => {
+      expect(mapAnthropicErrorToStatusMessage('invalid_request_error')).toBe('invalid_argument');
+      expect(mapAnthropicErrorToStatusMessage('authentication_error')).toBe('unauthenticated');
+      expect(mapAnthropicErrorToStatusMessage('permission_error')).toBe('permission_denied');
+      expect(mapAnthropicErrorToStatusMessage('not_found_error')).toBe('not_found');
+      expect(mapAnthropicErrorToStatusMessage('request_too_large')).toBe('failed_precondition');
+      expect(mapAnthropicErrorToStatusMessage('rate_limit_error')).toBe('resource_exhausted');
+      expect(mapAnthropicErrorToStatusMessage('api_error')).toBe('internal_error');
+      expect(mapAnthropicErrorToStatusMessage('overloaded_error')).toBe('unavailable');
+    });
+
+    it('falls back to internal_error for unknown error types', () => {
+      expect(mapAnthropicErrorToStatusMessage('some_new_error')).toBe('internal_error');
+    });
+
+    it('falls back to internal_error for undefined', () => {
+      expect(mapAnthropicErrorToStatusMessage(undefined)).toBe('internal_error');
+    });
+  });
+
+  describe('messagesFromParams', () => {
+    it('includes system message in messages list', () => {
+      expect(
+        messagesFromParams({
+          messages: [{ role: 'user', content: 'hello' }],
+          system: 'You are a friendly robot awaiting a greeting.',
+        }),
+      ).toStrictEqual([
+        { role: 'system', content: 'You are a friendly robot awaiting a greeting.' },
+        { role: 'user', content: 'hello' },
+      ]);
+    });
+
+    it('includes the text of system blocks as one system message', () => {
+      expect(
+        messagesFromParams({
+          messages: [{ role: 'user', content: 'hello' }],
+          system: [
+            { type: 'text', text: 'Be brief.' },
+            { type: 'text', text: 'Be kind.', cache_control: { type: 'ephemeral' } },
+          ],
+        }),
+      ).toStrictEqual([
+        { role: 'system', content: 'Be brief.\nBe kind.' },
+        { role: 'user', content: 'hello' },
+      ]);
+    });
+
+    it('looks to params.input ahead of params.messages', () => {
+      expect(
+        messagesFromParams({
+          input: [{ role: 'user', content: 'input' }],
+          messages: [{ role: 'user', content: 'hello' }],
+          system: 'You are a friendly robot awaiting a greeting.',
+        }),
+      ).toStrictEqual([
+        { role: 'system', content: 'You are a friendly robot awaiting a greeting.' },
+        { role: 'user', content: 'input' },
+      ]);
+    });
+
+    it('includes system message along with non-array messages', () => {
+      expect(
+        messagesFromParams({
+          messages: { role: 'user', content: 'hello' },
+          system: 'You are a friendly robot awaiting a greeting.',
+        }),
+      ).toStrictEqual([
+        { role: 'system', content: 'You are a friendly robot awaiting a greeting.' },
+        { role: 'user', content: 'hello' },
+      ]);
+    });
+
+    it('includes system message if no other messages', () => {
+      expect(
+        messagesFromParams({
+          system: 'You are a friendly robot awaiting a greeting.',
+        }),
+      ).toStrictEqual([{ role: 'system', content: 'You are a friendly robot awaiting a greeting.' }]);
+    });
+
+    it('returns messages if no system message', () => {
+      expect(
+        messagesFromParams({
+          messages: [{ role: 'user', content: 'hello' }],
+        }),
+      ).toStrictEqual([{ role: 'user', content: 'hello' }]);
+    });
+  });
+
+  describe('getMessagesAttributes', () => {
+    it('returns the input messages attribute', () => {
+      expect(getMessagesAttributes([{ role: 'user', content: 'hello, world' }])).toStrictEqual({
+        'gen_ai.input.messages': '[{"role":"user","content":"hello, world"}]',
+      });
+    });
+
+    it('ignores empty array', () => {
+      expect(getMessagesAttributes([])).toStrictEqual({});
+    });
+  });
+});

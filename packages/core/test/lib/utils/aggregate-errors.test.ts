@@ -1,0 +1,613 @@
+import { runInNewContext } from 'node:vm';
+import { describe, expect, test } from 'vitest';
+import type { ExtendedError } from '../../../src/types/error';
+import type { Event, EventHint } from '../../../src/types/event';
+import type { Exception } from '../../../src/types/exception';
+import type { StackParser } from '../../../src/types/stacktrace';
+import { applyAggregateErrorsToEvent } from '../../../src/utils/aggregate-errors';
+import { addExceptionMechanismToCapturedException } from '../../../src/utils/misc';
+import { createStackParser } from '../../../src/utils/stacktrace';
+
+const stackParser = createStackParser([0, line => ({ filename: line })]);
+const exceptionFromError = (_stackParser: StackParser, ex: Error): Exception => {
+  return { value: ex.message, type: ex.name, mechanism: { type: 'instrument', handled: true } };
+};
+class FakeAggregateError extends Error {
+  public errors: Error[];
+
+  constructor(errors: Error[], message: string) {
+    super(message);
+    this.errors = errors;
+    this.name = 'AggregateError';
+  }
+}
+
+class CustomAggregateError extends FakeAggregateError {
+  public cause?: Error;
+
+  constructor(errors: Error[], message: string, cause?: Error) {
+    super(errors, message);
+    this.name = 'CustomAggregateError';
+    this.cause = cause;
+  }
+}
+
+class FakeSuppressedError extends Error {
+  public error: unknown;
+  public suppressed: unknown;
+
+  constructor(error: unknown, suppressed: unknown, message = 'An error was suppressed during disposal.') {
+    super(message);
+    this.name = 'SuppressedError';
+    this.error = error;
+    this.suppressed = suppressed;
+  }
+}
+
+describe('applyAggregateErrorsToEvent()', () => {
+  test('should not do anything if event does not contain an exception', () => {
+    const event: Event = { exception: undefined };
+    const eventHint: EventHint = { originalException: new Error() };
+    applyAggregateErrorsToEvent(exceptionFromError, stackParser, 'cause', 100, event, eventHint);
+
+    // no changes
+    expect(event).toStrictEqual({ exception: undefined });
+  });
+
+  test('should not do anything if event does not contain exception values', () => {
+    const event: Event = { exception: { values: undefined } };
+    const eventHint: EventHint = { originalException: new Error() };
+    applyAggregateErrorsToEvent(exceptionFromError, stackParser, 'cause', 100, event, eventHint);
+
+    // no changes
+    expect(event).toStrictEqual({ exception: { values: undefined } });
+  });
+
+  test('should not do anything if event does not contain an event hint', () => {
+    const event: Event = { exception: { values: [] } };
+    applyAggregateErrorsToEvent(exceptionFromError, stackParser, 'cause', 100, event, undefined);
+
+    // no changes
+    expect(event).toStrictEqual({ exception: { values: [] } });
+  });
+
+  test('should not do anything if the event hint does not contain an original exception', () => {
+    const event: Event = { exception: { values: [] } };
+    const eventHint: EventHint = { originalException: undefined };
+    applyAggregateErrorsToEvent(exceptionFromError, stackParser, 'cause', 100, event, eventHint);
+
+    // no changes
+    expect(event).toStrictEqual({ exception: { values: [] } });
+  });
+
+  test('should recursively walk the original exception based on the `key` option and add them as exceptions to the event', () => {
+    const key = 'cause';
+    const originalException: ExtendedError = new Error('Root Error');
+    originalException[key] = new Error('Nested Error 1');
+    originalException[key][key] = new Error('Nested Error 2');
+
+    const event: Event = { exception: { values: [exceptionFromError(stackParser, originalException)] } };
+    const eventHint: EventHint = { originalException };
+
+    applyAggregateErrorsToEvent(exceptionFromError, stackParser, key, 100, event, eventHint);
+    expect(event).toStrictEqual({
+      exception: {
+        values: [
+          {
+            type: 'Error',
+            value: 'Nested Error 2',
+            mechanism: {
+              exception_id: 2,
+              handled: true,
+              parent_id: 1,
+              source: 'cause',
+              type: 'chained',
+            },
+          },
+          {
+            type: 'Error',
+            value: 'Nested Error 1',
+            mechanism: {
+              exception_id: 1,
+              handled: true,
+              parent_id: 0,
+              source: 'cause',
+              type: 'chained',
+            },
+          },
+          {
+            type: 'Error',
+            value: 'Root Error',
+            mechanism: {
+              exception_id: 0,
+              handled: true,
+              type: 'instrument',
+            },
+          },
+        ],
+      },
+    });
+  });
+
+  test('keeps a capture mechanism on the captured error instead of its causes', () => {
+    const cause = new Error('Failure 1');
+    const errorCause = Object.assign(new Error('Failure 2'), { cause });
+    const error = Object.assign(new Error('Failure 3'), { cause: errorCause });
+    const event: Event = { exception: { values: [exceptionFromError(stackParser, error)] } };
+    const eventHint: EventHint = {
+      originalException: error,
+      mechanism: { handled: false, type: 'auto.http.example' },
+    };
+
+    applyAggregateErrorsToEvent(exceptionFromError, stackParser, 'cause', 100, event, eventHint);
+    addExceptionMechanismToCapturedException(event, eventHint.mechanism);
+
+    expect(event.exception?.values).toStrictEqual([
+      {
+        type: 'Error',
+        value: 'Failure 1',
+        mechanism: {
+          exception_id: 2,
+          handled: true,
+          parent_id: 1,
+          source: 'cause',
+          type: 'chained',
+        },
+      },
+      {
+        type: 'Error',
+        value: 'Failure 2',
+        mechanism: {
+          exception_id: 1,
+          handled: true,
+          parent_id: 0,
+          source: 'cause',
+          type: 'chained',
+        },
+      },
+      {
+        type: 'Error',
+        value: 'Failure 3',
+        mechanism: {
+          exception_id: 0,
+          handled: false,
+          type: 'auto.http.example',
+        },
+      },
+    ]);
+  });
+
+  test('keeps exception group metadata when applying a capture mechanism to an AggregateError', () => {
+    const error = new FakeAggregateError([new Error('Child Error')], 'Aggregate Error');
+    const event: Event = { exception: { values: [exceptionFromError(stackParser, error)] } };
+    const eventHint: EventHint = {
+      originalException: error,
+      mechanism: { handled: false, type: 'auto.http.example' },
+    };
+
+    applyAggregateErrorsToEvent(exceptionFromError, stackParser, 'cause', 100, event, eventHint);
+    addExceptionMechanismToCapturedException(event, eventHint.mechanism);
+
+    expect(event.exception?.values).toStrictEqual([
+      {
+        type: 'Error',
+        value: 'Child Error',
+        mechanism: {
+          exception_id: 1,
+          handled: true,
+          parent_id: 0,
+          source: 'errors[0]',
+          type: 'chained',
+        },
+      },
+      {
+        type: 'AggregateError',
+        value: 'Aggregate Error',
+        mechanism: {
+          exception_id: 0,
+          handled: false,
+          is_exception_group: true,
+          type: 'auto.http.example',
+        },
+      },
+    ]);
+  });
+
+  test('recursively walks errors created in another realm', () => {
+    const originalException = runInNewContext(
+      `new AggregateError([new Error('Aggregate child')], 'Root Error', { cause: new Error('Cause') })`,
+    ) as ExtendedError;
+    expect(originalException).not.toBeInstanceOf(Error);
+
+    const event: Event = { exception: { values: [exceptionFromError(stackParser, originalException)] } };
+    const eventHint: EventHint = { originalException };
+
+    applyAggregateErrorsToEvent(exceptionFromError, stackParser, 'cause', 100, event, eventHint);
+
+    expect(event.exception?.values?.map(exception => exception.value)).toStrictEqual([
+      'Aggregate child',
+      'Cause',
+      'Root Error',
+    ]);
+  });
+
+  test('should not modify event if there are no attached errors', () => {
+    const originalException: ExtendedError = new Error('Some Error');
+
+    const event: Event = { exception: { values: [exceptionFromError(stackParser, originalException)] } };
+    const eventHint: EventHint = { originalException };
+
+    applyAggregateErrorsToEvent(exceptionFromError, stackParser, 'cause', 100, event, eventHint);
+
+    // no changes
+    expect(event).toStrictEqual({ exception: { values: [exceptionFromError(stackParser, originalException)] } });
+  });
+
+  test('should allow to limit number of attached errors', () => {
+    const key = 'cause';
+    const originalException: ExtendedError = new Error('Root Error');
+    const event: Event = { exception: { values: [exceptionFromError(stackParser, originalException)] } };
+
+    let err = originalException;
+    for (let i = 0; i < 10; i++) {
+      const newErr = new Error('Nested Error!');
+      err[key] = newErr;
+      err = newErr;
+    }
+
+    const eventHint: EventHint = { originalException };
+    applyAggregateErrorsToEvent(exceptionFromError, stackParser, key, 5, event, eventHint);
+
+    // 6 -> one for original exception + 5 linked
+    expect(event.exception?.values).toHaveLength(5 + 1);
+
+    // Last exception in list should be the root exception
+    expect(event.exception?.values?.[event.exception.values.length - 1]).toStrictEqual({
+      type: 'Error',
+      value: 'Root Error',
+      mechanism: {
+        exception_id: 0,
+        handled: true,
+        type: 'instrument',
+      },
+    });
+  });
+
+  test('limits AggregateError children', () => {
+    const error = new FakeAggregateError(
+      Array.from({ length: 20 }, (_, i) => new Error(`child-${i}`)),
+      'group',
+    );
+    const event: Event = { exception: { values: [exceptionFromError(stackParser, error)] } };
+
+    applyAggregateErrorsToEvent(exceptionFromError, stackParser, 'cause', 5, event, { originalException: error });
+
+    expect(event.exception?.values?.map(exception => exception.value)).toEqual([
+      'child-4',
+      'child-3',
+      'child-2',
+      'child-1',
+      'child-0',
+      'group',
+    ]);
+  });
+
+  test('limits SuppressedError siblings after traversing a nested error', () => {
+    const inner = new FakeSuppressedError(new Error('dispose failed'), new Error('original'), 'inner');
+    const error = new FakeSuppressedError(inner, new Error('outer suppressed'), 'outer');
+    const event: Event = { exception: { values: [exceptionFromError(stackParser, error)] } };
+
+    applyAggregateErrorsToEvent(exceptionFromError, stackParser, 'cause', 2, event, { originalException: error });
+
+    expect(event.exception?.values?.map(exception => exception.value)).toEqual(['dispose failed', 'inner', 'outer']);
+  });
+
+  test('shares the limit across causes, SuppressedErrors, and AggregateErrors', () => {
+    const cause = new FakeSuppressedError(new Error('dispose failed'), new Error('original'), 'cause');
+    const error = new CustomAggregateError([new Error('child')], 'group', cause);
+    const event: Event = { exception: { values: [exceptionFromError(stackParser, error)] } };
+
+    applyAggregateErrorsToEvent(exceptionFromError, stackParser, 'cause', 3, event, { originalException: error });
+
+    expect(event.exception?.values?.map(exception => exception.value)).toEqual([
+      'original',
+      'dispose failed',
+      'cause',
+      'group',
+    ]);
+  });
+
+  test('should keep the original mechanism type for the root exception', () => {
+    const fakeAggregateError = new FakeAggregateError(
+      [new Error('Nested Error 1'), new Error('Nested Error 2')],
+      'Root Error',
+    );
+
+    const event: Event = { exception: { values: [exceptionFromError(stackParser, fakeAggregateError)] } };
+    const eventHint: EventHint = { originalException: fakeAggregateError };
+
+    applyAggregateErrorsToEvent(exceptionFromError, stackParser, 'cause', 100, event, eventHint);
+    expect(event.exception?.values?.[event.exception.values.length - 1]?.mechanism?.type).toBe('instrument');
+  });
+
+  test('should assign a defualt mechanism type for the root exception', () => {
+    const fakeAggregateError = new FakeAggregateError(
+      [new Error('Nested Error 1'), new Error('Nested Error 2')],
+      'Root Error',
+    );
+
+    const exceptionFromError = (_stackParser: StackParser, ex: Error): Exception => {
+      return { value: ex.message, type: ex.name };
+    };
+
+    const event: Event = { exception: { values: [exceptionFromError(stackParser, fakeAggregateError)] } };
+    const eventHint: EventHint = { originalException: fakeAggregateError };
+
+    applyAggregateErrorsToEvent(exceptionFromError, stackParser, 'cause', 100, event, eventHint);
+
+    expect(event.exception?.values?.[event.exception.values.length - 1]?.mechanism?.type).toBe(
+      'auto.core.linked_errors',
+    );
+  });
+
+  test('should recursively walk mixed errors (Aggregate errors and based on `key`)', () => {
+    const chainedError: ExtendedError = new Error('Nested Error 3');
+    chainedError.cause = new Error('Nested Error 4');
+
+    const fakeAggregateError2 = new FakeAggregateError([new Error('Nested Error 2'), chainedError], 'AggregateError2');
+    const fakeAggregateError1 = new FakeAggregateError(
+      [new Error('Nested Error 1'), fakeAggregateError2],
+      'AggregateError1',
+    );
+
+    const event: Event = { exception: { values: [exceptionFromError(stackParser, fakeAggregateError1)] } };
+    const eventHint: EventHint = { originalException: fakeAggregateError1 };
+
+    applyAggregateErrorsToEvent(exceptionFromError, stackParser, 'cause', 100, event, eventHint);
+    expect(event).toStrictEqual({
+      exception: {
+        values: [
+          {
+            mechanism: {
+              exception_id: 5,
+              handled: true,
+              parent_id: 4,
+              source: 'cause',
+              type: 'chained',
+            },
+            type: 'Error',
+            value: 'Nested Error 4',
+          },
+          {
+            mechanism: {
+              exception_id: 4,
+              handled: true,
+              parent_id: 2,
+              source: 'errors[1]',
+              type: 'chained',
+            },
+            type: 'Error',
+            value: 'Nested Error 3',
+          },
+          {
+            mechanism: {
+              exception_id: 3,
+              handled: true,
+              parent_id: 2,
+              source: 'errors[0]',
+              type: 'chained',
+            },
+            type: 'Error',
+            value: 'Nested Error 2',
+          },
+          {
+            mechanism: {
+              exception_id: 2,
+              handled: true,
+              is_exception_group: true,
+              parent_id: 0,
+              source: 'errors[1]',
+              type: 'chained',
+            },
+            type: 'AggregateError',
+            value: 'AggregateError2',
+          },
+          {
+            mechanism: {
+              exception_id: 1,
+              handled: true,
+              parent_id: 0,
+              source: 'errors[0]',
+              type: 'chained',
+            },
+            type: 'Error',
+            value: 'Nested Error 1',
+          },
+          {
+            mechanism: {
+              exception_id: 0,
+              handled: true,
+              is_exception_group: true,
+              type: 'instrument',
+            },
+            type: 'AggregateError',
+            value: 'AggregateError1',
+          },
+        ],
+      },
+    });
+  });
+
+  test('should keep the original mechanism type for the root exception', () => {
+    const key = 'cause';
+    const originalException: ExtendedError = new Error('Root Error');
+    originalException[key] = new Error('Nested Error 1');
+    originalException[key][key] = new Error('Nested Error 2');
+
+    const event: Event = { exception: { values: [exceptionFromError(stackParser, originalException)] } };
+    const eventHint: EventHint = { originalException };
+
+    applyAggregateErrorsToEvent(exceptionFromError, stackParser, key, 100, event, eventHint);
+    expect(event).toStrictEqual({
+      exception: {
+        values: [
+          {
+            type: 'Error',
+            value: 'Nested Error 2',
+            mechanism: {
+              exception_id: 2,
+              handled: true,
+              parent_id: 1,
+              source: 'cause',
+              type: 'chained',
+            },
+          },
+          {
+            type: 'Error',
+            value: 'Nested Error 1',
+            mechanism: {
+              exception_id: 1,
+              handled: true,
+              parent_id: 0,
+              source: 'cause',
+              type: 'chained',
+            },
+          },
+          {
+            type: 'Error',
+            value: 'Root Error',
+            mechanism: {
+              exception_id: 0,
+              handled: true,
+              type: 'instrument',
+            },
+          },
+        ],
+      },
+    });
+  });
+
+  test('marks custom AggregateErrors as exception groups', () => {
+    const customAggregateError = new CustomAggregateError(
+      [new Error('Nested Error 1')],
+      'my CustomAggregateError',
+      new Error('Aggregate Cause'),
+    );
+
+    const event: Event = { exception: { values: [exceptionFromError(stackParser, customAggregateError)] } };
+    const eventHint: EventHint = { originalException: customAggregateError };
+
+    applyAggregateErrorsToEvent(exceptionFromError, stackParser, 'cause', 100, event, eventHint);
+
+    expect(event).toStrictEqual({
+      exception: {
+        values: [
+          {
+            mechanism: {
+              exception_id: 2,
+              handled: true,
+              parent_id: 0,
+              source: 'errors[0]',
+              type: 'chained',
+            },
+            type: 'Error',
+            value: 'Nested Error 1',
+          },
+          {
+            mechanism: {
+              exception_id: 1,
+              handled: true,
+              parent_id: 0,
+              source: 'cause',
+              type: 'chained',
+            },
+            type: 'Error',
+            value: 'Aggregate Cause',
+          },
+          {
+            mechanism: {
+              exception_id: 0,
+              handled: true,
+              type: 'instrument',
+              is_exception_group: true,
+            },
+            type: 'CustomAggregateError',
+            value: 'my CustomAggregateError',
+          },
+        ],
+      },
+    });
+  });
+
+  test('adds both the `error` and the `suppressed` error of a SuppressedError', () => {
+    const suppressedError = new FakeSuppressedError(new Error('Error from dispose'), new Error('Original error'));
+    const event: Event = { exception: { values: [exceptionFromError(stackParser, suppressedError)] } };
+    const eventHint: EventHint = { originalException: suppressedError };
+
+    applyAggregateErrorsToEvent(exceptionFromError, stackParser, 'cause', 100, event, eventHint);
+
+    expect(event).toStrictEqual({
+      exception: {
+        values: [
+          {
+            mechanism: { exception_id: 2, handled: true, parent_id: 0, source: 'suppressed', type: 'chained' },
+            type: 'Error',
+            value: 'Original error',
+          },
+          {
+            mechanism: { exception_id: 1, handled: true, parent_id: 0, source: 'error', type: 'chained' },
+            type: 'Error',
+            value: 'Error from dispose',
+          },
+          {
+            mechanism: { exception_id: 0, handled: true, type: 'instrument' },
+            type: 'SuppressedError',
+            value: 'An error was suppressed during disposal.',
+          },
+        ],
+      },
+    });
+  });
+
+  test('walks nested SuppressedErrors (several disposers throwing)', () => {
+    const inner = new FakeSuppressedError(new Error('dispose 2 failed'), new Error('Original error'));
+    const outer = new FakeSuppressedError(new Error('dispose 1 failed'), inner);
+    const event: Event = { exception: { values: [exceptionFromError(stackParser, outer)] } };
+
+    applyAggregateErrorsToEvent(exceptionFromError, stackParser, 'cause', 100, event, { originalException: outer });
+
+    expect(event.exception?.values?.map(e => e.value)).toEqual([
+      'Original error',
+      'dispose 2 failed',
+      'An error was suppressed during disposal.',
+      'dispose 1 failed',
+      'An error was suppressed during disposal.',
+    ]);
+  });
+
+  test('skips `error` / `suppressed` values that are not Errors', () => {
+    const suppressedError = new FakeSuppressedError('just a string', new Error('Original error'));
+    const event: Event = { exception: { values: [exceptionFromError(stackParser, suppressedError)] } };
+
+    applyAggregateErrorsToEvent(exceptionFromError, stackParser, 'cause', 100, event, {
+      originalException: suppressedError,
+    });
+
+    expect(event.exception?.values?.map(e => e.value)).toEqual([
+      'Original error',
+      'An error was suppressed during disposal.',
+    ]);
+  });
+
+  test('does not treat an error that only has an `error` property as a SuppressedError', () => {
+    const notSuppressed: ExtendedError = new Error('Something else');
+    notSuppressed.error = new Error('unrelated');
+    const event: Event = { exception: { values: [exceptionFromError(stackParser, notSuppressed)] } };
+
+    applyAggregateErrorsToEvent(exceptionFromError, stackParser, 'cause', 100, event, {
+      originalException: notSuppressed,
+    });
+
+    expect(event.exception?.values).toHaveLength(1);
+  });
+});

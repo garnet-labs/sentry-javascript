@@ -1,0 +1,210 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import * as breadcrumbsModule from '../../../../src/breadcrumbs';
+import { withScope } from '../../../../src/currentScopes';
+import { addOutgoingRequestBreadcrumb } from '../../../../src/integrations/http/add-outgoing-request-breadcrumb';
+import type { HttpClientRequest, HttpIncomingMessage } from '../../../../src/integrations/http/types';
+import type { CollectBehavior } from '../../../../src/types/datacollection';
+import { getDefaultTestClientOptions, TestClient } from '../../../mocks/client';
+
+function makeMockRequest(overrides: Partial<Record<string, unknown>> = {}): HttpClientRequest {
+  return {
+    method: 'GET',
+    path: '/api/test',
+    host: 'example.com',
+    protocol: 'http:',
+    port: 80,
+    getHeader: vi.fn(() => undefined),
+    getHeaders: vi.fn(() => ({})),
+    setHeader: vi.fn(),
+    removeHeader: vi.fn(),
+    end: vi.fn(),
+    on: vi.fn(),
+    once: vi.fn(),
+    prependListener: vi.fn(),
+    listenerCount: vi.fn(() => 0),
+    removeListener: vi.fn(),
+    ...overrides,
+  } as unknown as HttpClientRequest;
+}
+
+function makeMockResponse(overrides: Partial<HttpIncomingMessage> = {}): HttpIncomingMessage {
+  return {
+    statusCode: 200,
+    statusMessage: 'OK',
+    httpVersion: '1.1',
+    headers: {},
+    resume: vi.fn(),
+    on: vi.fn(),
+    addListener: vi.fn(),
+    off: vi.fn(),
+    removeListener: vi.fn(),
+    ...overrides,
+  } as unknown as HttpIncomingMessage;
+}
+
+describe('addOutgoingRequestBreadcrumb', () => {
+  beforeEach(() => {
+    vi.spyOn(breadcrumbsModule, 'addBreadcrumb').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('adds a breadcrumb with category "http" and type "http"', () => {
+    addOutgoingRequestBreadcrumb(makeMockRequest(), makeMockResponse());
+
+    expect(breadcrumbsModule.addBreadcrumb).toHaveBeenCalledOnce();
+    expect(breadcrumbsModule.addBreadcrumb).toHaveBeenCalledWith(
+      expect.objectContaining({ category: 'http', type: 'http' }),
+      expect.anything(),
+    );
+  });
+
+  it('includes sanitized URL, method, and status_code in data', () => {
+    const request = makeMockRequest({ method: 'POST' });
+    const response = makeMockResponse({ statusCode: 201 });
+
+    addOutgoingRequestBreadcrumb(request, response);
+
+    expect(breadcrumbsModule.addBreadcrumb).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          url: 'http://example.com/api/test',
+          'http.request.method': 'POST',
+          status_code: 201,
+        }),
+      }),
+      expect.anything(),
+    );
+  });
+
+  it('includes url.query when the URL has a query string', () => {
+    addOutgoingRequestBreadcrumb(makeMockRequest({ path: '/api/test?foo=bar' }), makeMockResponse());
+
+    expect(breadcrumbsModule.addBreadcrumb).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ 'url.query': 'foo=bar' }),
+      }),
+      expect.anything(),
+    );
+    // The main URL in data.url should not contain the query string
+    const callArg = vi.mocked(breadcrumbsModule.addBreadcrumb).mock.calls[0]![0];
+    expect(callArg.data?.url).not.toContain('foo=bar');
+  });
+
+  it('does not include url.query when the URL has no query string', () => {
+    addOutgoingRequestBreadcrumb(makeMockRequest(), makeMockResponse());
+
+    const callArg = vi.mocked(breadcrumbsModule.addBreadcrumb).mock.calls[0]![0];
+    expect(callArg.data?.['url.query']).toBeUndefined();
+  });
+
+  it('does not include url.fragment by default', () => {
+    addOutgoingRequestBreadcrumb(makeMockRequest(), makeMockResponse());
+
+    const callArg = vi.mocked(breadcrumbsModule.addBreadcrumb).mock.calls[0]![0];
+    expect(callArg.data?.['url.fragment']).toBeUndefined();
+  });
+
+  it('sets level to "warning" for 4xx status codes', () => {
+    addOutgoingRequestBreadcrumb(makeMockRequest(), makeMockResponse({ statusCode: 404 }));
+
+    expect(breadcrumbsModule.addBreadcrumb).toHaveBeenCalledWith(
+      expect.objectContaining({ level: 'warning' }),
+      expect.anything(),
+    );
+  });
+
+  it('sets level to "error" for 5xx status codes', () => {
+    addOutgoingRequestBreadcrumb(makeMockRequest(), makeMockResponse({ statusCode: 500 }));
+
+    expect(breadcrumbsModule.addBreadcrumb).toHaveBeenCalledWith(
+      expect.objectContaining({ level: 'error' }),
+      expect.anything(),
+    );
+  });
+
+  it('does not set level for 2xx status codes', () => {
+    addOutgoingRequestBreadcrumb(makeMockRequest(), makeMockResponse({ statusCode: 200 }));
+
+    const callArg = vi.mocked(breadcrumbsModule.addBreadcrumb).mock.calls[0]![0];
+    expect(callArg.level).toBeUndefined();
+  });
+
+  it('passes hint with event, request, and response', () => {
+    const request = makeMockRequest();
+    const response = makeMockResponse();
+
+    addOutgoingRequestBreadcrumb(request, response);
+
+    expect(breadcrumbsModule.addBreadcrumb).toHaveBeenCalledWith(expect.anything(), {
+      event: 'response',
+      request,
+      response,
+    });
+  });
+
+  it('handles undefined response (network error)', () => {
+    const request = makeMockRequest();
+
+    addOutgoingRequestBreadcrumb(request, undefined);
+
+    expect(breadcrumbsModule.addBreadcrumb).toHaveBeenCalledOnce();
+    const callArg = vi.mocked(breadcrumbsModule.addBreadcrumb).mock.calls[0]![0];
+    expect(callArg.data?.status_code).toBeUndefined();
+    expect(callArg.level).toBeUndefined();
+    expect(breadcrumbsModule.addBreadcrumb).toHaveBeenCalledWith(expect.anything(), {
+      event: 'response',
+      request,
+      response: undefined,
+    });
+  });
+
+  it('defaults method to "GET" when request.method is undefined', () => {
+    addOutgoingRequestBreadcrumb(makeMockRequest({ method: undefined }), makeMockResponse());
+
+    const callArg = vi.mocked(breadcrumbsModule.addBreadcrumb).mock.calls[0]![0];
+    expect(callArg.data?.['http.request.method']).toBe('GET');
+  });
+
+  // Breadcrumbs never reach the span pipeline, so this is the only place `urlQueryParams` is applied to them.
+  describe('dataCollection.urlQueryParams', () => {
+    function breadcrumbQuery(path: string, urlQueryParams?: CollectBehavior): unknown {
+      const client = new TestClient(
+        getDefaultTestClientOptions({
+          dsn: 'https://dsn@ingest.f00.f00/1',
+          ...(urlQueryParams !== undefined ? { dataCollection: { urlQueryParams } } : {}),
+        }),
+      );
+
+      return withScope(scope => {
+        scope.setClient(client);
+        addOutgoingRequestBreadcrumb(makeMockRequest({ path }), makeMockResponse());
+
+        const callArg = vi.mocked(breadcrumbsModule.addBreadcrumb).mock.calls.at(-1)![0];
+        return callArg.data?.['url.query'];
+      });
+    }
+
+    it('filters sensitive params and preserves encoding by default', () => {
+      expect(breadcrumbQuery('/api/test?token=abc123&q=a%20b%26c&page=5')).toBe('token=[Filtered]&q=a%20b%26c&page=5');
+    });
+
+    it('omits the query entirely when collection is off', () => {
+      expect(breadcrumbQuery('/api/test?token=abc123&page=5', false)).toBeUndefined();
+    });
+
+    it('honors allowList mode', () => {
+      expect(breadcrumbQuery('/api/test?page=1&ref=x&sort=name', { allow: ['page', 'sort'] })).toBe(
+        'page=1&ref=[Filtered]&sort=name',
+      );
+    });
+
+    it('honors extra deny terms', () => {
+      expect(breadcrumbQuery('/api/test?page=1&utm_source=email', { deny: ['utm'] })).toBe(
+        'page=1&utm_source=[Filtered]',
+      );
+    });
+  });
+});

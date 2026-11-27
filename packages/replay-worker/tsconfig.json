@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "lib": ["webworker", "scripthost"],
+    "esModuleInterop": true,
+    "target": "es2020",
+    "strictPropertyInitialization": false,
+    "inlineSourceMap": false,
+    "sourceMap": false,
+    "inlineSources": false
+  },
+  "include": ["src/**/*.ts"]
+}

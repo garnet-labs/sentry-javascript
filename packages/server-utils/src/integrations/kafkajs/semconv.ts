@@ -1,0 +1,14 @@
+export {
+  MESSAGING_DESTINATION_PARTITION_ID as ATTR_MESSAGING_DESTINATION_PARTITION_ID,
+  MESSAGING_KAFKA_MESSAGE_KEY as ATTR_MESSAGING_KAFKA_MESSAGE_KEY,
+  MESSAGING_KAFKA_MESSAGE_TOMBSTONE as ATTR_MESSAGING_KAFKA_MESSAGE_TOMBSTONE,
+  MESSAGING_KAFKA_OFFSET as ATTR_MESSAGING_KAFKA_OFFSET,
+} from '@sentry/conventions/attributes';
+
+export const MESSAGING_OPERATION_TYPE_VALUE_PROCESS = 'process' as const;
+export const MESSAGING_OPERATION_TYPE_VALUE_RECEIVE = 'receive' as const;
+export const MESSAGING_OPERATION_TYPE_VALUE_SEND = 'send' as const;
+export const MESSAGING_SYSTEM_VALUE_KAFKA = 'kafka' as const;
+
+// `_OTHER` is OTel's fallback bucket when no more specific `error.type` is known.
+export const ERROR_TYPE_VALUE_OTHER = '_OTHER' as const;
