@@ -13,6 +13,11 @@ on:
         description: Optional space-separated change numbers
         required: false
         type: string
+      lookback_days:
+        description: Days of merged dependency changes to replay
+        required: false
+        default: '10'
+        type: string
 permissions: {}
 concurrency:
   group: shadow-dependency-mirror
@@ -39,6 +44,7 @@ jobs:
       contents: read
     env:
       PRS: ${{ inputs.prs }}
+      LOOKBACK_DAYS: ${{ inputs.lookback_days || '10' }}
     steps:
       - name: Check authentication
         id: auth
@@ -64,7 +70,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          args=()
+          [[ "$LOOKBACK_DAYS" =~ ^[0-9]+$ ]] || { echo 'Invalid lookback'; exit 1; }
+          args=(--lookback-days "$LOOKBACK_DAYS")
           for pr in $PRS; do
             [[ "$pr" =~ ^[0-9]+$ ]] || { echo 'Invalid change number'; exit 1; }
             args+=(--pr "$pr")
