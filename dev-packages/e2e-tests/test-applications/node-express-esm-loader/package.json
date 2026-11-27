@@ -1,0 +1,24 @@
+{
+  "name": "node-express-esm-loader",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "node --import ./src/instrument.mjs src/app.mjs",
+    "clean": "npx rimraf node_modules pnpm-lock.yaml",
+    "test:build": "pnpm install",
+    "test:assert": "playwright test"
+  },
+  "dependencies": {
+    "@sentry/node": "file:../../packed/sentry-node-packed.tgz",
+    "@sentry/opentelemetry": "file:../../packed/sentry-opentelemetry-packed.tgz",
+    "express": "^4.21.2",
+    "mysql": "^2.18.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "~1.63.0",
+    "@sentry-internal/test-utils": "link:../../../test-utils"
+  },
+  "volta": {
+    "extends": "../../package.json"
+  }
+}

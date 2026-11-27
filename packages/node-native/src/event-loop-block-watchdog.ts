@@ -1,0 +1,334 @@
+import { workerData } from 'node:worker_threads';
+import type { DebugImage, Event, ScopeData, Session, StackFrame, Thread } from '@sentry/core';
+import {
+  applyScopeDataToEvent,
+  createEventEnvelope,
+  createSessionEnvelope,
+  generateSpanId,
+  getEnvelopeEndpointWithUrlEncodedAuth,
+  makeSession,
+  mergeScopeData,
+  normalizeUrlToBase,
+  Scope,
+  stripSentryFramesAndReverse,
+  updateSession,
+  uuid4,
+} from '@sentry/core';
+import { filenameIsInApp } from '@sentry/core/server';
+import { makeNodeTransport } from '@sentry/node';
+import { captureStackTrace, getThreadsLastSeen } from '@sentry/node-native-stacktrace';
+import type { ThreadState, WorkerStartData } from './common';
+import { POLL_RATIO } from './common';
+
+type CurrentScopes = {
+  isolationScope: Scope;
+};
+
+const {
+  threshold,
+  appRootPath,
+  contexts,
+  debug,
+  dist,
+  dsn,
+  environment,
+  maxEventsPerHour,
+  release,
+  sdkMetadata,
+  staticTags: tags,
+  tunnel,
+} = workerData as WorkerStartData;
+
+const pollInterval = threshold / POLL_RATIO;
+const triggeredThreads = new Set<string>();
+
+function log(...msg: unknown[]): void {
+  if (debug) {
+    // eslint-disable-next-line no-console
+    console.log('[Sentry Event Loop Blocked Watchdog]', ...msg);
+  }
+}
+
+function createRateLimiter(maxEventsPerHour: number): () => boolean {
+  let currentHour = 0;
+  let currentCount = 0;
+
+  return function isRateLimited(): boolean {
+    const hour = new Date().getHours();
+
+    if (hour !== currentHour) {
+      currentHour = hour;
+      currentCount = 0;
+    }
+
+    if (currentCount >= maxEventsPerHour) {
+      if (currentCount === maxEventsPerHour) {
+        currentCount += 1;
+        log(`Rate limit reached: ${currentCount} events in this hour`);
+      }
+      return true;
+    }
+
+    currentCount += 1;
+    return false;
+  };
+}
+
+const url = getEnvelopeEndpointWithUrlEncodedAuth(dsn, tunnel, sdkMetadata.sdk);
+const transport = makeNodeTransport({
+  url,
+  recordDroppedEvent: () => {
+    //
+  },
+});
+const isRateLimited = createRateLimiter(maxEventsPerHour);
+
+async function sendAbnormalSession(serializedSession: Session | undefined): Promise<void> {
+  if (!serializedSession) {
+    return;
+  }
+
+  log('Sending abnormal session');
+  const session = makeSession(serializedSession);
+
+  updateSession(session, {
+    status: 'abnormal',
+    abnormal_mechanism: 'anr_foreground',
+    release,
+    environment,
+  });
+
+  const envelope = createSessionEnvelope(session, dsn, sdkMetadata, tunnel);
+  // Log the envelope so to aid in testing
+  log(JSON.stringify(envelope));
+
+  await transport.send(envelope);
+}
+
+log('Started');
+
+function prepareStackFrames(stackFrames: StackFrame[] | undefined): StackFrame[] | undefined {
+  if (!stackFrames) {
+    return undefined;
+  }
+
+  // Strip Sentry frames and reverse the stack frames so they are in the correct order
+  const strippedFrames = stripSentryFramesAndReverse(stackFrames);
+
+  for (const frame of strippedFrames) {
+    if (!frame.filename) {
+      continue;
+    }
+
+    frame.in_app = filenameIsInApp(frame.filename);
+
+    // If we have an app root path, rewrite the filenames to be relative to the app root
+    if (appRootPath) {
+      frame.filename = normalizeUrlToBase(frame.filename, appRootPath);
+    }
+  }
+
+  return strippedFrames;
+}
+
+function stripFileProtocol(filename: string | undefined): string | undefined {
+  if (!filename) {
+    return undefined;
+  }
+  return filename.replace(/^file:\/\//, '');
+}
+
+// eslint-disable-next-line complexity
+function applyDebugMeta(event: Event, debugImages: Record<string, string>): void {
+  if (Object.keys(debugImages).length === 0) {
+    return;
+  }
+
+  const normalisedDebugImages = appRootPath ? {} : debugImages;
+  if (appRootPath) {
+    for (const [path, debugId] of Object.entries(debugImages)) {
+      normalisedDebugImages[normalizeUrlToBase(path, appRootPath)] = debugId;
+    }
+  }
+
+  const filenameToDebugId = new Map<string, string>();
+
+  for (const exception of event.exception?.values || []) {
+    for (const frame of exception.stacktrace?.frames || []) {
+      const filename = stripFileProtocol(frame.abs_path || frame.filename);
+      if (filename && normalisedDebugImages[filename]) {
+        filenameToDebugId.set(filename, normalisedDebugImages[filename]);
+      }
+    }
+  }
+
+  for (const thread of event.threads?.values || []) {
+    for (const frame of thread.stacktrace?.frames || []) {
+      const filename = stripFileProtocol(frame.abs_path || frame.filename);
+      if (filename && normalisedDebugImages[filename]) {
+        filenameToDebugId.set(filename, normalisedDebugImages[filename]);
+      }
+    }
+  }
+
+  if (filenameToDebugId.size > 0) {
+    const images: DebugImage[] = [];
+    for (const [code_file, debug_id] of filenameToDebugId.entries()) {
+      images.push({
+        type: 'sourcemap',
+        code_file,
+        debug_id,
+      });
+    }
+    event.debug_meta = { images };
+  }
+}
+
+function getExceptionAndThreads(
+  crashedThreadId: string,
+  threads: ReturnType<typeof captureStackTrace<CurrentScopes, ThreadState>>,
+): Event {
+  const crashedThread = threads[crashedThreadId];
+
+  return {
+    exception: {
+      values: [
+        {
+          type: 'EventLoopBlocked',
+          value: `Event Loop Blocked for at least ${threshold} ms`,
+          stacktrace: { frames: prepareStackFrames(crashedThread?.frames) },
+          // This ensures the UI doesn't say 'Crashed in' for the stack trace
+          mechanism: { type: 'ANR' },
+          thread_id: crashedThreadId,
+        },
+      ],
+    },
+    threads: {
+      values: Object.entries(threads).map(([threadId, threadState]) => {
+        const crashed = threadId === crashedThreadId;
+
+        const thread: Thread = {
+          id: threadId,
+          name: threadId === '0' ? 'main' : `worker-${threadId}`,
+          crashed,
+          current: true,
+          main: threadId === '0',
+        };
+
+        if (!crashed) {
+          thread.stacktrace = { frames: prepareStackFrames(threadState.frames) };
+        }
+
+        return thread;
+      }),
+    },
+  };
+}
+
+/**
+ * Rehydrates a Scope from serialized ScopeData that has been passed over a JSON serialization boundary.
+ *
+ * `Scope.update()` only handles `ScopeContext` fields, so breadcrumbs have to be carried over separately.
+ * Attachments are deliberately not carried over since their binary data does not survive JSON serialization.
+ */
+function hydrateScope(data: Partial<ScopeData> | undefined): Scope {
+  const scope = new Scope();
+  if (data) {
+    scope.update(data);
+    data.breadcrumbs?.forEach(breadcrumb => scope.addBreadcrumb(breadcrumb));
+  }
+  return scope;
+}
+
+function applyScopeToEvent(event: Event, scope: ScopeData): void {
+  applyScopeDataToEvent(event, scope);
+
+  if (!event.contexts?.trace) {
+    const { traceId, parentSpanId, propagationSpanId } = scope.propagationContext;
+    event.contexts = {
+      trace: {
+        trace_id: traceId,
+        span_id: propagationSpanId || generateSpanId(),
+        parent_span_id: parentSpanId,
+      },
+      ...event.contexts,
+    };
+  }
+}
+
+async function sendBlockEvent(crashedThreadId: string): Promise<void> {
+  if (isRateLimited()) {
+    return;
+  }
+
+  const threads = captureStackTrace<CurrentScopes, ThreadState>();
+  const crashedThread = threads[crashedThreadId];
+
+  if (!crashedThread) {
+    log(`No thread found with ID '${crashedThreadId}'`);
+    return;
+  }
+
+  try {
+    await sendAbnormalSession(crashedThread.pollState?.session);
+  } catch (error) {
+    log(`Failed to send abnormal session for thread '${crashedThreadId}':`, error);
+  }
+
+  log('Sending event');
+
+  const event: Event = {
+    event_id: uuid4(),
+    contexts,
+    release,
+    environment,
+    dist,
+    platform: 'node',
+    level: 'error',
+    tags,
+    ...getExceptionAndThreads(crashedThreadId, threads),
+  };
+
+  const scope = hydrateScope(crashedThread.pollState?.scope).getScopeData();
+
+  if (crashedThread?.asyncState?.isolationScope) {
+    // We need to rehydrate the scope from the serialized object with properties beginning with _user, etc
+    const isolationScope = Object.assign(new Scope(), crashedThread.asyncState.isolationScope).getScopeData();
+    mergeScopeData(scope, isolationScope);
+  }
+  applyScopeToEvent(event, scope);
+
+  const allDebugImages: Record<string, string> = Object.values(threads).reduce((acc, threadState) => {
+    return { ...acc, ...threadState.pollState?.debugImages };
+  }, {});
+
+  applyDebugMeta(event, allDebugImages);
+
+  const envelope = createEventEnvelope(event, dsn, sdkMetadata, tunnel);
+  // Log the envelope to aid in testing
+  log(JSON.stringify(envelope));
+
+  await transport.send(envelope);
+  await transport.flush(2000);
+}
+
+setInterval(async () => {
+  for (const [threadId, time] of Object.entries(getThreadsLastSeen())) {
+    if (time > threshold) {
+      if (triggeredThreads.has(threadId)) {
+        continue;
+      }
+
+      log(`Blocked thread detected '${threadId}' last polled ${time} ms ago.`);
+      triggeredThreads.add(threadId);
+
+      try {
+        await sendBlockEvent(threadId);
+      } catch (error) {
+        log(`Failed to send event for thread '${threadId}':`, error);
+      }
+    } else {
+      triggeredThreads.delete(threadId);
+    }
+  }
+}, pollInterval);

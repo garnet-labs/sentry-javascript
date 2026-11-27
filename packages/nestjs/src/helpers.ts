@@ -1,0 +1,47 @@
+import { isObjectLike } from '@sentry/core';
+
+/**
+ * Determines if the exception is an expected NestJS control flow error.
+ * - HttpException have getStatus and getResponse methods: https://github.com/nestjs/nest/blob/master/packages/microservices/exceptions/rpc-exception.ts
+ * - RpcException have getError and initMessage methods: https://github.com/nestjs/nest/blob/master/packages/common/exceptions/http.exception.ts
+ *
+ * We cannot use `instanceof HttpException` here because this file is imported
+ * from the main entry point (via decorators.ts), and importing @nestjs/common at that
+ * point would load it before OpenTelemetry instrumentation can patch it, breaking instrumentations.
+ *
+ * @returns `true` if the exception is expected and should not be reported to Sentry, otherwise `false`.
+ */
+export function isExpectedError(exception: unknown): boolean {
+  if (!isObjectLike(exception)) {
+    return false;
+  }
+
+  // HttpException
+  if (
+    typeof exception.getStatus === 'function' &&
+    typeof exception.getResponse === 'function' &&
+    typeof exception.initMessage === 'function'
+  ) {
+    return true;
+  }
+
+  if (isWsOrRpcException(exception)) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Determines if the exception is a WsException or RpcException, which have the same shape.
+ * Both have `getError()` and `initMessage()` methods.
+ *
+ * We use duck-typing to avoid importing from `@nestjs/websockets` or `@nestjs/microservices`.
+ */
+export function isWsOrRpcException(exception: unknown): boolean {
+  if (!isObjectLike(exception)) {
+    return false;
+  }
+
+  return typeof exception.getError === 'function' && typeof exception.initMessage === 'function';
+}

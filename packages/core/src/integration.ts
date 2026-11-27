@@ -1,0 +1,241 @@
+import type { Client } from './client';
+import { getClient } from './currentScopes';
+import { DEBUG_BUILD } from './debug-build';
+import type { Event, EventHint } from './types/event';
+import type { Integration, IntegrationFn } from './types/integration';
+import type { CoreOptions } from './types/options';
+import type { StreamedSpanJSON } from './types/span';
+import { debug } from './utils/debug-logger';
+
+export const installedIntegrations: string[] = [];
+
+/** Map of integrations assigned to a client */
+export type IntegrationIndex = {
+  [key: string]: Integration;
+};
+
+type IntegrationWithDefaultInstance = Integration & { isDefaultInstance?: true };
+
+/**
+ * Remove duplicates from the given array, preferring the last instance of any duplicate. Not guaranteed to
+ * preserve the order of integrations in the array.
+ *
+ * @private
+ */
+function filterDuplicates(integrations: Integration[]): Integration[] {
+  const integrationsByName: { [key: string]: Integration } = {};
+
+  integrations.forEach((currentInstance: IntegrationWithDefaultInstance) => {
+    const { name } = currentInstance;
+
+    const existingInstance: IntegrationWithDefaultInstance | undefined = integrationsByName[name];
+
+    // We want integrations later in the array to overwrite earlier ones of the same type, except that we never want a
+    // default instance to overwrite an existing user instance
+    if (existingInstance && !existingInstance.isDefaultInstance && currentInstance.isDefaultInstance) {
+      return;
+    }
+
+    integrationsByName[name] = currentInstance;
+  });
+
+  return Object.values(integrationsByName);
+}
+
+/** Gets integrations to install */
+export function getIntegrationsToSetup(
+  options: Pick<CoreOptions, 'defaultIntegrations' | 'integrations'>,
+): Integration[] {
+  const defaultIntegrations = options.defaultIntegrations || [];
+  const userIntegrations = options.integrations;
+
+  // We flag default instances, so that later we can tell them apart from any user-created instances of the same class
+  defaultIntegrations.forEach((integration: IntegrationWithDefaultInstance) => {
+    integration.isDefaultInstance = true;
+  });
+
+  let integrations: Integration[];
+
+  if (Array.isArray(userIntegrations)) {
+    integrations = [...defaultIntegrations, ...userIntegrations];
+  } else if (typeof userIntegrations === 'function') {
+    const resolvedUserIntegrations = userIntegrations(defaultIntegrations);
+    integrations = Array.isArray(resolvedUserIntegrations) ? resolvedUserIntegrations : [resolvedUserIntegrations];
+  } else {
+    integrations = defaultIntegrations;
+  }
+
+  return filterDuplicates(integrations);
+}
+
+/**
+ * Given a list of integration instances this installs them all. When `withDefaults` is set to `true` then all default
+ * integrations are added unless they were already provided before.
+ * @param integrations array of integration instances
+ * @param withDefault should enable default integrations
+ */
+export function setupIntegrations(client: Client, integrations: Integration[]): IntegrationIndex {
+  const integrationIndex: IntegrationIndex = {};
+
+  integrations.forEach((integration: Integration | undefined) => {
+    if (integration?.beforeSetup) {
+      integration.beforeSetup(client);
+    }
+  });
+
+  integrations.forEach((integration: Integration | undefined) => {
+    // guard against empty provided integrations
+    if (integration) {
+      setupIntegration(client, integration, integrationIndex);
+    }
+  });
+
+  return integrationIndex;
+}
+
+/**
+ * Execute the `afterAllSetup` hooks of the given integrations.
+ */
+export function afterSetupIntegrations(client: Client, integrations: Integration[]): void {
+  for (const integration of integrations) {
+    // guard against empty provided integrations
+    if (integration?.afterAllSetup) {
+      integration.afterAllSetup(client);
+    }
+  }
+}
+
+/** Setup a single integration.  */
+export function setupIntegration(client: Client, integration: Integration, integrationIndex: IntegrationIndex): void {
+  if (integrationIndex[integration.name]) {
+    DEBUG_BUILD && debug.log(`Integration skipped because it was already installed: ${integration.name}`);
+    return;
+  }
+  integrationIndex[integration.name] = integration;
+
+  // `setupOnce` is only called the first time
+  if (!installedIntegrations.includes(integration.name) && typeof integration.setupOnce === 'function') {
+    integration.setupOnce();
+    installedIntegrations.push(integration.name);
+  }
+
+  // `setup` is run for each client
+  if (integration.setup && typeof integration.setup === 'function') {
+    integration.setup(client);
+  }
+
+  if (typeof integration.preprocessEvent === 'function') {
+    const callback = integration.preprocessEvent.bind(integration) as typeof integration.preprocessEvent;
+    client.on('preprocessEvent', (event, hint) => callback(event, hint, client));
+  }
+
+  if (typeof integration.processEvent === 'function') {
+    const callback = integration.processEvent.bind(integration) as typeof integration.processEvent;
+
+    const processor = Object.assign((event: Event, hint: EventHint) => callback(event, hint, client), {
+      id: integration.name,
+    });
+
+    client.addEventProcessor(processor);
+  }
+
+  (['processSpan', 'processSegmentSpan'] as const).forEach(hook => {
+    const callback = integration[hook];
+    if (typeof callback === 'function') {
+      // The cast is needed because TS can't resolve overloads when the discriminant is a union type.
+      // Both overloads have the same callback signature so this is safe.
+      client.on(hook as 'processSpan', (span: StreamedSpanJSON) => callback.call(integration, span, client));
+    }
+  });
+
+  DEBUG_BUILD && debug.log(`Integration installed: ${integration.name}`);
+}
+
+/** Add an integration to the current scope's client. */
+export function addIntegration(integration: Integration): void {
+  const client = getClient();
+
+  if (!client) {
+    DEBUG_BUILD && debug.warn(`Cannot add integration "${integration.name}" because no SDK Client is available.`);
+    return;
+  }
+
+  client.addIntegration(integration);
+}
+
+/**
+ * Define an integration function that can be used to create an integration instance.
+ * Note that this by design hides the implementation details of the integration, as they are considered internal.
+ */
+export function defineIntegration<Fn extends IntegrationFn>(
+  fn: Fn,
+): (...args: Parameters<Fn>) => Integration & { name: ReturnType<Fn>['name'] } {
+  return fn;
+}
+
+// When  extending an integration, we allow other properties to be passed-through
+type IntegrationWithOtherProperties = Record<string, unknown> & Integration;
+type ExtendedIntegration<Base extends Integration, Extended extends Partial<IntegrationWithOtherProperties>> = Omit<
+  Base,
+  keyof Extended
+> &
+  Extended;
+
+/**
+ * Wrap a parent integration with an extended integration.
+ * Any passed integration function will call the parent integration function first, if it exists.
+ *
+ * Example usage:
+ *
+ * @example
+ * ```typescript
+ * const parentIntegration = defineIntegration(() => ({
+ *   name: 'ParentIntegration',
+ *   setupOnce: () => {
+ *     console.log('ParentIntegration setupOnce');
+ *   },
+ * }));
+ *
+ * const extendedIntegration = extendIntegration(parentIntegration, {
+ *   setupOnce: () => {
+ *     console.log('ExtendedIntegration setupOnce');
+ *   },
+ * });
+ * ```
+ */
+export function extendIntegration<Base extends Integration, Extended extends Partial<IntegrationWithOtherProperties>>(
+  integration: Base,
+  extendedIntegration: Extended,
+): ExtendedIntegration<Base, Extended> {
+  // The extension overrides the base for any shared key (object spread + the wrapping below), so the
+  // result type drops the overridden base keys rather than intersecting them — `Base & Extended` would
+  // wrongly intersect shared keys (e.g. a re-typed property collapses to `never`).
+  const wrappedIntegration = {
+    ...integration,
+    ...extendedIntegration,
+  } as ExtendedIntegration<Base, Extended>;
+
+  // Make sure that functions that are extended also call the base functions, if defined
+  // oxlint-disable-next-line guard-for-in
+  for (const key in extendedIntegration) {
+    const baseValue = integration[key as keyof Base];
+    const extendedValue = extendedIntegration[key];
+
+    type ValueType = typeof extendedValue;
+
+    if (typeof baseValue === 'function' && typeof extendedValue === 'function') {
+      const wrappedFunction = new Proxy(baseValue, {
+        apply: (target, thisArg, args) => {
+          Reflect.apply(target, thisArg, args);
+          return Reflect.apply(extendedValue, thisArg, args);
+        },
+      }) as ValueType;
+
+      // We know this is OK, but typescript does not properly narrow/infer types here
+      // so instead of casting the wrappedFunction to some complicated type, we just make clear that we simply overwrite this
+      (wrappedIntegration as Record<string, unknown>)[key] = wrappedFunction;
+    }
+  }
+
+  return wrappedIntegration;
+}

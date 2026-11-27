@@ -1,0 +1,59 @@
+import { isObjectLike, debug, getActiveSpan, getRootSpan } from '@sentry/core';
+import { setHttpServerSpanRouteAttribute } from '@sentry/server-utils';
+import type { H3Event } from 'h3';
+
+type MatchedRoute = { path?: string; route?: string };
+type EventWithMatchedRoute = Pick<H3Event, 'context'> & Partial<Pick<H3Event, 'path' | '_path'>>;
+
+function getMatchedRoutePath(event: EventWithMatchedRoute): string | undefined {
+  const matchedRoute = (event.context as { matchedRoute?: MatchedRoute }).matchedRoute;
+  // Nuxt 4 with h3 v1 uses `path`, Nuxt 5 with h3 v2 uses `route`
+  return matchedRoute?.path ?? matchedRoute?.route;
+}
+
+/**
+ * Update the root span (transaction) name for routes with parameters based on the matched route.
+ */
+export function updateRouteBeforeResponse(event: EventWithMatchedRoute): void {
+  if (!event.context.matchedRoute) {
+    return;
+  }
+
+  const matchedRoutePath = getMatchedRoutePath(event);
+  const requestPath = event.path ?? event._path;
+
+  // If the matched route path is defined and differs from the event's path, it indicates a parametrized route
+  // Example: Matched route is "/users/:id" and the event's path is "/users/123",
+  if (matchedRoutePath && matchedRoutePath !== requestPath) {
+    if (matchedRoutePath === '/**') {
+      // If page is server-side rendered, the whole path gets transformed to `/**` (Example : `/users/123` becomes `/**` instead of `/users/:id`).
+      return; // Skip if the matched route is a catch-all route (handled in `route-detector.server.ts`)
+    }
+
+    setHttpServerSpanRouteAttribute(matchedRoutePath);
+
+    const activeSpan = getActiveSpan(); // In development mode, getActiveSpan() is always undefined
+    if (!activeSpan) {
+      return;
+    }
+
+    const rootSpan = getRootSpan(activeSpan);
+    if (!rootSpan) {
+      return;
+    }
+
+    const params = event.context?.params;
+
+    if (isObjectLike(params)) {
+      Object.entries(params).forEach(([key, value]) => {
+        // Based on this convention: https://getsentry.github.io/sentry-conventions/generated/attributes/url.html#urlpathparameterkey
+        rootSpan.setAttributes({
+          [`url.path.parameter.${key}`]: String(value),
+          [`params.${key}`]: String(value),
+        });
+      });
+    }
+
+    debug.log(`Updated transaction name for parametrized route: ${matchedRoutePath}`);
+  }
+}

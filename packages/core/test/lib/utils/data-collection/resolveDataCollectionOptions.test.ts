@@ -1,0 +1,228 @@
+import { describe, expect, it } from 'vitest';
+import { resolveDataCollectionOptions } from '../../../../src/utils/data-collection/resolveDataCollectionOptions';
+
+describe('resolveDataCollectionOptions', () => {
+  const SPEC_DEFAULTS = {
+    userInfo: true,
+    cookies: true,
+    httpHeaders: { request: true, response: true },
+    httpBodies: ['incomingRequest', 'outgoingRequest', 'incomingResponse', 'outgoingResponse'],
+    urlQueryParams: true,
+    graphQL: { document: true, variables: true },
+    genAI: { inputs: true, outputs: true },
+    databaseQueryData: true,
+    queues: true,
+    stackFrameVariables: true,
+    frameContextLines: 5,
+  };
+
+  describe('with no dataCollection options', () => {
+    it('returns spec defaults when neither option is set', () => {
+      expect(resolveDataCollectionOptions({})).toEqual(SPEC_DEFAULTS);
+    });
+
+    it('returns spec defaults when dataCollection is explicitly set to empty object', () => {
+      expect(resolveDataCollectionOptions({ dataCollection: {} })).toEqual(SPEC_DEFAULTS);
+    });
+  });
+
+  describe('dataCollection options', () => {
+    it('uses spec defaults for fields that are not explicitly set', () => {
+      const result = resolveDataCollectionOptions({ dataCollection: { userInfo: false } });
+
+      expect(result.userInfo).toBe(false);
+      expect(result.httpBodies).toEqual(['incomingRequest', 'outgoingRequest', 'incomingResponse', 'outgoingResponse']);
+      expect(result.genAI).toEqual({ inputs: true, outputs: true });
+      expect(result.databaseQueryData).toBe(true);
+    });
+  });
+
+  describe('partial dataCollection overrides', () => {
+    it('merges user overrides with defaults', () => {
+      const result = resolveDataCollectionOptions({
+        dataCollection: {
+          httpBodies: ['incomingRequest'],
+        },
+      });
+
+      expect(result.userInfo).toBe(true);
+      expect(result.httpBodies).toEqual(['incomingRequest']);
+      // Everything else is spec default
+      expect(result.cookies).toBe(true);
+      expect(result.httpHeaders).toEqual({ request: true, response: true });
+      expect(result.urlQueryParams).toBe(true);
+      expect(result.graphQL).toEqual({ document: true, variables: true });
+      expect(result.genAI).toEqual({ inputs: true, outputs: true });
+      expect(result.databaseQueryData).toBe(true);
+      expect(result.stackFrameVariables).toBe(true);
+      expect(result.frameContextLines).toBe(5);
+    });
+
+    it('merges nested httpHeaders partially', () => {
+      const result = resolveDataCollectionOptions({
+        dataCollection: {
+          httpHeaders: { request: false },
+        },
+      });
+
+      expect(result.httpHeaders.request).toBe(false);
+      expect(result.httpHeaders.response).toBe(true);
+    });
+
+    it('merges nested httpHeaders partially for the response direction', () => {
+      const result = resolveDataCollectionOptions({
+        dataCollection: {
+          httpHeaders: { response: { allow: ['content-type'] } },
+        },
+      });
+
+      expect(result.httpHeaders).toEqual({ request: true, response: { allow: ['content-type'] } });
+    });
+
+    it('resolves independent request and response header settings', () => {
+      const result = resolveDataCollectionOptions({
+        dataCollection: {
+          httpHeaders: { request: { allow: ['x-request-id'] }, response: false },
+        },
+      });
+
+      expect(result.httpHeaders).toEqual({ request: { allow: ['x-request-id'] }, response: false });
+    });
+
+    it('treats an empty httpHeaders object as directional config with defaults', () => {
+      expect(resolveDataCollectionOptions({ dataCollection: { httpHeaders: {} } }).httpHeaders).toEqual({
+        request: true,
+        response: true,
+      });
+    });
+
+    it('applies boolean httpHeaders shorthand to both directions', () => {
+      expect(resolveDataCollectionOptions({ dataCollection: { httpHeaders: false } }).httpHeaders).toEqual({
+        request: false,
+        response: false,
+      });
+
+      expect(resolveDataCollectionOptions({ dataCollection: { httpHeaders: true } }).httpHeaders).toEqual({
+        request: true,
+        response: true,
+      });
+    });
+
+    it('applies allow/deny httpHeaders shorthand to both directions', () => {
+      const deny = { deny: ['forwarded', '-ip'] };
+      expect(resolveDataCollectionOptions({ dataCollection: { httpHeaders: deny } }).httpHeaders).toEqual({
+        request: deny,
+        response: deny,
+      });
+
+      const allow = { allow: ['content-type'] };
+      expect(resolveDataCollectionOptions({ dataCollection: { httpHeaders: allow } }).httpHeaders).toEqual({
+        request: allow,
+        response: allow,
+      });
+    });
+
+    it('merges nested genAI partially', () => {
+      const result = resolveDataCollectionOptions({
+        dataCollection: {
+          genAI: { inputs: false },
+        },
+      });
+
+      expect(result.genAI.inputs).toBe(false);
+      expect(result.genAI.outputs).toBe(true);
+    });
+
+    it('merges nested graphQL partially', () => {
+      const result = resolveDataCollectionOptions({
+        dataCollection: {
+          graphQL: { document: false },
+        },
+      });
+
+      expect(result.graphQL.document).toBe(false);
+      expect(result.graphQL.variables).toBe(true);
+    });
+
+    it('supports allow/deny list for cookies', () => {
+      const result = resolveDataCollectionOptions({
+        dataCollection: {
+          cookies: { deny: ['x-custom'] },
+        },
+      });
+
+      expect(result.cookies).toEqual({ deny: ['x-custom'] });
+    });
+
+    it('supports turning off URL query params', () => {
+      const result = resolveDataCollectionOptions({
+        dataCollection: {
+          urlQueryParams: false,
+        },
+      });
+
+      expect(result.urlQueryParams).toBe(false);
+    });
+
+    it('supports turning off database query data', () => {
+      const result = resolveDataCollectionOptions({
+        dataCollection: {
+          databaseQueryData: false,
+        },
+      });
+
+      expect(result.databaseQueryData).toBe(false);
+    });
+
+    it('supports turning off queue data', () => {
+      expect(resolveDataCollectionOptions({ dataCollection: { queues: false } }).queues).toBe(false);
+    });
+
+    it('supports allow/deny list for stack frame variables', () => {
+      expect(
+        resolveDataCollectionOptions({ dataCollection: { stackFrameVariables: { allow: ['user'] } } })
+          .stackFrameVariables,
+      ).toEqual({ allow: ['user'] });
+
+      expect(
+        resolveDataCollectionOptions({ dataCollection: { stackFrameVariables: { deny: ['password'] } } })
+          .stackFrameVariables,
+      ).toEqual({ deny: ['password'] });
+    });
+
+    it('supports turning off stack frame variables', () => {
+      const result = resolveDataCollectionOptions({
+        dataCollection: {
+          stackFrameVariables: false,
+        },
+      });
+
+      expect(result.stackFrameVariables).toBe(false);
+    });
+  });
+
+  describe('return type completeness', () => {
+    it('always returns all fields', () => {
+      const result = resolveDataCollectionOptions({});
+
+      expect(Object.keys(result)).toHaveLength(11);
+      expect(result).toHaveProperty('userInfo');
+      expect(result).toHaveProperty('cookies');
+      expect(result).toHaveProperty('httpHeaders');
+      expect(result).toHaveProperty('httpHeaders.request');
+      expect(result).toHaveProperty('httpHeaders.response');
+      expect(result).toHaveProperty('httpBodies');
+      expect(result).toHaveProperty('urlQueryParams');
+      expect(result).toHaveProperty('graphQL');
+      expect(result).toHaveProperty('graphQL.document');
+      expect(result).toHaveProperty('graphQL.variables');
+      expect(result).toHaveProperty('genAI');
+      expect(result).toHaveProperty('genAI.inputs');
+      expect(result).toHaveProperty('genAI.outputs');
+      expect(result).toHaveProperty('databaseQueryData');
+      expect(result).toHaveProperty('queues');
+      expect(result).toHaveProperty('stackFrameVariables');
+      expect(result).toHaveProperty('frameContextLines');
+    });
+  });
+});

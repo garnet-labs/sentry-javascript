@@ -1,0 +1,416 @@
+import { waitForTransaction, waitForError, waitForRequest } from '@sentry-internal/test-utils';
+import { InvokeCommand } from '@aws-sdk/client-lambda';
+import { test, expect } from './lambda-fixtures';
+
+interface TunnelInvokeResult {
+  attemptedDsn?: string;
+  status: number;
+  responseBody: string;
+}
+
+function parseLambdaPayload(payload: Uint8Array | undefined): TunnelInvokeResult {
+  if (!payload) {
+    throw new Error('Missing Lambda payload');
+  }
+
+  return JSON.parse(Buffer.from(payload).toString('utf8')) as TunnelInvokeResult;
+}
+
+test.describe('Lambda layer', () => {
+  test('tracing in CJS works', async ({ lambdaClient }) => {
+    const transactionEventPromise = waitForTransaction('aws-serverless-layer', transactionEvent => {
+      return transactionEvent?.transaction === 'LayerTracingCjs';
+    });
+
+    await lambdaClient.send(
+      new InvokeCommand({
+        FunctionName: 'LayerTracingCjs',
+        Payload: JSON.stringify({}),
+      }),
+    );
+
+    const transactionEvent = await transactionEventPromise;
+
+    // shows the SDK sent a transaction
+    expect(transactionEvent.transaction).toEqual('LayerTracingCjs');
+    expect(transactionEvent.contexts?.trace).toEqual({
+      data: {
+        'sentry.sample_rate': 1,
+        'sentry.segment.name.source': 'component',
+        'sentry.origin': 'auto.aws_lambda',
+        'sentry.op': 'function.aws',
+        'cloud.account.id': '012345678912',
+        'cloud.platform': 'aws_lambda',
+        'cloud.provider': 'aws',
+        'faas.invocation_id': expect.any(String),
+        'cloud.resource_id': 'arn:aws:lambda:us-east-1:012345678912:function:LayerTracingCjs',
+        'faas.name': 'LayerTracingCjs',
+        'faas.coldstart': true,
+        'sentry.kind': 'server',
+      },
+      op: 'function.aws',
+      origin: 'auto.aws_lambda',
+      span_id: expect.stringMatching(/[a-f0-9]{16}/),
+      status: 'ok',
+      trace_id: expect.stringMatching(/[a-f0-9]{32}/),
+    });
+
+    expect(transactionEvent.spans).toHaveLength(2);
+
+    // shows that the Otel Http instrumentation is working
+    expect(transactionEvent.spans).toContainEqual(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          'sentry.op': 'http.client',
+          'sentry.origin': 'auto.http.client',
+          'url.full': 'http://example.com/',
+        }),
+        description: 'GET http://example.com/',
+        op: 'http.client',
+      }),
+    );
+
+    // shows that the manual span creation is working
+    expect(transactionEvent.spans).toContainEqual(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          'sentry.op': 'test',
+          'sentry.origin': 'manual',
+        }),
+        description: 'manual-span',
+        op: 'test',
+      }),
+    );
+
+    // shows that the SDK source is correctly detected
+    expect(transactionEvent.sdk?.packages).toContainEqual(
+      expect.objectContaining({ name: 'aws-lambda-layer:@sentry/aws-serverless' }),
+    );
+  });
+
+  test('tracing in ESM works', async ({ lambdaClient }) => {
+    const transactionEventPromise = waitForTransaction('aws-serverless-layer', transactionEvent => {
+      return transactionEvent?.transaction === 'LayerTracingEsm';
+    });
+
+    await lambdaClient.send(
+      new InvokeCommand({
+        FunctionName: 'LayerTracingEsm',
+        Payload: JSON.stringify({}),
+      }),
+    );
+
+    const transactionEvent = await transactionEventPromise;
+
+    // shows the SDK sent a transaction
+    expect(transactionEvent.transaction).toEqual('LayerTracingEsm'); // name should be the function name
+    expect(transactionEvent.contexts?.trace).toEqual({
+      data: {
+        'sentry.sample_rate': 1,
+        'sentry.segment.name.source': 'component',
+        'sentry.origin': 'auto.aws_lambda',
+        'sentry.op': 'function.aws',
+        'cloud.account.id': '012345678912',
+        'cloud.platform': 'aws_lambda',
+        'cloud.provider': 'aws',
+        'faas.invocation_id': expect.any(String),
+        'cloud.resource_id': 'arn:aws:lambda:us-east-1:012345678912:function:LayerTracingEsm',
+        'faas.name': 'LayerTracingEsm',
+        'faas.coldstart': true,
+        'sentry.kind': 'server',
+      },
+      op: 'function.aws',
+      origin: 'auto.aws_lambda',
+      span_id: expect.stringMatching(/[a-f0-9]{16}/),
+      status: 'ok',
+      trace_id: expect.stringMatching(/[a-f0-9]{32}/),
+    });
+
+    expect(transactionEvent.spans).toHaveLength(2);
+
+    // shows that the Otel Http instrumentation is working
+    expect(transactionEvent.spans).toContainEqual(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          'sentry.op': 'http.client',
+          'sentry.origin': 'auto.http.client',
+          'url.full': 'http://example.com/',
+        }),
+        description: 'GET http://example.com/',
+        op: 'http.client',
+      }),
+    );
+
+    // shows that the manual span creation is working
+    expect(transactionEvent.spans).toContainEqual(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          'sentry.op': 'test',
+          'sentry.origin': 'manual',
+        }),
+        description: 'manual-span',
+        op: 'test',
+      }),
+    );
+
+    // shows that the SDK source is correctly detected
+    expect(transactionEvent.sdk?.packages).toContainEqual(
+      expect.objectContaining({ name: 'aws-lambda-layer:@sentry/aws-serverless' }),
+    );
+  });
+
+  test('capturing errors works', async ({ lambdaClient }) => {
+    const errorEventPromise = waitForError('aws-serverless-layer', errorEvent => {
+      return errorEvent?.exception?.values?.[0]?.value === 'test';
+    });
+
+    await lambdaClient.send(
+      new InvokeCommand({
+        FunctionName: 'LayerError',
+        Payload: JSON.stringify({}),
+      }),
+    );
+
+    const errorEvent = await errorEventPromise;
+
+    // shows the SDK sent an error event
+    expect(errorEvent.exception?.values).toHaveLength(1);
+    expect(errorEvent.exception?.values?.[0]).toEqual(
+      expect.objectContaining({
+        type: 'Error',
+        value: 'test',
+        mechanism: {
+          type: 'auto.function.aws_serverless.otel',
+          handled: false,
+        },
+      }),
+    );
+  });
+
+  test('capturing errors works in ESM', async ({ lambdaClient }) => {
+    const errorEventPromise = waitForError('aws-serverless-layer', errorEvent => {
+      return errorEvent?.exception?.values?.[0]?.value === 'test esm';
+    });
+
+    await lambdaClient.send(
+      new InvokeCommand({
+        FunctionName: 'LayerErrorEsm',
+        Payload: JSON.stringify({}),
+      }),
+    );
+
+    const errorEvent = await errorEventPromise;
+
+    // shows the SDK sent an error event
+    expect(errorEvent.exception?.values).toHaveLength(1);
+    expect(errorEvent.exception?.values?.[0]).toEqual(
+      expect.objectContaining({
+        type: 'Error',
+        value: 'test esm',
+        mechanism: {
+          type: 'auto.function.aws_serverless.otel',
+          handled: false,
+        },
+      }),
+    );
+  });
+
+  test('streaming handlers work', async ({ lambdaClient }) => {
+    const transactionEventPromise = waitForTransaction('aws-serverless-layer', transactionEvent => {
+      return transactionEvent?.transaction === 'LayerStreaming';
+    });
+
+    await lambdaClient.send(
+      new InvokeCommand({
+        FunctionName: 'LayerStreaming',
+        Payload: JSON.stringify({}),
+      }),
+    );
+
+    const transactionEvent = await transactionEventPromise;
+
+    expect(transactionEvent.transaction).toEqual('LayerStreaming');
+    expect(transactionEvent.contexts?.trace).toEqual({
+      data: {
+        'sentry.sample_rate': 1,
+        'sentry.segment.name.source': 'component',
+        'sentry.origin': 'auto.aws_lambda',
+        'sentry.op': 'function.aws',
+        'cloud.account.id': '012345678912',
+        'cloud.platform': 'aws_lambda',
+        'cloud.provider': 'aws',
+        'faas.invocation_id': expect.any(String),
+        'cloud.resource_id': 'arn:aws:lambda:us-east-1:012345678912:function:LayerStreaming',
+        'faas.name': 'LayerStreaming',
+        'faas.coldstart': true,
+        'sentry.kind': 'server',
+      },
+      op: 'function.aws',
+      origin: 'auto.aws_lambda',
+      span_id: expect.stringMatching(/[a-f0-9]{16}/),
+      status: 'ok',
+      trace_id: expect.stringMatching(/[a-f0-9]{32}/),
+    });
+
+    expect(transactionEvent.spans).toHaveLength(1);
+
+    expect(transactionEvent.spans).toContainEqual(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          'sentry.op': 'test',
+          'sentry.origin': 'manual',
+        }),
+        description: 'manual-span',
+        op: 'test',
+      }),
+    );
+  });
+
+  test('callback-style handlers work', async ({ lambdaClient }) => {
+    const transactionEventPromise = waitForTransaction('aws-serverless-layer', transactionEvent => {
+      return transactionEvent?.transaction === 'LayerCallback';
+    });
+
+    await lambdaClient.send(
+      new InvokeCommand({
+        FunctionName: 'LayerCallback',
+        Payload: JSON.stringify({}),
+      }),
+    );
+
+    const transactionEvent = await transactionEventPromise;
+
+    expect(transactionEvent.contexts?.trace).toEqual(
+      expect.objectContaining({
+        op: 'function.aws',
+        origin: 'auto.aws_lambda',
+        status: 'ok',
+        data: expect.objectContaining({
+          'sentry.op': 'function.aws',
+          'sentry.origin': 'auto.aws_lambda',
+          'sentry.kind': 'server',
+          'cloud.resource_id': 'arn:aws:lambda:us-east-1:012345678912:function:LayerCallback',
+          'faas.name': 'LayerCallback',
+        }),
+      }),
+    );
+  });
+
+  test('callback-style handler errors are captured', async ({ lambdaClient }) => {
+    const errorEventPromise = waitForError('aws-serverless-layer', errorEvent => {
+      return errorEvent?.exception?.values?.[0]?.value === 'callback error';
+    });
+
+    await lambdaClient.send(
+      new InvokeCommand({
+        FunctionName: 'LayerCallback',
+        Payload: JSON.stringify({ shouldError: true }),
+      }),
+    );
+
+    const errorEvent = await errorEventPromise;
+
+    expect(errorEvent.exception?.values?.[0]).toEqual(
+      expect.objectContaining({
+        type: 'Error',
+        value: 'callback error',
+        mechanism: {
+          type: 'auto.function.aws_serverless.otel',
+          handled: false,
+        },
+      }),
+    );
+  });
+
+  test('continues a trace from incoming headers', async ({ lambdaClient }) => {
+    const traceId = 'd4cda95b652f4a1592b449d5929fda1b';
+    const parentSpanId = '6e0c63257de34c92';
+
+    const transactionEventPromise = waitForTransaction('aws-serverless-layer', transactionEvent => {
+      return (
+        transactionEvent?.transaction === 'LayerTracingCjs' && transactionEvent.contexts?.trace?.trace_id === traceId
+      );
+    });
+
+    await lambdaClient.send(
+      new InvokeCommand({
+        FunctionName: 'LayerTracingCjs',
+        Payload: JSON.stringify({
+          headers: {
+            'sentry-trace': `${traceId}-${parentSpanId}-1`,
+            baggage: `sentry-environment=qa,sentry-public_key=public,sentry-trace_id=${traceId}`,
+          },
+        }),
+      }),
+    );
+
+    const transactionEvent = await transactionEventPromise;
+
+    // The Lambda transaction is parented to the incoming trace context (eventContextExtractor + startInactiveSpan).
+    expect(transactionEvent.contexts?.trace?.trace_id).toEqual(traceId);
+    expect(transactionEvent.contexts?.trace?.parent_span_id).toEqual(parentSpanId);
+  });
+
+  test('extension tunnel validates DSN allowlist and rejects invalid envelopes', async ({ lambdaClient }) => {
+    const matchingMarker = `extension-tunnel-matching-${Date.now()}`;
+    const matchingRequestPromise = waitForRequest('aws-serverless-layer', requestData => {
+      return requestData.rawProxyRequestBody.includes(matchingMarker);
+    });
+
+    const matchingResponse = await lambdaClient.send(
+      new InvokeCommand({
+        FunctionName: 'LayerTunnel',
+        Payload: JSON.stringify({
+          marker: matchingMarker,
+        }),
+      }),
+    );
+    const matchingResult = parseLambdaPayload(matchingResponse.Payload);
+    expect(matchingResult.status).toBe(200);
+    await matchingRequestPromise;
+
+    const mismatchedResponse = await lambdaClient.send(
+      new InvokeCommand({
+        FunctionName: 'LayerTunnel',
+        Payload: JSON.stringify({
+          // Keep host/project/port valid but change public key, so DSN stays valid and fails allowlist match.
+          dsn: String(matchingResult.attemptedDsn).replace('://public@', '://unauthorized@'),
+        }),
+      }),
+    );
+    const mismatchedResult = parseLambdaPayload(mismatchedResponse.Payload);
+    expect(mismatchedResult.status).toBe(403);
+    expect(mismatchedResult.responseBody).toContain('DSN not allowed');
+
+    const missingDsnResponse = await lambdaClient.send(
+      new InvokeCommand({
+        FunctionName: 'LayerTunnel',
+        Payload: JSON.stringify({
+          omitDsn: true,
+        }),
+      }),
+    );
+    const missingDsnResult = parseLambdaPayload(missingDsnResponse.Payload);
+    expect(missingDsnResult.status).toBe(400);
+    expect(missingDsnResult.responseBody).toContain('missing DSN');
+  });
+
+  test('extension tunnel forwards requests when SENTRY_DSN is missing', async ({ lambdaClient }) => {
+    const marker = `extension-tunnel-no-sentry-dsn-${Date.now()}`;
+    const noDsnRequestPromise = waitForRequest('aws-serverless-layer', requestData => {
+      return requestData.rawProxyRequestBody.includes(marker);
+    });
+
+    const noDsnResponse = await lambdaClient.send(
+      new InvokeCommand({
+        FunctionName: 'LayerTunnelNoDsn',
+        Payload: JSON.stringify({
+          marker,
+        }),
+      }),
+    );
+    const noDsnResult = parseLambdaPayload(noDsnResponse.Payload);
+    expect(noDsnResult.status).toBe(200);
+    await noDsnRequestPromise;
+  });
+});

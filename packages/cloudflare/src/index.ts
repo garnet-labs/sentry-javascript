@@ -1,0 +1,153 @@
+export type {
+  Breadcrumb,
+  BreadcrumbHint,
+  PolymorphicRequest,
+  RequestEventData,
+  SdkInfo,
+  Event,
+  EventHint,
+  ErrorEvent,
+  Exception,
+  FeatureFlagsIntegration,
+  Session,
+  SeverityLevel,
+  Span,
+  StackFrame,
+  Stacktrace,
+  Thread,
+  User,
+  Metric,
+  ExclusiveEventHintOrCaptureContext,
+  CaptureContext,
+} from '@sentry/core';
+
+export type { CloudflareOptions } from './client';
+
+export {
+  addEventProcessor,
+  addBreadcrumb,
+  addIntegration,
+  captureException,
+  captureEvent,
+  captureMessage,
+  captureFeedback,
+  close,
+  createTransport,
+  lastEventId,
+  flush,
+  getClient,
+  isInitialized,
+  isEnabled,
+  getCurrentScope,
+  getGlobalScope,
+  getIsolationScope,
+  setCurrentClient,
+  Scope,
+  SDK_VERSION,
+  setContext,
+  setExtra,
+  setExtras,
+  setTag,
+  setTags,
+  setAttribute,
+  setAttributes,
+  setUser,
+  setConversationId,
+  getSpanStatusFromHttpCode,
+  setHttpStatus,
+  withScope,
+  withIsolationScope,
+  captureCheckIn,
+  withMonitor,
+  setMeasurement,
+  getActiveSpan,
+  getRootSpan,
+  getTraceData,
+  getTraceMetaTags,
+  startSpan,
+  startInactiveSpan,
+  startSpanManual,
+  startNewTrace,
+  bindScopeToEmitter,
+  suppressTracing,
+  withActiveSpan,
+  getSpanDescendants,
+  continueTrace,
+  functionToStringIntegration,
+  eventFiltersIntegration,
+  linkedErrorsIntegration,
+  requestDataIntegration,
+  extraErrorDataIntegration,
+  dedupeIntegration,
+  rewriteFramesIntegration,
+  captureConsoleIntegration,
+  moduleMetadataIntegration,
+  supabaseIntegration,
+  instrumentSupabaseClient,
+  zodErrorsIntegration,
+  consoleIntegration,
+  // oxlint-disable-next-line typescript/no-deprecated
+  SEMANTIC_ATTRIBUTE_SENTRY_OP,
+  // oxlint-disable-next-line typescript/no-deprecated
+  SEMANTIC_ATTRIBUTE_SENTRY_ORIGIN,
+  SEMANTIC_ATTRIBUTE_SENTRY_SAMPLE_RATE,
+  spanToStaticSpanJSON,
+  spanToJSON,
+  spanToTraceHeader,
+  spanToBaggageHeader,
+  updateSpanName,
+  consoleLoggingIntegration,
+  createConsolaReporter,
+  featureFlagsIntegration,
+  growthbookIntegration,
+  logger,
+  metrics,
+  withStaticSpan,
+  // oxlint-disable-next-line typescript/no-deprecated
+  withStreamedSpan,
+  spanStreamingIntegration,
+} from '@sentry/core';
+export { trpcMiddleware, wrapMcpServerWithSentry } from '@sentry/core/server';
+export { createFlueInstrumentation, instrumentPostgresJsSql } from '@sentry/server-utils';
+export type { FlueOptions } from '@sentry/server-utils';
+
+export { withSentry } from './withSentry';
+export { defineCloudflareOptions } from './defineCloudflareOptions';
+export { instrumentAgentWithSentry, instrumentDurableObjectWithSentry } from './durableobject';
+export { _INTERNAL_wrapUnlessInstrumented } from './instrument';
+export { sentryPagesPlugin } from './pages-plugin';
+
+export { CloudflareClient } from './client';
+export { _INTERNAL_wrapRequestHandler, getDefaultIntegrations } from './sdk';
+
+export { httpServerIntegration } from './integrations/httpServer';
+export { fetchIntegration } from './integrations/fetch';
+export type { FetchIntegrationOptions } from '@sentry/core';
+export { spotlightIntegration } from './integrations/spotlight';
+export { cronTriggersIntegration } from './integrations/cronTriggers';
+export type { CronTriggerMonitorSettings, CronTriggersOptions } from './integrations/cronTriggers';
+export {
+  openTelemetryIntegration,
+  getOtlpTracesEndpoint,
+  prismaIntegration,
+  instrumentMistralAiClient,
+  instrumentTypeSafeClient,
+  instrumentOpenAiClient,
+  instrumentAnthropicAiClient,
+  instrumentGoogleGenAIClient,
+  instrumentWorkersAiClient,
+  createLangChainCallbackHandler,
+  instrumentLangChainEmbeddings,
+  instrumentStateGraph,
+  instrumentCreateReactAgent,
+  vercelAIIntegration,
+  honoIntegration,
+  honoMiddleware,
+  eveConversationHook,
+  eveIntegration,
+  getInstrumentedModuleNames,
+} from '@sentry/server-utils';
+
+export { instrumentWorkflowWithSentry } from './workflows';
+
+export { setAsyncLocalStorageAsyncContextStrategy } from '@sentry/server-utils/no-diagnostic-channels';

@@ -1,0 +1,297 @@
+import type { DurableObjectStorage } from '@cloudflare/workers-types';
+import type { SerializedTraceData } from '@sentry/core';
+import { CODE_FUNCTION_NAME, SENTRY_OP, SENTRY_ORIGIN } from '@sentry/conventions/attributes';
+import { FUNCTION } from '@sentry/conventions/op';
+import {
+  isObjectLike,
+  captureException,
+  continueTrace,
+  isThenable,
+  type Scope,
+  startNewTrace as startNewTraceCore,
+  startSpan,
+} from '@sentry/core';
+import type { CloudflareOptions } from './client';
+import type { ExecutionContextCompat } from './executionContext';
+import { flushAndDispose, getOriginalWaitUntil } from './flush';
+import { ensureInstrumented } from './instrument';
+import { init } from './sdk';
+import { getInvocationState, getInvocationWaitUntil } from './utils/invocationContext';
+import { withInvocationIsolationScope } from './utils/invocationScope';
+import { extractRpcMeta } from './utils/rpcMeta';
+import { buildSpanLinks, getStoredSpanContext, storeSpanContext } from './utils/traceLinks';
+
+/** Extended DurableObjectState with originalStorage exposed by instrumentContext */
+export interface InstrumentedDurableObjectState extends DurableObjectState {
+  originalStorage?: DurableObjectStorage;
+}
+
+/**
+ * Resolves uninstrumented DO storage for the current invocation.
+ * Prefer `thisArg.ctx` (the live Durable Object instance) over the context captured at
+ * construction time to avoid cross-DO I/O errors in the same isolate.
+ */
+function resolveOriginalStorage(
+  context: ExecutionContext | InstrumentedDurableObjectState | undefined,
+  thisArg: unknown,
+): DurableObjectStorage | undefined {
+  if (isObjectLike(thisArg) && 'ctx' in thisArg) {
+    const doCtx = (thisArg as { ctx: InstrumentedDurableObjectState }).ctx;
+    if (doCtx?.originalStorage) {
+      return doCtx.originalStorage;
+    }
+  }
+
+  if (context && 'originalStorage' in context && context.originalStorage) {
+    return context.originalStorage;
+  }
+
+  return undefined;
+}
+
+type MethodWrapperOptions = {
+  /**
+   * The span name, or a resolver called with the RPC metadata of the current call.
+   * Returning `undefined` skips the span and only captures errors.
+   */
+  spanName?: string | ((rpcMeta: SerializedTraceData | undefined) => string | undefined);
+  spanOp?: string;
+  options: CloudflareOptions;
+  context: ExecutionContext | InstrumentedDurableObjectState;
+  /**
+   * If true, starts a fresh trace instead of inheriting from a parent trace.
+   * Useful for scheduled/independent invocations like alarms.
+   *
+   * If true, it also stores the current span context and links to the previous invocation's span.
+   * Uses Durable Object storage to persist the link. The link is set asynchronously via `span.addLinks()`
+   * in a `waitUntil` to avoid blocking.
+   *
+   * @default false
+   */
+  startNewTrace?: boolean;
+  /**
+   * The trace origin identifying which instrumentation created the span, e.g. `auto.faas.cloudflare.durable_object`.
+   * Used both as the span's `sentry.origin` attribute and as the `mechanism.type` for captured exceptions.
+   */
+  origin: string;
+};
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type UncheckedMethod = (...args: any[]) => any;
+type OriginalMethod = UncheckedMethod;
+
+/**
+ * Wraps a method with Sentry error tracking and optional tracing.
+ * Supports starting new traces and linking to previous invocations via Durable Object storage.
+ *
+ * @param wrapperOptions - The options for the wrapper.
+ * @param handler - The method to wrap.
+ * @param callback - The callback to call.
+ * @param noMark - Whether to mark the method as instrumented.
+ * @returns The wrapped method.
+ */
+export function wrapMethodWithSentry<T extends OriginalMethod>(
+  wrapperOptions: MethodWrapperOptions,
+  handler: T,
+  callback?: (...args: Parameters<T>) => void,
+  noMark?: true,
+): T {
+  return ensureInstrumented(
+    handler,
+    original =>
+      new Proxy(original, {
+        apply(target, thisArg, rawArgs: Parameters<T>) {
+          const { startNewTrace, origin } = wrapperOptions;
+
+          // For RPC methods, extract Sentry trace context from the trailing argument.
+          // The caller side (instrumentDurableObjectStub / JSRPC proxy) appends it;
+          // we strip it here so the user's method never sees it.
+          let args = rawArgs;
+          let rpcMeta: SerializedTraceData | undefined;
+
+          if (wrapperOptions.spanOp === 'rpc') {
+            const extracted = extractRpcMeta(rawArgs);
+            args = extracted.args;
+            rpcMeta = extracted.rpcMeta;
+          }
+
+          const spanName =
+            typeof wrapperOptions.spanName === 'function' ? wrapperOptions.spanName(rpcMeta) : wrapperOptions.spanName;
+
+          const wrappedFunction = (scope: Scope): unknown | Promise<unknown> => {
+            // In certain situations, the passed context can become undefined.
+            // For example, for Astro while prerendering pages at build time.
+            // see: https://github.com/getsentry/sentry-javascript/issues/13217
+            const context: typeof wrapperOptions.context | undefined = wrapperOptions.context;
+
+            // see: https://github.com/getsentry/sentry-javascript/issues/22328
+            // Resolved once per invocation and cached on its state: reading `ctx.waitUntil`
+            // on a native context is a runtime getter call.
+            const invocationState = getInvocationState();
+            const waitUntil = invocationState
+              ? getInvocationWaitUntil(invocationState)
+              : context
+                ? getOriginalWaitUntil(context as ExecutionContextCompat)?.bind(context)
+                : undefined;
+            const storage = resolveOriginalStorage(context, thisArg);
+
+            let scopeClient = scope.getClient();
+            // Re-init when the scope has no usable client (a previous handler disposed it, e.g.
+            // DO alarm handlers) or for `startNewTrace`, so the client points at this
+            // invocation's context. With `cacheClient: true` `init()` returns the isolate's
+            // cached client and only creates (and caches) a fresh one when nothing is cached yet;
+            // `cacheClient: false` creates one per invocation.
+            if (startNewTrace || !scopeClient?.getTransport()) {
+              const client = init({
+                ...wrapperOptions.options,
+                ctx: context as unknown as ExecutionContext | undefined,
+              });
+              scope.setClient(client);
+              scopeClient = client;
+            }
+
+            const clientToDispose = scopeClient;
+            const methodName = spanName || 'unknown';
+
+            const teardown = async (): Promise<void> => {
+              if (startNewTrace && storage) {
+                storeSpanContext(storage, methodName);
+              }
+              await flushAndDispose(clientToDispose);
+            };
+
+            const onFulfilled = (res: unknown) => {
+              waitUntil?.(teardown());
+              return res;
+            };
+
+            const captureAndRethrow = (e: unknown): never => {
+              captureException(e, {
+                mechanism: {
+                  type: origin,
+                  handled: false,
+                },
+              });
+              throw e;
+            };
+
+            const onRejected = (e: unknown) => {
+              try {
+                return captureAndRethrow(e);
+              } finally {
+                waitUntil?.(teardown());
+              }
+            };
+
+            if (!spanName) {
+              try {
+                if (callback) {
+                  callback(...args);
+                }
+
+                const result = Reflect.apply(target, thisArg, args);
+
+                if (isThenable(result)) {
+                  return result.then(onFulfilled, onRejected);
+                } else {
+                  return onFulfilled(result);
+                }
+              } catch (e) {
+                return onRejected(e);
+              }
+            }
+
+            const attributes = wrapperOptions.spanOp
+              ? {
+                  [SENTRY_OP]: wrapperOptions.spanOp,
+                  [SENTRY_ORIGIN]: origin,
+                  // `function` spans are already named like their function name, so we just set `code.function.name` here.
+                  ...(wrapperOptions.spanOp === FUNCTION && { [CODE_FUNCTION_NAME]: methodName }),
+                }
+              : {};
+
+            const executeSpan = (): unknown => {
+              return startSpan({ name: methodName, attributes }, span => {
+                if (startNewTrace && storage) {
+                  const storedContext = getStoredSpanContext(storage, methodName);
+
+                  if (storedContext) {
+                    span.addLinks(buildSpanLinks(storedContext));
+                    // TODO(v12): Remove this once the Sentry trace view finds linked traces via span links.
+                    // EAP stores span links, but the trace view still reads this attribute to navigate to the
+                    // previous/next trace.
+                    const sampledFlag = storedContext.sampled ? '1' : '0';
+                    span.setAttribute(
+                      'sentry.previous_trace',
+                      `${storedContext.traceId}-${storedContext.spanId}-${sampledFlag}`,
+                    );
+                  }
+                }
+
+                try {
+                  const result = Reflect.apply(target, thisArg, args);
+
+                  if (isThenable(result)) {
+                    return result.then(undefined, captureAndRethrow);
+                  }
+                  return result;
+                } catch (e) {
+                  return captureAndRethrow(e);
+                }
+              });
+            };
+
+            // The boundary flush (teardown) must run after the method span has ended, so the
+            // span is in the buffer when that flush drains it. Running it inside the span
+            // callback (before `startSpan` ends the span) would leave the span for the eager
+            // path and cost a second flush per invocation.
+            const runWithTeardown = (run: () => unknown): unknown => {
+              let out: unknown;
+              try {
+                out = run();
+              } catch (e) {
+                // Synchronous throw: `startSpan` already ended the span and rethrew.
+                waitUntil?.(teardown());
+                throw e;
+              }
+              if (isThenable(out)) {
+                return out.then(
+                  res => {
+                    waitUntil?.(teardown());
+                    return res;
+                  },
+                  e => {
+                    waitUntil?.(teardown());
+                    throw e;
+                  },
+                );
+              }
+              waitUntil?.(teardown());
+              return out;
+            };
+
+            if (rpcMeta) {
+              return runWithTeardown(() =>
+                continueTrace(
+                  { sentryTrace: rpcMeta['sentry-trace'] || '', baggage: rpcMeta.baggage || '' },
+                  executeSpan,
+                ),
+              );
+            }
+
+            if (startNewTrace) {
+              return runWithTeardown(() => startNewTraceCore(() => executeSpan()));
+            }
+
+            return runWithTeardown(executeSpan);
+          };
+
+          return withInvocationIsolationScope(
+            wrappedFunction,
+            wrapperOptions.context as ExecutionContextCompat | undefined,
+          );
+        },
+      }),
+    noMark,
+  );
+}

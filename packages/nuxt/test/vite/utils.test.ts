@@ -1,0 +1,448 @@
+import type { Nuxt } from '@nuxt/schema';
+import * as fs from 'fs';
+import * as path from 'path';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import {
+  addRuntimeInjectionTraceDep,
+  constructFunctionReExport,
+  constructWrappedFunctionExportQuery,
+  extractFunctionReexportQueryParameters,
+  findDefaultSdkInitFile,
+  getFilenameFromNodeStartCommand,
+  QUERY_END_INDICATOR,
+  removeSentryQueryFromPath,
+  SENTRY_REEXPORTED_FUNCTIONS,
+  SENTRY_WRAPPED_ENTRY,
+  SENTRY_WRAPPED_FUNCTIONS,
+  toImportSpecifier,
+} from '../../src/vite/utils';
+
+const resolvePathMock = vi.hoisted(() => vi.fn());
+
+vi.mock('@nuxt/kit', () => ({
+  resolvePath: resolvePathMock,
+}));
+
+vi.mock('fs', async importOriginal => ({
+  ...(await importOriginal<typeof fs>()),
+  existsSync: vi.fn(),
+}));
+
+describe('findDefaultSdkInitFile', () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it.each(['ts', 'js', 'mjs', 'cjs', 'mts', 'cts'])(
+    'should return the server file path with .%s extension if it exists',
+    async ext => {
+      vi.mocked(fs.existsSync).mockImplementation(filePath => {
+        return !(filePath instanceof URL) && filePath.toString().includes(`sentry.server.config.${ext}`);
+      });
+
+      const result = await findDefaultSdkInitFile('server');
+      expect(result).toMatch(path.join('packages', 'nuxt', `sentry.server.config.${ext}`));
+    },
+  );
+
+  it.each(['ts', 'js', 'mjs', 'cjs', 'mts', 'cts'])(
+    'should return the client file path with .%s extension if it exists',
+    async ext => {
+      vi.mocked(fs.existsSync).mockImplementation(filePath => {
+        return !(filePath instanceof URL) && filePath.toString().includes(`sentry.client.config.${ext}`);
+      });
+
+      const result = await findDefaultSdkInitFile('client');
+      expect(result).toMatch(path.join('packages', 'nuxt', `sentry.client.config.${ext}`));
+    },
+  );
+
+  it.each(['ts', 'js', 'mjs', 'cjs', 'mts', 'cts'])(
+    'should return a client config from a custom config root dir if it exists with .%s extension',
+    async ext => {
+      vi.mocked(fs.existsSync).mockImplementation(filePath => {
+        return !(filePath instanceof URL) && filePath.toString().includes(`sentry.client.config.${ext}`);
+      });
+
+      const baseDir = '/users/some-user/front-example/app/config';
+
+      resolvePathMock.mockResolvedValue(baseDir);
+
+      const result = await findDefaultSdkInitFile('client', undefined, {
+        configDir: '~/config',
+      });
+
+      expect(result).toBe(path.resolve(baseDir, `sentry.client.config.${ext}`));
+      expect(resolvePathMock).toHaveBeenCalledWith('~/config', { type: 'dir' });
+    },
+  );
+
+  it.each(['ts', 'js', 'mjs', 'cjs', 'mts', 'cts'])(
+    'should return a server config from a custom config root dir if it exists with .%s extension',
+    async ext => {
+      vi.mocked(fs.existsSync).mockImplementation(filePath => {
+        return !(filePath instanceof URL) && filePath.toString().includes(`sentry.server.config.${ext}`);
+      });
+
+      const baseDir = '/users/some-user/front-example/app/config';
+
+      resolvePathMock.mockResolvedValue(baseDir);
+
+      const result = await findDefaultSdkInitFile('server', undefined, {
+        configDir: '~/config',
+      });
+
+      expect(result).toBe(path.resolve(baseDir, `sentry.server.config.${ext}`));
+      expect(resolvePathMock).toHaveBeenCalledWith('~/config', { type: 'dir' });
+    },
+  );
+
+  it('should return undefined if no file with specified extensions exists', async () => {
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+
+    const result = await findDefaultSdkInitFile('server');
+    expect(result).toBeUndefined();
+  });
+
+  it('should return undefined if no file exists', async () => {
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+
+    const result = await findDefaultSdkInitFile('server');
+    expect(result).toBeUndefined();
+  });
+
+  it('ignores a public/instrument.server file', async () => {
+    vi.mocked(fs.existsSync).mockImplementation(filePath => {
+      return !(filePath instanceof URL) && filePath.toString().includes('instrument.server.js');
+    });
+
+    const result = await findDefaultSdkInitFile('server');
+    expect(result).toBeUndefined();
+  });
+
+  it('should return the latest layer config file path if client config exists', async () => {
+    vi.mocked(fs.existsSync).mockImplementation(filePath => {
+      return !(filePath instanceof URL) && filePath.toString().includes('sentry.client.config.ts');
+    });
+
+    const nuxtMock = {
+      options: {
+        _layers: [
+          {
+            cwd: 'packages/nuxt/module',
+          },
+          {
+            cwd: 'packages/nuxt',
+          },
+        ],
+      },
+    } as unknown as Nuxt;
+
+    const result = await findDefaultSdkInitFile('client', nuxtMock);
+    expect(result).toMatch(path.join('packages', 'nuxt', 'sentry.client.config.ts'));
+  });
+
+  it('should return the latest layer config file path if server config exists', async () => {
+    vi.mocked(fs.existsSync).mockImplementation(filePath => {
+      return !(filePath instanceof URL) && filePath.toString().includes('sentry.server.config.ts');
+    });
+
+    const nuxtMock = {
+      options: {
+        _layers: [
+          {
+            cwd: 'packages/nuxt/module',
+          },
+          {
+            cwd: 'packages/nuxt',
+          },
+        ],
+      },
+    } as unknown as Nuxt;
+
+    const result = await findDefaultSdkInitFile('server', nuxtMock);
+    expect(result).toMatch(path.join('packages', 'nuxt', 'sentry.server.config.ts'));
+  });
+
+  it('should return the latest layer config file path if client config exists in former layer', async () => {
+    vi.mocked(fs.existsSync).mockImplementation(filePath => {
+      return (
+        !(filePath instanceof URL) &&
+        filePath.toString().includes(path.join('nuxt', 'module', 'sentry.client.config.ts'))
+      );
+    });
+
+    const nuxtMock = {
+      options: {
+        _layers: [
+          {
+            cwd: 'packages/nuxt/module',
+          },
+          {
+            cwd: 'packages/nuxt',
+          },
+        ],
+      },
+    } as unknown as Nuxt;
+
+    const result = await findDefaultSdkInitFile('client', nuxtMock);
+    expect(result).toMatch(path.join('packages', 'nuxt', 'module', 'sentry.client.config.ts'));
+  });
+});
+
+describe('toImportSpecifier', () => {
+  it('builds a relative specifier Node accepts', () => {
+    expect(toImportSpecifier(path.join('/my', 'app'), path.join('/my', 'app', '.nuxt', 'dev', 'config.mjs'))).toBe(
+      './.nuxt/dev/config.mjs',
+    );
+  });
+
+  // On Windows `path.relative` returns backslashes, which Node rejects in an import specifier.
+  it('rewrites backslash separators to forward slashes', () => {
+    expect(toImportSpecifier('/my/app', '/my/app/.nuxt\\dev\\config.mjs')).toBe('./.nuxt/dev/config.mjs');
+  });
+});
+
+describe('getFilenameFromPath', () => {
+  it('should return the filename from a simple path', () => {
+    const path = 'node ./server/index.mjs';
+    const filename = getFilenameFromNodeStartCommand(path);
+    expect(filename).toBe('index.mjs');
+  });
+
+  it('should return the filename from a nested path', () => {
+    const path = 'node ./.output/whatever/path/server.js';
+    const filename = getFilenameFromNodeStartCommand(path);
+    expect(filename).toBe('server.js');
+  });
+
+  it('should return the filename from a Windows-style path', () => {
+    const path = '.\\Projects\\my-app\\src\\main.js';
+    const filename = getFilenameFromNodeStartCommand(path);
+    expect(filename).toBe('main.js');
+  });
+
+  it('should return null for an empty path', () => {
+    const path = '';
+    const filename = getFilenameFromNodeStartCommand(path);
+    expect(filename).toBeNull();
+  });
+
+  it('should return the filename when there are no directory separators', () => {
+    const path = 'index.mjs';
+    const filename = getFilenameFromNodeStartCommand(path);
+    expect(filename).toBe('index.mjs');
+  });
+
+  it('should return null for paths with trailing slashes', () => {
+    const path = 'node ./server/';
+    const filename = getFilenameFromNodeStartCommand(path);
+    expect(filename).toBeNull();
+  });
+
+  it('should return null for commands without file extensions', () => {
+    const path = 'npx @azure/static-web-apps-cli start .output/public --api-location .output/server';
+    const filename = getFilenameFromNodeStartCommand(path);
+    expect(filename).toBeNull();
+  });
+});
+
+describe('removeSentryQueryFromPath', () => {
+  it('strips the Sentry query part from the path', () => {
+    const url = `/example/path${SENTRY_WRAPPED_ENTRY}${SENTRY_WRAPPED_FUNCTIONS}foo,${QUERY_END_INDICATOR}`;
+    const url2 = `/example/path${SENTRY_WRAPPED_ENTRY}${QUERY_END_INDICATOR}`;
+    const result = removeSentryQueryFromPath(url);
+    const result2 = removeSentryQueryFromPath(url2);
+    expect(result).toBe('/example/path');
+    expect(result2).toBe('/example/path');
+  });
+
+  it('returns the same path if the specific query part is not present', () => {
+    const url = '/example/path?other-query=param';
+    const result = removeSentryQueryFromPath(url);
+    expect(result).toBe(url);
+  });
+});
+
+describe('extractFunctionReexportQueryParameters', () => {
+  it.each([
+    [`${SENTRY_WRAPPED_FUNCTIONS}foo,bar,${QUERY_END_INDICATOR}`, { wrap: ['foo', 'bar'], reexport: [] }],
+    [
+      `${SENTRY_WRAPPED_FUNCTIONS}foo,bar,default${QUERY_END_INDICATOR}`,
+      { wrap: ['foo', 'bar', 'default'], reexport: [] },
+    ],
+    [
+      `${SENTRY_WRAPPED_FUNCTIONS}foo,a.b*c?d[e]f(g)h|i\\\\j(){hello},${QUERY_END_INDICATOR}`,
+      { wrap: ['foo', 'a\\.b\\*c\\?d\\[e\\]f\\(g\\)h\\|i\\\\\\\\j\\(\\)\\{hello\\}'], reexport: [] },
+    ],
+    [`/example/path/${SENTRY_WRAPPED_FUNCTIONS}foo,bar${QUERY_END_INDICATOR}`, { wrap: ['foo', 'bar'], reexport: [] }],
+    [
+      `${SENTRY_WRAPPED_FUNCTIONS}foo,bar,${SENTRY_REEXPORTED_FUNCTIONS}${QUERY_END_INDICATOR}`,
+      { wrap: ['foo', 'bar'], reexport: [] },
+    ],
+    [`${SENTRY_REEXPORTED_FUNCTIONS}${QUERY_END_INDICATOR}`, { wrap: [], reexport: [] }],
+    [
+      `/path${SENTRY_WRAPPED_FUNCTIONS}foo,bar${SENTRY_REEXPORTED_FUNCTIONS}bar${QUERY_END_INDICATOR}`,
+      { wrap: ['foo', 'bar'], reexport: ['bar'] },
+    ],
+    ['?other-query=param', { wrap: [], reexport: [] }],
+  ])('extracts parameters from the query string: %s', (query, expected) => {
+    const result = extractFunctionReexportQueryParameters(query);
+    expect(result).toEqual(expected);
+  });
+});
+
+describe('constructWrappedFunctionExportQuery', () => {
+  it.each([
+    [{ '.': ['handler'] }, ['handler'], `${SENTRY_WRAPPED_FUNCTIONS}handler`],
+    [{ '.': ['handler'], './module': ['server'] }, [], `${SENTRY_REEXPORTED_FUNCTIONS}handler,server`],
+    [
+      { '.': ['handler'], './module': ['server'] },
+      ['server'],
+      `${SENTRY_WRAPPED_FUNCTIONS}server${SENTRY_REEXPORTED_FUNCTIONS}handler`,
+    ],
+    [
+      { '.': ['handler', 'otherFunction'] },
+      ['handler'],
+      `${SENTRY_WRAPPED_FUNCTIONS}handler${SENTRY_REEXPORTED_FUNCTIONS}otherFunction`,
+    ],
+    [{ '.': ['handler', 'otherFn'] }, ['handler', 'otherFn'], `${SENTRY_WRAPPED_FUNCTIONS}handler,otherFn`],
+    [{ '.': ['bar'], './module': ['foo'] }, ['bar', 'foo'], `${SENTRY_WRAPPED_FUNCTIONS}bar,foo`],
+    [{ '.': ['foo', 'bar'] }, ['foo'], `${SENTRY_WRAPPED_FUNCTIONS}foo${SENTRY_REEXPORTED_FUNCTIONS}bar`],
+    [{ '.': ['foo', 'bar'] }, ['bar'], `${SENTRY_WRAPPED_FUNCTIONS}bar${SENTRY_REEXPORTED_FUNCTIONS}foo`],
+    [{ '.': ['foo', 'bar'] }, ['foo', 'bar'], `${SENTRY_WRAPPED_FUNCTIONS}foo,bar`],
+    [{ '.': ['foo', 'bar'] }, [], `${SENTRY_REEXPORTED_FUNCTIONS}foo,bar`],
+  ])(
+    'constructs re-export query for exportedBindings: %j and entrypointWrappedFunctions: %j',
+    (exportedBindings, entrypointWrappedFunctions, expected) => {
+      const result = constructWrappedFunctionExportQuery(exportedBindings, entrypointWrappedFunctions);
+      expect(result).toBe(expected);
+    },
+  );
+
+  it('logs a warning if no functions are found for re-export and debug is true', () => {
+    const consoleWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const exportedBindings = { '.': ['handler'] };
+    const entrypointWrappedFunctions = ['nonExistentFunction'];
+    const debug = true;
+
+    const result = constructWrappedFunctionExportQuery(exportedBindings, entrypointWrappedFunctions, debug);
+    expect(result).toBe('?sentry-query-reexported-functions=handler');
+    expect(consoleWarnSpy).toHaveBeenCalledWith(
+      "[Sentry] No functions found to wrap. In case the server needs to export async functions other than `handler` or  `server`, consider adding the name(s) to Sentry's build options `sentry.experimental_entrypointWrappedFunctions` in `nuxt.config.ts`.",
+    );
+
+    consoleWarnSpy.mockRestore();
+  });
+});
+
+describe('constructFunctionReExport', () => {
+  it('constructs re-export code for given query parameters and entry ID', () => {
+    const query = `${SENTRY_WRAPPED_FUNCTIONS}foo,bar,${QUERY_END_INDICATOR}}`;
+    const query2 = `${SENTRY_WRAPPED_FUNCTIONS}foo,bar${QUERY_END_INDICATOR}}`;
+    const entryId = './module';
+    const result = constructFunctionReExport(query, entryId);
+    const result2 = constructFunctionReExport(query2, entryId);
+
+    const expected = `
+async function foo_sentryWrapped(...args) {
+  const res = await import("./module");
+  return res.foo.call(this, ...args);
+}
+export { foo_sentryWrapped as foo };
+async function bar_sentryWrapped(...args) {
+  const res = await import("./module");
+  return res.bar.call(this, ...args);
+}
+export { bar_sentryWrapped as bar };
+`;
+    expect(result.trim()).toBe(expected.trim());
+    expect(result2.trim()).toBe(expected.trim());
+  });
+
+  it('constructs re-export code for a "default" query parameters and entry ID', () => {
+    const query = `${SENTRY_WRAPPED_FUNCTIONS}default${QUERY_END_INDICATOR}}`;
+    const entryId = './index';
+    const result = constructFunctionReExport(query, entryId);
+
+    const expected = `
+async function default_sentryWrapped(...args) {
+  const res = await import("./index");
+  return res.default.call(this, ...args);
+}
+export { default_sentryWrapped as default };
+`;
+    expect(result.trim()).toBe(expected.trim());
+  });
+
+  it('constructs re-export code for a "default" query parameters and entry ID', () => {
+    const query = `${SENTRY_WRAPPED_FUNCTIONS}default${QUERY_END_INDICATOR}}`;
+    const entryId = './index';
+    const result = constructFunctionReExport(query, entryId);
+
+    const expected = `
+async function default_sentryWrapped(...args) {
+  const res = await import("./index");
+  return res.default.call(this, ...args);
+}
+export { default_sentryWrapped as default };
+`;
+    expect(result.trim()).toBe(expected.trim());
+  });
+
+  it('constructs re-export code for a mix of wrapped and re-exported functions', () => {
+    const query = `${SENTRY_WRAPPED_FUNCTIONS}foo,${SENTRY_REEXPORTED_FUNCTIONS}bar${QUERY_END_INDICATOR}`;
+    const entryId = './module';
+    const result = constructFunctionReExport(query, entryId);
+
+    const expected = `
+async function foo_sentryWrapped(...args) {
+  const res = await import("./module");
+  return res.foo.call(this, ...args);
+}
+export { foo_sentryWrapped as foo };
+export { bar } from "./module";
+`;
+    expect(result.trim()).toBe(expected.trim());
+  });
+
+  it('does not re-export a default export for regular re-exported functions', () => {
+    const query = `${SENTRY_WRAPPED_FUNCTIONS}foo${SENTRY_REEXPORTED_FUNCTIONS}default${QUERY_END_INDICATOR}`;
+    const entryId = './module';
+    const result = constructFunctionReExport(query, entryId);
+
+    const expected = `
+async function foo_sentryWrapped(...args) {
+  const res = await import("./module");
+  return res.foo.call(this, ...args);
+}
+export { foo_sentryWrapped as foo };
+`;
+    expect(result.trim()).toBe(expected.trim());
+  });
+
+  it('returns an empty string if the query string is empty', () => {
+    const query = '';
+    const entryId = './module';
+    const result = constructFunctionReExport(query, entryId);
+    expect(result).toBe('');
+  });
+});
+
+describe('addRuntimeInjectionTraceDep', () => {
+  it('keeps `@sentry/server-runtime-injection` out of the Nitro v3 bundle', () => {
+    const nuxtMock = { options: { nitro: { traceDeps: ['sharp'] } } } as unknown as Nuxt;
+
+    addRuntimeInjectionTraceDep(nuxtMock, true);
+
+    expect(nuxtMock.options.nitro).toEqual({ traceDeps: ['sharp', '@sentry/server-runtime-injection'] });
+  });
+
+  it('does not touch the Nitro v2 config', () => {
+    const nuxtMock = { options: { nitro: {} } } as unknown as Nuxt;
+
+    addRuntimeInjectionTraceDep(nuxtMock, false);
+
+    expect(nuxtMock.options.nitro).toEqual({});
+  });
+});

@@ -1,0 +1,74 @@
+{
+  "name": "@sentry/profiling-node",
+  "version": "11.8.0",
+  "description": "Official Sentry SDK for Node.js Profiling",
+  "repository": "git://github.com/getsentry/sentry-javascript.git",
+  "homepage": "https://github.com/getsentry/sentry-javascript/tree/master/packages/profiling-node",
+  "author": "Sentry",
+  "license": "MIT",
+  "main": "build/cjs/index.js",
+  "module": "build/esm/index.js",
+  "types": "build/types/index.d.ts",
+  "exports": {
+    "./package.json": "./package.json",
+    ".": {
+      "import": {
+        "types": "./build/types/index.d.ts",
+        "default": "./build/esm/index.js"
+      },
+      "require": {
+        "types": "./build/types/index.d.ts",
+        "default": "./build/cjs/index.js"
+      }
+    }
+  },
+  "engines": {
+    "node": ">=20.19.0 <22.0.0 || >=22.12.0 <23.0.0 || >=23.2.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "/build",
+    "package.json"
+  ],
+  "scripts": {
+    "clean": "rm -rf build",
+    "lint": "oxlint . --type-aware",
+    "lint:types": "oxlint src --type-aware --type-check",
+    "lint:es-compatibility": "es-check es2022 ./build/cjs/*.js && es-check es2022 ./build/esm/*.js --module",
+    "lint:fix": "oxlint . --fix --type-aware",
+    "build": "yarn build:types && yarn build:transpile",
+    "build:transpile": "yarn rollup -c rollup.npm.config.mjs",
+    "build:types": "tsc -p tsconfig.types.json",
+    "build:dev": "yarn clean && yarn build",
+    "build:transpile:watch": "rollup -c rollup.npm.config.mjs --watch",
+    "build:watch": "run-p build:transpile:watch",
+    "build:tarball": "npm pack",
+    "test:bundle": "node test-binaries.esbuild.js",
+    "test": "vitest run",
+    "test:watch": "vitest --watch"
+  },
+  "dependencies": {
+    "@sentry/node-cpu-profiler": "^2.4.4",
+    "@sentry/core": "11.8.0",
+    "@sentry/node": "11.8.0"
+  },
+  "devDependencies": {
+    "@types/node": "^18.19.1"
+  },
+  "volta": {
+    "extends": "../../package.json"
+  },
+  "sideEffects": false,
+  "nx": {
+    "targets": {
+      "build:transpile": {
+        "dependsOn": [
+          "^build:transpile",
+          "^build:types"
+        ]
+      }
+    }
+  }
+}
