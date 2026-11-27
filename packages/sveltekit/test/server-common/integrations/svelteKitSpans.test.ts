@@ -1,0 +1,294 @@
+import { SENTRY_OP, SENTRY_ORIGIN } from '@sentry/conventions/attributes';
+import type { SpanJSON, StreamedSpanJSON, TransactionEvent } from '@sentry/core';
+import { describe, expect, it } from 'vitest';
+import {
+  _enhanceKitSpan,
+  _enhanceKitSpanStreamed,
+  svelteKitSpansIntegration,
+} from '../../../src/server-common/integrations/svelteKitSpans';
+
+describe('svelteKitSpansIntegration', () => {
+  it('has a name and a preprocessEvent and processSpan hook', () => {
+    const integration = svelteKitSpansIntegration();
+
+    expect(integration.name).toBe('SvelteKitSpansEnhancement');
+    expect(typeof integration.preprocessEvent).toBe('function');
+    expect(typeof integration.processSpan).toBe('function');
+  });
+
+  it('enhances spans from SvelteKit', () => {
+    const event: TransactionEvent = {
+      type: 'transaction',
+      contexts: {
+        trace: {
+          span_id: '123',
+          trace_id: 'abc',
+          data: {
+            'sveltekit.tracing.original_name': 'sveltekit.handle.root',
+          },
+        },
+      },
+      spans: [
+        {
+          description: 'sveltekit.resolve',
+          data: {
+            someAttribute: 'someValue',
+          },
+          span_id: '123',
+          trace_id: 'abc',
+          start_timestamp: 0,
+        },
+      ],
+    };
+
+    // @ts-expect-error -- passing in an empty option for client but it is unused in the integration
+    svelteKitSpansIntegration().preprocessEvent?.(event, {}, {});
+
+    expect(event.spans).toHaveLength(1);
+    expect(event.spans?.[0]?.op).toBe('function');
+    expect(event.spans?.[0]?.origin).toBe('auto.http.sveltekit');
+    expect(event.spans?.[0]?.data[SENTRY_OP]).toBe('function');
+    expect(event.spans?.[0]?.data[SENTRY_ORIGIN]).toBe('auto.http.sveltekit');
+  });
+
+  describe('_enhanceKitSpan', () => {
+    it.each([
+      ['sveltekit.resolve', 'function', 'auto.http.sveltekit'],
+      ['sveltekit.load', 'function', 'auto.function.sveltekit.load'],
+      ['sveltekit.form_action', 'function', 'auto.function.sveltekit.action'],
+      ['sveltekit.endpoint', 'function', 'auto.function.sveltekit.endpoint'],
+      ['sveltekit.remote.call', 'function', 'auto.rpc.sveltekit.remote'],
+      ['sveltekit.handle.sequenced.0', 'function', 'auto.function.sveltekit.handle'],
+      ['sveltekit.handle.sequenced.myHandler', 'function', 'auto.function.sveltekit.handle'],
+    ])('enhances %s span with the correct op and origin', (spanName, op, origin) => {
+      const span = {
+        description: spanName,
+        data: {
+          someAttribute: 'someValue',
+        },
+        span_id: '123',
+        trace_id: 'abc',
+        start_timestamp: 0,
+      } as SpanJSON;
+
+      _enhanceKitSpan(span);
+
+      expect(span.op).toBe(op);
+      expect(span.origin).toBe(origin);
+      expect(span.data[SENTRY_OP]).toBe(op);
+      expect(span.data[SENTRY_ORIGIN]).toBe(origin);
+    });
+
+    it("doesn't change spans from other origins", () => {
+      const span = {
+        description: 'someOtherSpan',
+        data: {},
+      } as SpanJSON;
+
+      _enhanceKitSpan(span);
+
+      expect(span.op).toBeUndefined();
+      expect(span.origin).toBeUndefined();
+      expect(span.data[SENTRY_OP]).toBeUndefined();
+      expect(span.data[SENTRY_ORIGIN]).toBeUndefined();
+    });
+
+    it("doesn't overwrite the sveltekit.handle.root span", () => {
+      const rootHandleSpan = {
+        description: 'sveltekit.handle.root',
+        op: 'http.server',
+        origin: 'auto.http.sveltekit',
+        data: {
+          [SENTRY_OP]: 'http.server',
+          [SENTRY_ORIGIN]: 'auto.http.sveltekit',
+        },
+        span_id: '123',
+        trace_id: 'abc',
+        start_timestamp: 0,
+      } as SpanJSON;
+
+      _enhanceKitSpan(rootHandleSpan);
+
+      expect(rootHandleSpan.data[SENTRY_OP]).toBe('http.server');
+      expect(rootHandleSpan.data[SENTRY_ORIGIN]).toBe('auto.http.sveltekit');
+      expect(rootHandleSpan.op).toBe('http.server');
+      expect(rootHandleSpan.origin).toBe('auto.http.sveltekit');
+    });
+
+    it("doesn't enhance unrelated spans", () => {
+      const span = {
+        description: 'someOtherSpan',
+        data: {
+          [SENTRY_OP]: 'db',
+          [SENTRY_ORIGIN]: 'auto.db.pg',
+        },
+        op: 'db',
+        origin: 'auto.db.pg',
+        span_id: '123',
+        trace_id: 'abc',
+        start_timestamp: 0,
+      } as SpanJSON;
+
+      _enhanceKitSpan(span);
+
+      expect(span.op).toBe('db');
+      expect(span.origin).toBe('auto.db.pg');
+      expect(span.data[SENTRY_OP]).toBe('db');
+      expect(span.data[SENTRY_ORIGIN]).toBe('auto.db.pg');
+    });
+
+    it("doesn't overwrite already set ops or origins on sveltekit spans", () => {
+      // for example, if users manually set this (for whatever reason)
+      const span = {
+        description: 'sveltekit.resolve',
+        origin: 'auto.custom.origin',
+        data: {
+          [SENTRY_OP]: 'custom.op',
+        },
+        span_id: '123',
+        trace_id: 'abc',
+        start_timestamp: 0,
+      } as SpanJSON;
+
+      _enhanceKitSpan(span);
+
+      expect(span.origin).toBe('auto.custom.origin');
+      expect(span.data[SENTRY_OP]).toBe('custom.op');
+    });
+
+    it('overwrites previously set "manual" origins on sveltekit spans', () => {
+      // for example, if users manually set this (for whatever reason)
+      const span = {
+        description: 'sveltekit.resolve',
+        origin: 'manual',
+        data: {
+          [SENTRY_OP]: 'custom.op',
+        },
+        span_id: '123',
+        trace_id: 'abc',
+        start_timestamp: 0,
+      } as SpanJSON;
+
+      _enhanceKitSpan(span);
+
+      expect(span.origin).toBe('auto.http.sveltekit');
+      expect(span.data[SENTRY_OP]).toBe('custom.op');
+    });
+  });
+
+  describe('_enhanceKitSpanStreamed', () => {
+    function makeStreamedSpan(overrides: Partial<StreamedSpanJSON> = {}): StreamedSpanJSON {
+      return {
+        name: 'unspecified',
+        span_id: '123',
+        trace_id: 'abc',
+        start_timestamp: 0,
+        end_timestamp: 1,
+        status: 'ok',
+        is_segment: false,
+        attributes: {},
+        ...overrides,
+      };
+    }
+
+    it.each([
+      ['sveltekit.resolve', 'function', 'auto.http.sveltekit'],
+      ['sveltekit.load', 'function', 'auto.function.sveltekit.load'],
+      ['sveltekit.form_action', 'function', 'auto.function.sveltekit.action'],
+      ['sveltekit.endpoint', 'function', 'auto.function.sveltekit.endpoint'],
+      ['sveltekit.remote.call', 'function', 'auto.rpc.sveltekit.remote'],
+      ['sveltekit.handle.sequenced.0', 'function', 'auto.function.sveltekit.handle'],
+      ['sveltekit.handle.sequenced.myHandler', 'function', 'auto.function.sveltekit.handle'],
+    ])('enhances %s span with the correct op and origin', (spanName, op, origin) => {
+      const span = makeStreamedSpan({ name: spanName, attributes: { someAttribute: 'someValue' } });
+
+      _enhanceKitSpanStreamed(span);
+
+      expect(span.attributes?.[SENTRY_OP]).toBe(op);
+      expect(span.attributes?.[SENTRY_ORIGIN]).toBe(origin);
+      expect(span.attributes?.['sentry.description']).toBe(spanName);
+    });
+
+    it("doesn't change spans from other origins", () => {
+      const span = makeStreamedSpan({ name: 'someOtherSpan' });
+
+      _enhanceKitSpanStreamed(span);
+
+      expect(span.attributes?.[SENTRY_OP]).toBeUndefined();
+      expect(span.attributes?.[SENTRY_ORIGIN]).toBeUndefined();
+      expect(span.attributes?.['sentry.description']).toBeUndefined();
+    });
+
+    it("doesn't overwrite the sveltekit.handle.root span", () => {
+      const rootHandleSpan = makeStreamedSpan({
+        name: 'sveltekit.handle.root',
+        attributes: {
+          [SENTRY_OP]: 'http.server',
+          [SENTRY_ORIGIN]: 'auto.http.sveltekit',
+        },
+      });
+
+      _enhanceKitSpanStreamed(rootHandleSpan);
+
+      expect(rootHandleSpan.attributes?.[SENTRY_OP]).toBe('http.server');
+      expect(rootHandleSpan.attributes?.[SENTRY_ORIGIN]).toBe('auto.http.sveltekit');
+    });
+
+    it("doesn't enhance unrelated spans", () => {
+      const span = makeStreamedSpan({
+        name: 'someOtherSpan',
+        attributes: {
+          [SENTRY_OP]: 'db',
+          [SENTRY_ORIGIN]: 'auto.db.pg',
+        },
+      });
+
+      _enhanceKitSpanStreamed(span);
+
+      expect(span.attributes?.[SENTRY_OP]).toBe('db');
+      expect(span.attributes?.[SENTRY_ORIGIN]).toBe('auto.db.pg');
+    });
+
+    it("doesn't overwrite already set ops or origins on sveltekit spans", () => {
+      // for example, if users manually set this (for whatever reason)
+      const span = makeStreamedSpan({
+        name: 'sveltekit.resolve',
+        attributes: {
+          [SENTRY_OP]: 'custom.op',
+          [SENTRY_ORIGIN]: 'auto.custom.origin',
+        },
+      });
+
+      _enhanceKitSpanStreamed(span);
+
+      expect(span.attributes?.[SENTRY_OP]).toBe('custom.op');
+      expect(span.attributes?.[SENTRY_ORIGIN]).toBe('auto.custom.origin');
+    });
+
+    it("doesn't overwrite an already set description", () => {
+      const span = makeStreamedSpan({
+        name: 'sveltekit.load',
+        attributes: { 'sentry.description': 'my custom description' },
+      });
+
+      _enhanceKitSpanStreamed(span);
+
+      expect(span.attributes?.['sentry.description']).toBe('my custom description');
+    });
+
+    it('overwrites previously set "manual" origins on sveltekit spans', () => {
+      const span = makeStreamedSpan({
+        name: 'sveltekit.resolve',
+        attributes: {
+          [SENTRY_OP]: 'custom.op',
+          [SENTRY_ORIGIN]: 'manual',
+        },
+      });
+
+      _enhanceKitSpanStreamed(span);
+
+      expect(span.attributes?.[SENTRY_OP]).toBe('custom.op');
+      expect(span.attributes?.[SENTRY_ORIGIN]).toBe('auto.http.sveltekit');
+    });
+  });
+});

@@ -1,0 +1,191 @@
+import { Stack, CfnResource, StackProps } from 'aws-cdk-lib';
+import { Construct } from 'constructs';
+import * as path from 'node:path';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as dns from 'node:dns/promises';
+import { arch, platform } from 'node:process';
+import { execFileSync } from 'node:child_process';
+
+const LAMBDA_FUNCTIONS_DIR = './src/lambda-functions-npm';
+const LAMBDA_FUNCTION_TIMEOUT = 10;
+// SAM allocates runtime container ports in [5000, 9000) before binding its own endpoint.
+export const SAM_PORT = Number(process.env.SAM_PORT) || 17120;
+
+/** Match SAM / Docker to this machine so Apple Silicon does not mix arm64 images with an x86_64 template default. */
+function samLambdaArchitecture(): 'arm64' | 'x86_64' {
+  return arch === 'arm64' ? 'arm64' : 'x86_64';
+}
+
+function resolvePackagesDir(): string {
+  // When running via the e2e test runner, tests are copied to a temp directory
+  // so we need the workspace root passed via env var
+  const workspaceRoot = process.env.SENTRY_E2E_WORKSPACE_ROOT;
+  if (workspaceRoot) {
+    return path.join(workspaceRoot, 'packages');
+  }
+  // Fallback for local development when running from the original location
+  return path.resolve(__dirname, '../../../../../packages');
+}
+
+export class LocalLambdaStack extends Stack {
+  constructor(scope: Construct, id: string, props: StackProps, hostIp: string) {
+    console.log('[LocalLambdaStack] Creating local SAM Lambda Stack');
+    super(scope, id, props);
+
+    this.templateOptions.templateFormatVersion = '2010-09-09';
+    this.templateOptions.transforms = ['AWS::Serverless-2016-10-31'];
+
+    const dsn = `http://public@${hostIp}:3031/1337`;
+    console.log(`[LocalLambdaStack] Using Sentry DSN: ${dsn}`);
+
+    this.addLambdaFunctions(dsn);
+  }
+
+  private addLambdaFunctions(dsn: string) {
+    console.log(`[LocalLambdaStack] Add all Lambda functions defined in ${LAMBDA_FUNCTIONS_DIR} to the SAM stack`);
+
+    const lambdaDirs = fs
+      .readdirSync(LAMBDA_FUNCTIONS_DIR)
+      .filter(dir => fs.statSync(path.join(LAMBDA_FUNCTIONS_DIR, dir)).isDirectory());
+
+    for (const lambdaDir of lambdaDirs) {
+      const functionName = `Npm${lambdaDir}`;
+
+      const lambdaPath = path.resolve(LAMBDA_FUNCTIONS_DIR, lambdaDir);
+      const lockfilePath = path.join(lambdaPath, 'pnpm-lock.yaml');
+      const nodeModulesPath = path.join(lambdaPath, 'node_modules');
+
+      // `dir` is the package directory under `packages/`; `name` is the published npm name.
+      const packagesToLink: Array<{ dir: string; name: string }> = [
+        { dir: 'aws-serverless', name: '@sentry/aws-serverless' },
+        { dir: 'node', name: '@sentry/node' },
+        { dir: 'core', name: '@sentry/core' },
+        { dir: 'opentelemetry', name: '@sentry/opentelemetry' },
+        { dir: 'server-utils', name: '@sentry/server-utils' },
+        { dir: 'server-runtime-injection', name: '@sentry/server-runtime-injection' },
+        { dir: 'bundler-plugins', name: '@sentry/bundler-plugins' },
+      ];
+      const dependencies: Record<string, string> = {};
+
+      const packagesDir = resolvePackagesDir();
+      for (const { dir, name } of packagesToLink) {
+        const pkgDir = path.join(packagesDir, dir);
+        if (!fs.existsSync(pkgDir)) {
+          throw new Error(
+            `[LocalLambdaStack] Workspace package ${name} not found at ${pkgDir}. Did you run the build?`,
+          );
+        }
+        const relativePath = path.relative(lambdaPath, pkgDir);
+        dependencies[name] = `file:${relativePath.replace(/\\/g, '/')}`;
+      }
+
+      console.log(`[LocalLambdaStack] Install dependencies for ${functionName}`);
+
+      if (fs.existsSync(lockfilePath)) {
+        fs.rmSync(lockfilePath);
+      }
+
+      if (fs.existsSync(nodeModulesPath)) {
+        fs.rmSync(nodeModulesPath, { recursive: true, force: true });
+      }
+
+      fs.writeFileSync(path.join(lambdaPath, 'package.json'), JSON.stringify({ dependencies }, null, 2));
+      // JSON is valid YAML. pnpm reads overrides only from pnpm-workspace.yaml, and this file also keeps
+      // pnpm from treating the app's own pnpm-workspace.yaml as the workspace root.
+      fs.writeFileSync(
+        path.join(lambdaPath, 'pnpm-workspace.yaml'),
+        JSON.stringify({ minimumReleaseAge: 0, overrides: dependencies }, null, 2),
+      );
+      execFileSync(
+        'pnpm',
+        ['install', '--offline', '--prod', '--ignore-scripts', '--no-frozen-lockfile', '--config.node-linker=hoisted'],
+        {
+          cwd: lambdaPath,
+          stdio: 'inherit',
+        },
+      );
+
+      if (!process.env.NODE_VERSION) {
+        throw new Error('[LocalLambdaStack] NODE_VERSION is not set');
+      }
+
+      new CfnResource(this, functionName, {
+        type: 'AWS::Serverless::Function',
+        properties: {
+          Architectures: [samLambdaArchitecture()],
+          CodeUri: path.join(LAMBDA_FUNCTIONS_DIR, lambdaDir),
+          Handler: 'index.handler',
+          Runtime: `nodejs${process.env.NODE_VERSION}.x`,
+          Timeout: LAMBDA_FUNCTION_TIMEOUT,
+          Environment: {
+            Variables: {
+              SENTRY_DSN: dsn,
+              SENTRY_TRACES_SAMPLE_RATE: 1.0,
+              SENTRY_DEBUG: true,
+              // A function with its own `instrument.mjs` initializes the SDK itself, e.g. to add integrations.
+              NODE_OPTIONS: fs.existsSync(path.join(lambdaPath, 'instrument.mjs'))
+                ? '--import=/var/task/instrument.mjs'
+                : '--import=@sentry/aws-serverless/awslambda-auto',
+            },
+          },
+        },
+      });
+
+      console.log(`[LocalLambdaStack] Added Lambda function: ${functionName}`);
+    }
+  }
+
+  // Generous timeout: with `--warm-containers EAGER`, SAM boots every function container
+  // before the endpoint responds, which can take well over a minute on slow CI runners.
+  static async waitForStack(timeout = 180000, port = SAM_PORT) {
+    const startTime = Date.now();
+    const maxWaitTime = timeout;
+
+    while (Date.now() - startTime < maxWaitTime) {
+      try {
+        const response = await fetch(`http://127.0.0.1:${port}/`);
+
+        if (response.status === 404 && response.headers.get('x-amzn-errortype') === 'PathNotFoundLocally') {
+          console.log(`[LocalLambdaStack] SAM stack is ready`);
+          return;
+        }
+      } catch {}
+
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+
+    throw new Error(`[LocalLambdaStack] Failed to start SAM stack after ${timeout}ms`);
+  }
+}
+
+export async function getHostIp() {
+  if (process.env.GITHUB_ACTIONS) {
+    return getExternalHostIp();
+  }
+
+  if (platform === 'darwin' || platform === 'win32') {
+    return 'host.docker.internal';
+  }
+
+  return getExternalHostIp();
+}
+
+/**
+ * The Lambda container reaches the event proxy on the host through an address of the host's network interface.
+ * Some runners (e.g. Namespace) map the hostname to a loopback address, which inside the container is the container
+ * itself, so fall back to the first external IPv4 address that is not a Docker bridge.
+ */
+async function getExternalHostIp(): Promise<string> {
+  const host = await dns.lookup(os.hostname());
+  if (!host.address.startsWith('127.') && host.address !== '::1') {
+    return host.address;
+  }
+
+  const external = Object.entries(os.networkInterfaces())
+    .filter(([name]) => !name.startsWith('docker') && !name.startsWith('br-') && !name.startsWith('veth'))
+    .flatMap(([, addresses]) => addresses ?? [])
+    .find(address => address.family === 'IPv4' && !address.internal);
+
+  return external?.address ?? host.address;
+}

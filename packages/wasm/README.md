@@ -1,0 +1,27 @@
+<p align="center">
+  <a href="https://sentry.io/?utm_source=github&utm_medium=logo" target="_blank">
+    <picture>
+      <source srcset="https://sentry-brand.storage.googleapis.com/sentry-logo-white.png" media="(prefers-color-scheme: dark)" />
+      <source srcset="https://sentry-brand.storage.googleapis.com/sentry-wordmark-dark-280x84.png" media="(prefers-color-scheme: light), (prefers-color-scheme: no-preference)" />
+      <img src="https://sentry-brand.storage.googleapis.com/sentry-wordmark-dark-280x84.png" alt="Sentry" width="280">
+    </picture>
+  </a>
+</p>
+
+# Sentry JavaScript WebAssembly Support
+
+[![npm version](https://img.shields.io/npm/v/@sentry/wasm.svg)](https://www.npmjs.com/package/@sentry/wasm)
+[![npm dm](https://img.shields.io/npm/dm/@sentry/wasm.svg)](https://www.npmjs.com/package/@sentry/wasm)
+[![npm dt](https://img.shields.io/npm/dt/@sentry/wasm.svg)](https://www.npmjs.com/package/@sentry/wasm)
+
+WebAssembly stack-trace support for the Sentry JavaScript SDK.
+
+## Documentation
+
+- [Getting started](https://docs.sentry.io/platforms/javascript/guides/wasm/)
+- [Configuration](https://docs.sentry.io/platforms/javascript/guides/wasm/configuration/)
+
+## Support
+
+- [Report a bug](https://github.com/getsentry/sentry-javascript/issues/new/choose)
+- [Contributing](https://github.com/getsentry/sentry-javascript/blob/develop/CONTRIBUTING.md)

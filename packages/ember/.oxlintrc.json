@@ -1,0 +1,21 @@
+{
+  "$schema": "../../node_modules/oxlint/configuration_schema.json",
+  "extends": ["../../.oxlintrc.base.json"],
+  "env": {
+    "browser": true
+  },
+  "overrides": [
+    {
+      "files": ["src/**/*.{js,ts,d.ts}"],
+      "rules": {
+        "no-restricted-globals": "off"
+      }
+    },
+    {
+      "files": ["unpublished-development-types/index.d.ts"],
+      "rules": {
+        "unicorn/no-empty-file": "off"
+      }
+    }
+  ]
+}

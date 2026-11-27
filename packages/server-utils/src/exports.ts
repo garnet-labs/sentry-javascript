@@ -1,0 +1,19 @@
+// Shared exports not using diagnostics channels
+export { setHttpServerSpanRouteAttribute } from './utils/setHttpServerSpanRouteAttribute';
+export { setAsyncLocalStorageAsyncContextStrategy } from './async-context';
+export { openTelemetryIntegration, getOtlpTracesEndpoint } from './opentelemetry';
+export * from './ai';
+export { getSqlQuerySummary, sanitizeSqlQuery, getSqlQueryAttributes, getSqlSpanName } from './utils/sql';
+export type { SqlDialect } from './utils/sql';
+export { isBun, isCloudflareWorkers, isDeno } from './utils/runtime';
+export { instrumentPostgresJsSql } from './integrations/postgresjs-wrapper';
+export type { PostgresConnectionContext } from './integrations/postgresjs-wrapper';
+
+// Shared, runtime-agnostic Hono instrumentation re-used by the `@sentry/hono` SDK across all runtimes.
+// Sourced directly from their modules (not the `./integrations/hono` barrel, which also exports the
+// diagnostics-channel-based `honoIntegration`) so the non-Node adapters can import them from the
+// diagnostics_channel-free `@sentry/server-utils/no-diagnostic-channels` entry.
+export { applyHonoPatches, earlyPatchHono } from './integrations/hono/applyPatches';
+export { createHonoRequestMiddleware } from './integrations/hono/createHonoMiddleware';
+export type { CreateHonoRequestMiddlewareOptions } from './integrations/hono/createHonoMiddleware';
+export type { SentryHonoMiddlewareOptions } from './integrations/hono/types';

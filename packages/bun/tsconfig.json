@@ -1,0 +1,12 @@
+{
+  "extends": "../../tsconfig.json",
+
+  "include": ["src/**/*"],
+
+  "compilerOptions": {
+    // package-specific options
+    "types": ["bun-types"],
+    "module": "nodenext",
+    "moduleResolution": "nodenext"
+  }
+}

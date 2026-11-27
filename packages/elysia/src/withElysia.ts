@@ -1,0 +1,388 @@
+import {
+  CODE_FUNCTION_NAME,
+  HTTP_ROUTE,
+  SENTRY_OP,
+  SENTRY_SEGMENT_NAME_SOURCE,
+  URL_FULL,
+  URL_PATH,
+  SENTRY_ORIGIN,
+} from '@sentry/conventions/attributes';
+import { HANDLER, HTTP_SERVER, MIDDLEWARE } from '@sentry/conventions/op';
+import type { Span } from '@sentry/core';
+import {
+  captureException,
+  continueTrace,
+  getActiveSpan,
+  getClient,
+  getIsolationScope,
+  getRootSpan,
+  getTraceData,
+  hasSpanStreamingEnabled,
+  REQUEST_HANDLER_SPAN_NAME_FALLBACK,
+  setHttpStatus,
+  startInactiveSpan,
+  startSpanManual,
+  updateSpanName,
+  winterCGRequestToRequestData,
+  withIsolationScope,
+  filterCollectedUrl,
+  HTTP_SPAN_NAME_FALLBACK,
+} from '@sentry/core';
+import type { AnyElysia, Elysia, ErrorContext, TraceHandler, TraceListener } from 'elysia';
+
+/**
+ * The part of Elysia's request context that the lifecycle spans read. Elysia types
+ * `.trace()`'s context as an index signature, which a required property would reject.
+ */
+interface LifecycleContext {
+  route?: string;
+}
+
+interface ElysiaHandlerOptions {
+  shouldHandleError?: (context: ErrorContext) => boolean;
+}
+
+const ELYSIA_ORIGIN = 'auto.http.elysia';
+
+/**
+ * Map Elysia lifecycle phase names to Sentry span ops.
+ */
+const ELYSIA_LIFECYCLE_OP_MAP: Record<string, string> = {
+  Request: MIDDLEWARE,
+  Parse: MIDDLEWARE,
+  Transform: MIDDLEWARE,
+  BeforeHandle: MIDDLEWARE,
+  Handle: HANDLER,
+  AfterHandle: MIDDLEWARE,
+  MapResponse: MIDDLEWARE,
+  AfterResponse: MIDDLEWARE,
+  Error: MIDDLEWARE,
+};
+
+function isBun(): boolean {
+  return typeof Bun !== 'undefined';
+}
+
+/**
+ * Per-request storage for the root span reference.
+ * .wrap() captures the root span and .trace() reads it.
+ * This is necessary because Elysia's .trace() callbacks may run in a different
+ * async context where getActiveSpan() returns undefined.
+ */
+const rootSpanForRequest = new WeakMap<Request, Span>();
+
+const instrumentedApps = new WeakSet<Elysia>();
+
+/**
+ * Updates the root span and isolation scope with the parameterized route name.
+ */
+function updateRouteTransactionName(request: Request, method: string, route: string): void {
+  const transactionName = `${method} ${route}`;
+
+  function applyRouteToSpan(span: Span): void {
+    updateSpanName(span, transactionName);
+    span.setAttributes({
+      [SENTRY_SEGMENT_NAME_SOURCE]: 'route',
+      [HTTP_ROUTE]: route,
+    });
+  }
+
+  // Try the stored root span first (reliable across async contexts),
+  // then fall back to getActiveSpan() for cases where async context is preserved.
+  const rootSpan = rootSpanForRequest.get(request);
+  if (rootSpan) {
+    applyRouteToSpan(rootSpan);
+  } else {
+    const activeSpan = getActiveSpan();
+    if (activeSpan) {
+      const root = getRootSpan(activeSpan);
+      applyRouteToSpan(root);
+    }
+  }
+
+  getIsolationScope().setTransactionName(transactionName);
+}
+
+function defaultShouldHandleError(context: ErrorContext): boolean {
+  const status = context.set.status;
+  if (status === undefined) {
+    return true;
+  }
+  const statusCode = parseInt(String(status), 10);
+  if (Number.isNaN(statusCode)) {
+    return true;
+  }
+  // Capture server errors (5xx) and unusual status codes (<= 299 in an error handler).
+  // 3xx and 4xx are not captured by default (client errors / redirects).
+  return statusCode >= 500 || statusCode <= 299;
+}
+
+/**
+ * Instruments a single Elysia lifecycle phase by creating a Sentry span for it,
+ * and child spans for each individual handler within the phase.
+ *
+ * @param rootSpan - The root server span to parent lifecycle spans under.
+ *   Must be passed explicitly because Elysia's .trace() listener callbacks run
+ *   in a different async context where getActiveSpan() returns undefined.
+ * @param context - The request context. Read `route` off it inside the listener:
+ *   Elysia assigns the route when the request enters the compiled handler, which
+ *   is after `.trace()` hands out its listeners.
+ */
+function instrumentLifecyclePhase(
+  phaseName: string,
+  listener: TraceListener,
+  rootSpan: Span | undefined,
+  context: LifecycleContext,
+): void {
+  const op = ELYSIA_LIFECYCLE_OP_MAP[phaseName];
+  if (!op) {
+    return;
+  }
+
+  void listener(process => {
+    const client = getClient();
+    const isRequestHandlerSpan = op === HANDLER;
+    // With span streaming, span names have to be low cardinality, so request handler
+    // spans are named after their route.
+    const isStreamedRequestHandlerSpan = isRequestHandlerSpan && !!client && hasSpanStreamingEnabled(client);
+    // The route describes the span in both trace lifecycles, and the other server
+    // integrations put it on their request handler spans too.
+    const routeAttribute = isRequestHandlerSpan && context.route ? { [HTTP_ROUTE]: context.route } : {};
+
+    const phaseSpan = startInactiveSpan({
+      name: isStreamedRequestHandlerSpan ? context.route || REQUEST_HANDLER_SPAN_NAME_FALLBACK : phaseName,
+      parentSpan: rootSpan,
+      attributes: {
+        [SENTRY_OP]: op,
+        [SENTRY_ORIGIN]: ELYSIA_ORIGIN,
+        ...routeAttribute,
+      },
+    });
+
+    // Create child spans for individual handlers within this phase.
+    // Named functions get their name, arrow functions get 'anonymous'.
+    if (process.total > 0) {
+      void process.onEvent(child => {
+        const handlerName = child.name || 'anonymous';
+        const childSpan = startInactiveSpan({
+          name: isStreamedRequestHandlerSpan ? context.route || REQUEST_HANDLER_SPAN_NAME_FALLBACK : handlerName,
+          parentSpan: phaseSpan,
+          attributes: {
+            [SENTRY_OP]: op,
+            [SENTRY_ORIGIN]: ELYSIA_ORIGIN,
+            ...routeAttribute,
+            // Streamed request handler spans are named after the route, so the
+            // handler name has no other place to go. Anonymous handlers have no
+            // name to record.
+            ...(isRequestHandlerSpan && child.name ? { [CODE_FUNCTION_NAME]: child.name } : {}),
+          },
+        });
+
+        void child.onStop(() => {
+          childSpan.end();
+        });
+      });
+    }
+
+    void process.onStop(() => {
+      phaseSpan.end();
+    });
+  });
+}
+
+/**
+ * Integrate Sentry with an Elysia app for error handling, request context,
+ * and tracing. Returns the app instance for chaining.
+ *
+ * Should be called at the **start** of the chain before defining routes.
+ *
+ * @param app The Elysia instance
+ * @param options Configuration options
+ * @returns The same Elysia instance for chaining
+ *
+ * @example
+ * ```javascript
+ * import * as Sentry from '@sentry/elysia';
+ * import { Elysia } from 'elysia';
+ *
+ * Sentry.withElysia(new Elysia())
+ *   .get('/', () => 'Hello World')
+ *   .listen(3000);
+ * ```
+ */
+// Using the AnyElysia type here to allow users to pass in the full set of Elysia
+// options without type errors. The `T extends Elysia` type is too narrow to allow
+// users to pass in dynamic options like `prefix` without breaking the type system.
+// See Elysia type definition and its usage of `const in out` which forces the string
+// template literals to be fully consistent for e.g. `prefix`.
+export function withElysia<T extends AnyElysia>(app: T, options: ElysiaHandlerOptions = {}): T {
+  if (instrumentedApps.has(app)) {
+    return app;
+  }
+  instrumentedApps.add(app);
+
+  // Use .wrap() to capture or create the root span for each request.
+  // This is necessary because Elysia's .trace() callbacks run in a different
+  // async context where getActiveSpan() returns undefined. By storing the root
+  // span in a WeakMap keyed by the Request object, we can retrieve it in .trace().
+  // HigherOrderFunction type is not exported from elysia's main entry point,
+  // so we type the callback parameters directly.
+  app.wrap((fn: (...args: unknown[]) => unknown, request: Request) => {
+    if (isBun()) {
+      // On Bun there is no HTTP instrumentation, so we create a root span ourselves.
+      // Scope setup must happen inside the returned function so that it's active
+      // when Elysia calls the handler (not during .wrap() registration).
+      return (...args: unknown[]) => {
+        return withIsolationScope(() => {
+          return continueTrace(
+            {
+              sentryTrace: request.headers.get('sentry-trace') || '',
+              baggage: request.headers.get('baggage'),
+            },
+            () => {
+              const client = getClient();
+              return startSpanManual(
+                {
+                  // With span streaming, span names have to be low cardinality, so we can't fall back to the
+                  // URL path. `updateRouteTransactionName` renames the span once Elysia resolves the route.
+                  name:
+                    client && hasSpanStreamingEnabled(client)
+                      ? request.method?.toUpperCase() || HTTP_SPAN_NAME_FALLBACK
+                      : `${request.method} ${new URL(request.url).pathname}`,
+                  attributes: {
+                    [SENTRY_OP]: HTTP_SERVER,
+                    [SENTRY_ORIGIN]: ELYSIA_ORIGIN,
+                    [SENTRY_SEGMENT_NAME_SOURCE]: 'url',
+                    [URL_FULL]: filterCollectedUrl(request.url),
+                    [URL_PATH]: new URL(request.url).pathname,
+                  },
+                },
+                rootSpan => {
+                  rootSpanForRequest.set(request, rootSpan);
+                  try {
+                    const result = fn(...args);
+                    if (result instanceof Promise) {
+                      return result.then(
+                        res => {
+                          rootSpanForRequest.delete(request);
+                          rootSpan.end();
+                          return res;
+                        },
+                        err => {
+                          rootSpanForRequest.delete(request);
+                          rootSpan.end();
+                          throw err;
+                        },
+                      );
+                    }
+                    rootSpanForRequest.delete(request);
+                    rootSpan.end();
+                    return result;
+                  } catch (err) {
+                    rootSpanForRequest.delete(request);
+                    rootSpan.end();
+                    throw err;
+                  }
+                },
+              );
+            },
+          );
+        });
+      };
+    }
+
+    // On Node.js, the HTTP instrumentation already creates a root span.
+    // We just capture its reference so .trace() can use it.
+    const activeSpan = getActiveSpan();
+    if (activeSpan) {
+      rootSpanForRequest.set(request, getRootSpan(activeSpan));
+    }
+    return fn;
+  });
+
+  // Use .trace() ONLY for span creation. The trace API is observational —
+  // callbacks fire after phases complete, so they can't reliably mutate
+  // response headers or capture errors. All SDK logic stays in real hooks.
+  // The app is typed as `AnyElysia`, whose `Singleton` is `any`; `.trace()` expects the handler's
+  // singleton to match, and `TraceHandler`'s generics are invariant, so the annotation has to use `any` too.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const traceHandler: TraceHandler<{}, any> = lifecycle => {
+    const rootSpan = rootSpanForRequest.get(lifecycle.context.request);
+
+    const phases: [string, TraceListener][] = [
+      ['Request', lifecycle.onRequest],
+      ['Parse', lifecycle.onParse],
+      ['Transform', lifecycle.onTransform],
+      ['BeforeHandle', lifecycle.onBeforeHandle],
+      ['Handle', lifecycle.onHandle],
+      ['AfterHandle', lifecycle.onAfterHandle],
+      ['MapResponse', lifecycle.onMapResponse],
+      ['AfterResponse', lifecycle.onAfterResponse],
+      ['Error', lifecycle.onError],
+    ];
+
+    for (const [phaseName, listener] of phases) {
+      if (listener) {
+        instrumentLifecyclePhase(phaseName, listener, rootSpan, lifecycle.context);
+      }
+    }
+  };
+
+  app.trace({ as: 'global' }, traceHandler);
+
+  // SDK logic uses real lifecycle hooks — these show up as handler spans
+  // in the trace (named sentryOnRequest etc.), but that's the correct
+  // tradeoff: the trace API can't reliably mutate state or capture errors.
+
+  app.onRequest(function sentryOnRequest(context) {
+    getIsolationScope().setSDKProcessingMetadata({
+      normalizedRequest: winterCGRequestToRequestData(context.request),
+    });
+  });
+
+  // Cast from AnyElysia to Elysia so that onAfterHandle/onError callback
+  // parameters resolve to typed contexts (e.g. ErrorContext for shouldHandleError).
+  // `AnyElysia` is needed on the user-facing `app` type to accept user instances with
+  // arbitrary generic args.
+  // The cast is safe because AnyElysia IS Elysia<any, any, ...>.
+  const elysiaApp = app as unknown as Elysia;
+
+  elysiaApp.onAfterHandle({ as: 'global' }, function sentryOnAfterHandle(context) {
+    if (context.route) {
+      updateRouteTransactionName(context.request, context.request.method, context.route);
+    }
+
+    const traceData = getTraceData();
+    if (traceData['sentry-trace']) {
+      context.set.headers['sentry-trace'] = traceData['sentry-trace'];
+    }
+    if (traceData.baggage) {
+      context.set.headers['baggage'] = traceData.baggage;
+    }
+  });
+
+  elysiaApp.onError({ as: 'global' }, function sentryOnError(context) {
+    if (context.route) {
+      updateRouteTransactionName(context.request, context.request.method, context.route);
+    }
+
+    // Set error status on root span
+    const rootSpan = rootSpanForRequest.get(context.request);
+    if (rootSpan) {
+      const statusCode = parseInt(String(context.set.status), 10);
+      setHttpStatus(rootSpan, Number.isNaN(statusCode) ? 500 : statusCode);
+    }
+
+    const shouldHandleError = options?.shouldHandleError || defaultShouldHandleError;
+    if (shouldHandleError(context)) {
+      captureException(context.error, {
+        mechanism: {
+          type: 'auto.http.elysia.on_error',
+          handled: false,
+        },
+      });
+    }
+  });
+
+  return app;
+}

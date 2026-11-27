@@ -1,0 +1,128 @@
+import { RPC_METHOD, RPC_SERVICE, RPC_SYSTEM_NAME, SENTRY_OP, SENTRY_ORIGIN } from '@sentry/conventions/attributes';
+import { GRPC } from '@sentry/conventions/op';
+import type { Client, IntegrationFn } from '@sentry/core';
+import { defineIntegration, fill, getClient } from '@sentry/core';
+import { startInactiveSpan } from '@sentry/node';
+import type { EventEmitter } from 'events';
+
+export interface GrpcFunction extends CallableFunction {
+  (...args: unknown[]): EventEmitter;
+}
+
+export interface GrpcFunctionObject extends GrpcFunction {
+  requestStream: boolean;
+  responseStream: boolean;
+  originalName: string;
+}
+
+interface StubOptions {
+  servicePath?: string;
+}
+
+interface CreateStubFunc extends CallableFunction {
+  (createStub: unknown, options: StubOptions): PromiseLike<Stub>;
+}
+
+export interface Stub {
+  [key: string]: GrpcFunctionObject;
+}
+
+const SERVICE_PATH_REGEX = /^(\w+)\.googleapis.com$/;
+
+const INTEGRATION_NAME = 'GoogleCloudGrpc' as const;
+
+const SETUP_CLIENTS = new WeakMap<Client, boolean>();
+
+const _googleCloudGrpcIntegration = ((options: { optional?: boolean } = {}) => {
+  const optional = options.optional || false;
+  return {
+    name: INTEGRATION_NAME,
+    setupOnce() {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const gaxModule = require('google-gax');
+        fill(
+          gaxModule.GrpcClient.prototype, // eslint-disable-line @typescript-eslint/no-unsafe-member-access
+          'createStub',
+          wrapCreateStub,
+        );
+      } catch (e) {
+        if (!optional) {
+          throw e;
+        }
+      }
+    },
+    setup(client) {
+      SETUP_CLIENTS.set(client, true);
+    },
+  };
+}) satisfies IntegrationFn;
+
+/**
+ * Google Cloud Platform service requests tracking for GRPC APIs.
+ */
+export const googleCloudGrpcIntegration = defineIntegration(_googleCloudGrpcIntegration);
+
+/** Returns a wrapped function that returns a stub with tracing enabled */
+function wrapCreateStub(origCreate: CreateStubFunc): CreateStubFunc {
+  return async function (this: unknown, ...args: Parameters<CreateStubFunc>) {
+    const servicePath = args[1]?.servicePath;
+    if (servicePath == null || servicePath == undefined) {
+      return origCreate.apply(this, args);
+    }
+    const serviceIdentifier = identifyService(servicePath);
+    const stub = await origCreate.apply(this, args);
+    for (const methodName of Object.keys(Object.getPrototypeOf(stub))) {
+      fillGrpcFunction(stub, serviceIdentifier, methodName);
+    }
+    return stub;
+  };
+}
+
+/** Patches the function in grpc stub to enable tracing */
+export function fillGrpcFunction(stub: Stub, serviceIdentifier: string, methodName: string): void {
+  const funcObj = stub[methodName];
+  if (typeof funcObj !== 'function') {
+    return;
+  }
+  const callType =
+    !funcObj.requestStream && !funcObj.responseStream
+      ? 'unary call'
+      : funcObj.requestStream && !funcObj.responseStream
+        ? 'client stream'
+        : !funcObj.requestStream && funcObj.responseStream
+          ? 'server stream'
+          : 'bidi stream';
+  if (callType != 'unary call') {
+    return;
+  }
+  fill(stub, methodName, (orig: GrpcFunction): GrpcFunction => (...args) => {
+    const ret = orig.apply(stub, args);
+    if (typeof ret?.on !== 'function' || !SETUP_CLIENTS.has(getClient() as Client)) {
+      return ret;
+    }
+    const span = startInactiveSpan({
+      name: `${callType} ${methodName}`,
+      onlyIfParent: true,
+      attributes: {
+        [SENTRY_OP]: GRPC,
+        [SENTRY_ORIGIN]: 'auto.grpc.google_cloud',
+        [RPC_SYSTEM_NAME]: 'grpc',
+        [RPC_SERVICE]: serviceIdentifier,
+        [RPC_METHOD]: methodName,
+      },
+    });
+    ret.on('status', () => {
+      if (span) {
+        span.end();
+      }
+    });
+    return ret;
+  });
+}
+
+/** Identifies service by its address */
+function identifyService(servicePath: string): string {
+  const match = servicePath.match(SERVICE_PATH_REGEX);
+  return match?.[1] || servicePath;
+}

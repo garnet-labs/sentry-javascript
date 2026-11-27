@@ -1,0 +1,45 @@
+import {
+  BROWSER_WEB_VITAL_LCP_VALUE,
+  BROWSER_WEB_VITAL_LCP_ELEMENT,
+  BROWSER_WEB_VITAL_LCP_SIZE,
+} from '@sentry/conventions/attributes';
+import type { Route } from '@playwright/test';
+import { expect } from '@playwright/test';
+import { sentryTest } from '../../../../utils/fixtures';
+import { shouldSkipTracingTest, waitForLcpCandidate } from '../../../../utils/helpers';
+import { getSpanOp, waitForStreamedSpan } from '../../../../utils/spanUtils';
+
+const bundle = process.env.PW_BUNDLE || '';
+
+sentryTest(
+  'should capture metrics for LCP instrumentation handlers',
+  async ({ browserName, getLocalTestUrl, page }) => {
+    // This uses a utility that is not exported in CDN bundles
+    if (shouldSkipTracingTest() || browserName !== 'chromium' || bundle.startsWith('bundle')) {
+      sentryTest.skip();
+    }
+
+    await page.route('**/path/to/image.png', (route: Route) =>
+      route.fulfill({ path: `${__dirname}/assets/sentry-logo-600x179.png` }),
+    );
+
+    const url = await getLocalTestUrl({ testDir: __dirname });
+
+    const lcpPromise = waitForStreamedSpan(page, span => getSpanOp(span) === 'ui.webvital.lcp');
+    await page.goto(url);
+    await waitForLcpCandidate(page, 'img');
+    await page.locator('button').click();
+    const lcpSpan = await lcpPromise;
+
+    expect(lcpSpan.attributes[BROWSER_WEB_VITAL_LCP_VALUE]?.value).toBeGreaterThan(0);
+    expect(lcpSpan.attributes[BROWSER_WEB_VITAL_LCP_ELEMENT]).toEqual({ type: 'string', value: 'body > img' });
+    expect(lcpSpan.attributes[BROWSER_WEB_VITAL_LCP_SIZE]).toEqual({ type: 'integer', value: 107400 });
+    expect(await page.evaluate('window._LCP')).toBe(107400);
+    expect(await page.evaluate('window._LCP2')).toBe(107400);
+    expect(await page.evaluate('window._LCP3')).toBeUndefined();
+
+    await page.evaluate('window.ADD_HANDLER()');
+    await page.waitForFunction('window._LCP3 === 107400');
+    expect(await page.evaluate('window._LCP3')).toBe(107400);
+  },
+);
