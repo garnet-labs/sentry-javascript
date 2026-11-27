@@ -1,0 +1,167 @@
+import { expect, test } from '@playwright/test';
+import { waitForEnvelopeItem, waitForError } from '@sentry-internal/test-utils';
+
+test('Cron job triggers send of in_progress envelope', async ({ baseURL }) => {
+  const inProgressEnvelopePromise = waitForEnvelopeItem('nestjs-basic', envelope => {
+    return (
+      envelope[0].type === 'check_in' &&
+      envelope[1]['monitor_slug'] === 'test-cron-slug' &&
+      envelope[1]['status'] === 'in_progress'
+    );
+  });
+
+  const okEnvelopePromise = waitForEnvelopeItem('nestjs-basic', envelope => {
+    return (
+      envelope[0].type === 'check_in' &&
+      envelope[1]['monitor_slug'] === 'test-cron-slug' &&
+      envelope[1]['status'] === 'ok'
+    );
+  });
+
+  const inProgressEnvelope = await inProgressEnvelopePromise;
+  const okEnvelope = await okEnvelopePromise;
+
+  expect(inProgressEnvelope[1]).toEqual(
+    expect.objectContaining({
+      check_in_id: expect.any(String),
+      monitor_slug: 'test-cron-slug',
+      status: 'in_progress',
+      environment: 'qa',
+      monitor_config: {
+        schedule: {
+          type: 'crontab',
+          value: '* * * * *',
+        },
+      },
+      contexts: {
+        trace: {
+          span_id: expect.stringMatching(/[a-f0-9]{16}/),
+          trace_id: expect.stringMatching(/[a-f0-9]{32}/),
+        },
+      },
+    }),
+  );
+
+  expect(okEnvelope[1]).toEqual(
+    expect.objectContaining({
+      check_in_id: expect.any(String),
+      monitor_slug: 'test-cron-slug',
+      status: 'ok',
+      environment: 'qa',
+      duration: expect.any(Number),
+      contexts: {
+        trace: {
+          span_id: expect.stringMatching(/[a-f0-9]{16}/),
+          trace_id: expect.stringMatching(/[a-f0-9]{32}/),
+        },
+      },
+    }),
+  );
+
+  // kill cron so tests don't get stuck
+  await fetch(`${baseURL}/kill-test-cron/test-cron-job`);
+});
+
+test('Sends the schedule and time zone of @Cron with the check-in', async ({ baseURL }) => {
+  const inProgressEnvelopePromise = waitForEnvelopeItem('nestjs-basic', envelope => {
+    return (
+      envelope[0].type === 'check_in' &&
+      envelope[1]['monitor_slug'] === 'test-derived-cron-slug' &&
+      envelope[1]['status'] === 'in_progress'
+    );
+  });
+
+  await fetch(`${baseURL}/test-derived-cron`);
+
+  const inProgressEnvelope = await inProgressEnvelopePromise;
+
+  expect(inProgressEnvelope[1]).toEqual(
+    expect.objectContaining({
+      monitor_slug: 'test-derived-cron-slug',
+      status: 'in_progress',
+      monitor_config: {
+        schedule: {
+          type: 'crontab',
+          value: '30 9 * * 1-5',
+        },
+        timezone: 'Europe/Vienna',
+        checkin_margin: 2,
+      },
+    }),
+  );
+});
+
+test('Monitors @Cron methods without @SentryCron when monitorCronJobs is enabled', async ({ baseURL }) => {
+  const inProgressEnvelopePromise = waitForEnvelopeItem('nestjs-basic', envelope => {
+    return (
+      envelope[0].type === 'check_in' &&
+      envelope[1]['monitor_slug'] === 'test-auto-monitored-cron' &&
+      envelope[1]['status'] === 'in_progress'
+    );
+  });
+
+  await fetch(`${baseURL}/test-auto-monitored-cron`);
+
+  expect((await inProgressEnvelopePromise)[1]).toEqual(
+    expect.objectContaining({
+      monitor_slug: 'test-auto-monitored-cron',
+      status: 'in_progress',
+      monitor_config: {
+        schedule: { type: 'crontab', value: '0 0 * * *' },
+        timezone: 'America/New_York',
+      },
+    }),
+  );
+});
+
+test('Sends exceptions to Sentry on error in async cron job', async ({ baseURL }) => {
+  const errorEventPromise = waitForError('nestjs-basic', event => {
+    return (
+      !event.type &&
+      event.exception?.values?.[0]?.value === 'Test error from cron async job' &&
+      event.exception?.values?.[0]?.mechanism?.type === 'auto.function.nestjs.cron'
+    );
+  });
+
+  const errorEvent = await errorEventPromise;
+
+  expect(errorEvent.exception?.values).toHaveLength(1);
+  expect(errorEvent.contexts?.trace).toEqual({
+    trace_id: expect.stringMatching(/[a-f0-9]{32}/),
+    span_id: expect.stringMatching(/[a-f0-9]{16}/),
+  });
+
+  expect(errorEvent.exception?.values?.[0]?.mechanism).toEqual({
+    handled: false,
+    type: 'auto.function.nestjs.cron',
+  });
+
+  // kill cron so tests don't get stuck
+  await fetch(`${baseURL}/kill-test-cron/test-async-cron-error`);
+});
+
+test('Sends exceptions to Sentry on error in sync cron job', async ({ baseURL }) => {
+  const errorEventPromise = waitForError('nestjs-basic', event => {
+    return (
+      !event.type &&
+      event.exception?.values?.[0]?.value === 'Test error from cron sync job' &&
+      event.exception?.values?.[0]?.mechanism?.type === 'auto.function.nestjs.cron'
+    );
+  });
+
+  const errorEvent = await errorEventPromise;
+
+  expect(errorEvent.exception?.values).toHaveLength(1);
+  expect(errorEvent.contexts?.trace).toEqual({
+    trace_id: expect.stringMatching(/[a-f0-9]{32}/),
+    span_id: expect.stringMatching(/[a-f0-9]{16}/),
+  });
+
+  expect(errorEvent.exception?.values?.[0]?.mechanism).toEqual({
+    handled: false,
+    type: 'auto.function.nestjs.cron',
+  });
+
+  // kill cron so tests don't get stuck
+  await fetch(`${baseURL}/kill-test-cron/test-sync-cron-error`);
+});

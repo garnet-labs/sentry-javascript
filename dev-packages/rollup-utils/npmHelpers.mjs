@@ -1,0 +1,346 @@
+// @ts-check
+
+/**
+ * Rolldown config docs: https://rolldown.rs/reference/config-options
+ */
+
+import * as fs from 'fs';
+import { isBuiltin } from 'module';
+import * as path from 'path';
+import { fileURLToPath } from 'url';
+
+import deepMerge from 'deepmerge';
+
+import { defineConfig } from 'rolldown';
+import {
+  makeDebugBuildStatementReplacePlugin,
+  makeEsmCjsReplacePlugin,
+  makeProductionReplacePlugin,
+  makeRrwebBuildPlugin,
+} from './plugins/index.mjs';
+import { makePackageNodeEsm } from './plugins/make-esm-plugin.mjs';
+import { getNodeBuiltIns, mergeExternals, mergePlugins } from './utils.mjs';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+const packageDotJSON = JSON.parse(fs.readFileSync(path.resolve(process.cwd(), './package.json'), { encoding: 'utf8' }));
+
+const ignoreSideEffects = /[\\/]debug-build\.ts$/;
+
+const repoRoot = path.resolve(__dirname, '../..');
+const sideEffectsCache = new Map();
+
+/**
+ * Whether an external package declares `"sideEffects": false` in its `package.json`.
+ * Unknown packages are treated as having side effects.
+ */
+function isSideEffectFreePackage(packageName) {
+  const cached = sideEffectsCache.get(packageName);
+  if (cached !== undefined) {
+    return cached;
+  }
+
+  let sideEffectFree = false;
+  try {
+    const json = JSON.parse(fs.readFileSync(findPackageJson(packageName), { encoding: 'utf8' }));
+    sideEffectFree = json.sideEffects === false;
+  } catch {
+    // Not resolvable from the built package - assume side effects.
+    if (isInstalledPackage(packageName)) {
+      // oxlint-disable-next-line no-console
+      console.warn(
+        `[rollup-utils] Cannot read the package.json of "${packageName}" from ${process.cwd()}, so its imports are kept. Declare it in the package.json of the built package.`,
+      );
+    }
+  }
+
+  sideEffectsCache.set(packageName, sideEffectFree);
+  return sideEffectFree;
+}
+
+/**
+ * The `package.json` of a dependency of the built package (the working directory): the nearest
+ * `node_modules/<packageName>` from there up to the repo root, like Node resolves it.
+ */
+function findPackageJson(packageName) {
+  for (let dir = process.cwd(); ; dir = path.dirname(dir)) {
+    const candidate = path.join(dir, 'node_modules', packageName, 'package.json');
+    if (fs.existsSync(candidate) || dir === repoRoot || dir === path.dirname(dir)) {
+      return candidate;
+    }
+  }
+}
+
+/**
+ * Whether `packageName` must have a `package.json` in a `node_modules` folder of the built package. This is false for
+ * builtins, for virtual modules and placeholders (e.g. `$app`, `cloudflare:workers`), which are no valid npm package
+ * names, for the built package itself, and for optional peers, which are not always installed.
+ */
+function isInstalledPackage(packageName) {
+  return (
+    !isBuiltin(packageName) &&
+    /^(@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/.test(packageName) &&
+    packageName !== packageDotJSON.name &&
+    !packageDotJSON.peerDependenciesMeta?.[packageName]?.optional
+  );
+}
+
+function getPackageName(id) {
+  const segments = id.split('/');
+  return id.startsWith('@') ? segments.slice(0, 2).join('/') : segments[0];
+}
+
+export function makeBaseNPMConfig(options = {}) {
+  const {
+    entrypoints = ['src/index.ts'],
+    hasBundles = false,
+    packageSpecificConfig = {},
+    bundledBuiltins = [],
+  } = options;
+
+  const debugBuildStatementReplacePlugin = makeDebugBuildStatementReplacePlugin();
+  const rrwebBuildPlugin = makeRrwebBuildPlugin({
+    excludeShadowDom: undefined,
+    excludeIframe: undefined,
+  });
+
+  const deps = [
+    ...getNodeBuiltIns(bundledBuiltins),
+    ...Object.keys(packageDotJSON.dependencies || {}),
+    ...Object.keys(packageDotJSON.peerDependencies || {}),
+    ...Object.keys(packageDotJSON.optionalDependencies || {}),
+  ];
+
+  const defaultBaseConfig = {
+    input: entrypoints,
+
+    // Point at the package's tsconfig so rolldown picks up its TypeScript & JSX settings.
+    tsconfig: path.resolve(process.cwd(), './tsconfig.json'),
+
+    // NOTE: we deliberately leave `platform` unset so rolldown infers it from the output format
+    // ('node' for cjs, 'browser' for everything else). Every explicit value breaks something:
+    // 'node' injects `import "node:module"` into each runtime chunk, which webpack rejects for
+    // browser targets; 'neutral' rewrites `import.meta` to `{}`, so `createRequire(import.meta.url)`
+    // gets `undefined`. Node-only packages that need the node platform for both halves set it
+    // themselves (see server-utils and bundler-plugins).
+
+    // ES2020 is our floor: keeps `?.`/`??` native and downlevels everything newer. Packages that
+    // need more (e.g. top-level await) raise it through `packageSpecificConfig`.
+    transform: {
+      target: 'es2020',
+
+      // The inferred 'browser' platform defines `process.env.NODE_ENV`, which folds every
+      // `process.env.NODE_ENV !== 'development'` guard to a constant and lets DCE delete the
+      // branch behind it. That silently dropped the orchestrion and source-map plugins from the
+      // vite integrations' ESM output while the CJS half kept them. Mapping it to itself keeps
+      // the runtime lookup, so the guard is evaluated by the consumer as it always was.
+      define: {
+        'process.env.NODE_ENV': 'process.env.NODE_ENV',
+      },
+    },
+
+    output: {
+      // an appropriately-named directory will be added to this base value when we specify either a cjs or esm build
+      dir: hasBundles ? 'build/npm' : 'build',
+
+      sourcemap: true,
+
+      // Include __esModule property when there is a default prop
+      esModule: 'if-default-prop',
+
+      // output individual files rather than one big bundle
+      preserveModules: true,
+      preserveModulesRoot: 'src',
+
+      // Don't hoist imports into entrypoints
+      // should be ignored when `preserveModules` is used,
+      // but Rollup still includes them when hoisting transitive imports.
+      hoistTransitiveImports: false,
+
+      // Allow wrappers or helper functions generated by rollup to use any ES2015 features
+      generatedCode: {
+        preset: 'es2015',
+      },
+
+      // don't add `"use strict"` to the top of cjs files
+      strict: false,
+
+      // Use simple exports format:
+      //     exports.dogs = are.great
+      // rather than Object.defineProperty style exports:
+      //     Object.defineProperty(exports, 'dogs', {
+      //       enumerable: true,
+      //       get: () => are.great,
+      //     });
+      externalLiveBindings: false,
+    },
+
+    // NOTE: rolldown has no equivalent of rollup's `output.interop`. In the CJS build it wraps
+    // namespace imports of externals as `x = __toESM(require('x'))`, and `__toESM` returns a copy
+    // whose properties are getter-only forwarders. Reads pass through to the real module but writes
+    // do not, so code that monkey-patches a module in place has to default-import it (`import x
+    // from 'x'`, whose `.default` is the live `require()` result) rather than namespace-import it.
+    // Rolldown errors on a statically visible `ns.foo = ...` (ASSIGN_TO_IMPORT), but it cannot see a
+    // write made through a helper, and that one fails silently. See
+    // `packages/node/src/integrations/fs/vendored/instrumentation.ts`.
+
+    treeshake: {
+      moduleSideEffects: (id, external) => {
+        if (external === false && ignoreSideEffects.test(id)) {
+          // Tell Rollup this module has no side effects, so it can be tree-shaken
+          return false;
+        }
+
+        // Rollup keeps a bare `import '<pkg>'` alive whenever it tree-shakes away every
+        // binding of an external it believes has side effects. For a package that declares
+        // `"sideEffects": false` that import contradicts its own manifest, and bundlers such
+        // as esbuild warn about it (`ignored-bare-import`).
+        if (external && isSideEffectFreePackage(getPackageName(id))) {
+          return false;
+        }
+
+        return true;
+      },
+    },
+
+    plugins: [debugBuildStatementReplacePlugin, rrwebBuildPlugin],
+
+    // don't include imported modules from outside the package in the final output
+    // also treat subpath exports (e.g. `@sentry/core/browser`) as external
+    external: id => {
+      // treat subpath exports as external if the package is external
+      return deps.some(dep => id === dep || id.startsWith(`${dep}/`));
+    },
+  };
+
+  return deepMerge(defaultBaseConfig, packageSpecificConfig, {
+    // Plugins have to be in the correct order or everything breaks, so when merging we have to manually re-order them
+    customMerge: key => {
+      if (key === 'plugins') return mergePlugins;
+      if (key === 'external') return mergeExternals;
+      return undefined;
+    },
+  });
+}
+
+/**
+ * Make the CJS variants flat: one file per entry, plus chunks for the code that entries share.
+ * Node resolves, reads and evaluates each file on its own, so `require()` starts much faster than
+ * with `preserveModules`. The ESM variants keep one file per module, because bundlers use them and
+ * drop unused files by the package's `sideEffects` setting. Name the entries with an object `input`
+ * to keep their paths. Chunk names have no hash, so file tracers see the same paths in each build.
+ */
+export function makeCjsVariantsFlat(configs) {
+  return configs.map(config =>
+    config.output.format === 'cjs'
+      ? {
+          ...config,
+          output: {
+            ...config.output,
+            preserveModules: false,
+            entryFileNames: '[name].js',
+            chunkFileNames: 'chunks/[name].js',
+          },
+        }
+      : config,
+  );
+}
+
+export function makeNPMConfigVariants(baseConfig, options = {}) {
+  const { emitEsm = true, emitCjs = true, splitDevProd = false } = options;
+
+  const variantSpecificConfigs = [];
+
+  if (emitCjs) {
+    if (splitDevProd) {
+      variantSpecificConfigs.push({
+        output: { format: 'cjs', dir: path.join(baseConfig.output.dir, 'cjs/dev') },
+        plugins: [makeEsmCjsReplacePlugin('cjs')],
+      });
+      variantSpecificConfigs.push({
+        output: { format: 'cjs', dir: path.join(baseConfig.output.dir, 'cjs/prod') },
+        plugins: [makeProductionReplacePlugin(), makeEsmCjsReplacePlugin('cjs')],
+      });
+    } else {
+      variantSpecificConfigs.push({
+        output: { format: 'cjs', dir: path.join(baseConfig.output.dir, 'cjs') },
+        plugins: [makeEsmCjsReplacePlugin('cjs')],
+      });
+    }
+  }
+
+  if (emitEsm) {
+    if (splitDevProd) {
+      variantSpecificConfigs.push({
+        output: { format: 'esm', dir: path.join(baseConfig.output.dir, 'esm/dev') },
+        plugins: [makePackageNodeEsm(), makeEsmCjsReplacePlugin('esm')],
+      });
+      variantSpecificConfigs.push({
+        output: { format: 'esm', dir: path.join(baseConfig.output.dir, 'esm/prod') },
+        plugins: [makePackageNodeEsm(), makeProductionReplacePlugin(), makeEsmCjsReplacePlugin('esm')],
+      });
+    } else {
+      variantSpecificConfigs.push({
+        output: { format: 'esm', dir: path.join(baseConfig.output.dir, 'esm') },
+        plugins: [makePackageNodeEsm(), makeEsmCjsReplacePlugin('esm')],
+      });
+    }
+  }
+
+  return variantSpecificConfigs.map(variant =>
+    // Plugin arrays must be merged in the right order or the build silently misbehaves.
+    deepMerge(baseConfig, variant, {
+      customMerge: key => (key === 'plugins' ? mergePlugins : undefined),
+    }),
+  );
+}
+
+/**
+ * Emits the `@sentry/<framework>/import` entry (`build/import-hook.mjs`) as part of the rollup build,
+ * used as `node --import @sentry/<framework>/import app.js`. The generated hook imports
+ * `@sentry/server-runtime-injection/import-hook`, which registers the orchestrion
+ * diagnostics-channel injection, so the consuming package must declare
+ * `@sentry/server-runtime-injection` as a dependency.
+ *
+ * @param {string} outputFolder Build output folder.
+ */
+export function makeOrchestrionLoader(outputFolder) {
+  const expectedImportHookLocation = `${outputFolder}/import-hook.mjs`;
+  const foundImportHookExport = Object.keys(packageDotJSON.exports ?? {}).some(key => {
+    return packageDotJSON?.exports?.[key]?.import?.default === expectedImportHookLocation;
+  });
+  if (!foundImportHookExport) {
+    throw new Error(
+      `You used the makeOrchestrionLoader() rollup utility without specifying the import hook inside \`exports[something].import.default\`. Please add "${expectedImportHookLocation}" as a value there (maybe check for typos - it needs to be "${expectedImportHookLocation}" exactly).`,
+    );
+  }
+
+  const requiredDep = '@sentry/server-runtime-injection';
+  const foundRequiredDep =
+    Object.keys(packageDotJSON.dependencies ?? {}).some(key => {
+      return key === requiredDep;
+    }) ||
+    Object.keys(packageDotJSON.devDependencies ?? {}).some(key => {
+      return key === requiredDep;
+    });
+
+  if (!foundRequiredDep) {
+    throw new Error(
+      `You used the makeOrchestrionLoader() rollup utility but didn't specify the "${requiredDep}" dependency in ${path.resolve(
+        process.cwd(),
+        'package.json',
+      )}. Please add it to the dependencies.`,
+    );
+  }
+
+  return defineConfig([
+    {
+      input: path.join(__dirname, 'code', 'importHookTemplate.js'),
+      external: /.*/,
+      output: {
+        format: 'esm',
+        file: path.join(outputFolder, 'import-hook.mjs'),
+      },
+    },
+  ]);
+}

@@ -1,0 +1,116 @@
+import type { DurableObjectStorage, SyncKvStorage, SqlStorage } from '@cloudflare/workers-types';
+import { SENTRY_OP, SENTRY_ORIGIN, DB_OPERATION_NAME, DB_SYSTEM_NAME } from '@sentry/conventions/attributes';
+import { DB } from '@sentry/conventions/op';
+import { getClient, isThenable, startSpan } from '@sentry/core';
+import type { CloudflareClientOptions } from '../client';
+import { getStorageKeys, targetsCloudflareInternalKey } from '../utils/internalStorageKey';
+import { storeSpanContext } from '../utils/traceLinks';
+import { instrumentDurableObjectSyncKvStorage } from './instrumentDurableObjectSyncKvStorage';
+import { instrumentSqlStorage } from './instrumentSqlStorage';
+
+const STORAGE_METHODS_TO_INSTRUMENT = ['get', 'put', 'delete', 'list', 'setAlarm', 'getAlarm', 'deleteAlarm'] as const;
+
+type StorageMethod = (typeof STORAGE_METHODS_TO_INSTRUMENT)[number];
+
+type WaitUntil = (promise: Promise<unknown>) => void;
+
+/**
+ * Instruments DurableObjectStorage methods with Sentry spans.
+ *
+ * Wraps the following async methods:
+ * - get, put, delete, list (KV API)
+ * - setAlarm, getAlarm, deleteAlarm (Alarm API)
+ *
+ * When setAlarm is called, it also stores the current span context so that when
+ * the alarm fires later, it can link back to the trace that called setAlarm.
+ *
+ * @param storage - The DurableObjectStorage instance to instrument
+ * @param waitUntil - Optional waitUntil function to defer span context storage
+ * @returns An instrumented DurableObjectStorage instance
+ */
+export function instrumentDurableObjectStorage(
+  storage: DurableObjectStorage,
+  waitUntil?: WaitUntil,
+): DurableObjectStorage {
+  return new Proxy(storage, {
+    get(target, prop, _receiver) {
+      // Use `target` as the receiver instead of the proxy (`_receiver`).
+      // Native workerd getters (e.g., `storage.sql`) validate `this` via
+      // internal slots. Passing the proxy as receiver breaks that check,
+      // causing "Illegal invocation: function called with incorrect `this`
+      // reference" errors.
+      const original = Reflect.get(target, prop, target);
+
+      if (prop === 'kv' && original != null && 'get' in original && 'put' in original) {
+        return instrumentDurableObjectSyncKvStorage(original as SyncKvStorage);
+      }
+
+      if (prop === 'sql' && original != null && 'databaseSize' in original && 'exec' in original) {
+        return instrumentSqlStorage(original as SqlStorage);
+      }
+
+      if (typeof original !== 'function') {
+        return original;
+      }
+
+      const methodName = prop as string;
+      if (!STORAGE_METHODS_TO_INSTRUMENT.includes(methodName as StorageMethod)) {
+        return (original as (...args: unknown[]) => unknown).bind(target);
+      }
+
+      return function (this: unknown, ...args: unknown[]) {
+        // KV entries managed by the DO framework itself (agents/partyserver state) are bookkeeping
+        // rather than user work — skip the span, mirroring how `cf_` SQL tables are treated.
+        // oxlint-disable-next-line typescript/no-unnecessary-type-assertion -- rule false positive: the cast reaches the Cloudflare-only `durableObjectStorageSpanAllowlist`; tsc errors without it
+        const allowlist = (getClient()?.getOptions() as CloudflareClientOptions | undefined)
+          ?.durableObjectStorageSpanAllowlist;
+        const keys = getStorageKeys(methodName, args);
+        if (keys && keys.length > 0 && keys.every(key => targetsCloudflareInternalKey(key, allowlist))) {
+          return (original as (...a: unknown[]) => unknown).apply(target, args);
+        }
+
+        return startSpan(
+          {
+            // Use underscore naming to match Cloudflare's native instrumentation (e.g., "durable_object_storage_get")
+            name: `durable_object_storage_${methodName}`,
+            attributes: {
+              [SENTRY_OP]: DB,
+              [SENTRY_ORIGIN]: 'auto.db.cloudflare.durable_object',
+              [DB_SYSTEM_NAME]: 'cloudflare.durable_object.storage',
+              [DB_OPERATION_NAME]: methodName,
+            },
+          },
+          () => {
+            const teardown = async (): Promise<void> => {
+              // When setAlarm is called, store the current span context so that when the alarm
+              // fires later, it can link back to the trace that called setAlarm.
+              // We use the original (uninstrumented) storage (target) to avoid creating a span
+              // for this internal operation. The storage is deferred via waitUntil to not block.
+              if (methodName === 'setAlarm') {
+                storeSpanContext(target, 'alarm');
+              }
+            };
+
+            const result = (original as (...args: unknown[]) => unknown).apply(target, args);
+
+            if (!isThenable(result)) {
+              waitUntil?.(teardown());
+
+              return result;
+            }
+
+            return result.then(
+              res => {
+                waitUntil?.(teardown());
+                return res;
+              },
+              e => {
+                throw e;
+              },
+            );
+          },
+        );
+      };
+    },
+  });
+}

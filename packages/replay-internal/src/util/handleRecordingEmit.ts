@@ -1,0 +1,223 @@
+import { EventType, IncrementalSource, record } from '@sentry/rrweb';
+import { NodeType } from '@sentry/rrweb-snapshot';
+import { updateClickDetectorForRecordingEvent } from '../coreHandlers/handleClick';
+import { BREADCRUMB_RELEVANT_ATTRIBUTES } from '../coreHandlers/util/getAttributesToRecord';
+import { DEBUG_BUILD } from '../debug-build';
+import { saveSession } from '../session/saveSession';
+import type { RecordingEvent, ReplayContainer, ReplayOptionFrameEvent } from '../types';
+import { addEventSync } from './addEvent';
+import { debug } from './logger';
+
+type MutationAttributeData = {
+  id: number;
+  attributes: Record<string, string | number | true | null>;
+};
+
+type RecordingEmitCallback = (event: RecordingEvent, isCheckout?: boolean) => void;
+
+/**
+ * Handler for recording events.
+ *
+ * Adds to event buffer, and has varying flushing behaviors if the event was a checkout.
+ */
+export function getHandleRecordingEmit(replay: ReplayContainer): RecordingEmitCallback {
+  let hadFirstEvent = false;
+
+  return (event: RecordingEvent, _isCheckout?: boolean) => {
+    // This callback runs synchronously inside rrweb's observer / `takeFullSnapshot`
+    // call stack. If it throws, rrweb re-throws it (our `errorHandler` returns
+    // `undefined`) and can tear down recording — e.g. leaving the mutation buffer
+    // permanently locked. Never let an exception escape back into rrweb.
+    try {
+      // If this is false, it means session is expired, create and a new session and wait for checkout
+      if (!replay.checkAndHandleExpiredSession()) {
+        DEBUG_BUILD && debug.warn('Received replay event after session expired.');
+
+        return;
+      }
+
+      // `_isCheckout` is only set when the checkout is due to `checkoutEveryNms`
+      // We also want to treat the first event as a checkout, so we handle this specifically here
+      const isCheckout = _isCheckout || !hadFirstEvent;
+      hadFirstEvent = true;
+
+      syncMirrorAttributesFromMutationEvent(event);
+
+      if (replay.clickDetector) {
+        updateClickDetectorForRecordingEvent(replay.clickDetector, event);
+      }
+
+      // The handler returns `true` if we do not want to trigger debounced flush, `false` if we want to debounce flush.
+      replay.addUpdate(() => {
+        // The session is always started immediately on pageload/init, but for
+        // error-only replays, it should reflect the most recent checkout
+        // when an error occurs. Clear any state that happens before this current
+        // checkout. This needs to happen before `addEvent()` which updates state
+        // dependent on this reset.
+        if (replay.recordingMode === 'buffer' && isCheckout) {
+          replay.setInitialState();
+        }
+
+        // If the event is not added (e.g. due to being paused, disabled, or out of the max replay duration),
+        // Skip all further steps
+        if (!addEventSync(replay, event, isCheckout)) {
+          // Return true to skip scheduling a debounced flush
+          return true;
+        }
+
+        // Different behavior for full snapshots (type=2), ignore other event types
+        // See https://github.com/rrweb-io/rrweb/blob/d8f9290ca496712aa1e7d472549480c4e7876594/packages/rrweb/src/types.ts#L16
+        if (!isCheckout) {
+          return false;
+        }
+
+        const session = replay.session;
+
+        // Additionally, create a meta event that will capture certain SDK settings.
+        // In order to handle buffer mode, this needs to either be done when we
+        // receive checkout events or at flush time. We have an experimental mode
+        // to perform multiple checkouts a session (the idea is to improve
+        // seeking during playback), so also only include if segmentId is 0
+        // (handled in `addSettingsEvent`).
+        //
+        // `isCheckout` is always true, but want to be explicit that it should
+        // only be added for checkouts
+        addSettingsEvent(replay, isCheckout);
+
+        // When in buffer mode, make sure we adjust the session started date to the current earliest event of the buffer
+        // this should usually be the timestamp of the checkout event, but to be safe...
+        if (replay.recordingMode === 'buffer' && session && replay.eventBuffer && !session.dirty) {
+          const earliestEvent = replay.eventBuffer.getEarliestTimestamp();
+          if (earliestEvent) {
+            DEBUG_BUILD &&
+              debug.log(`Updating session start time to earliest event in buffer to ${new Date(earliestEvent)}`);
+
+            session.started = earliestEvent;
+
+            if (replay.getOptions().stickySession) {
+              saveSession(session);
+            }
+          }
+        }
+
+        // If there is a previousSessionId after a full snapshot occurs, then
+        // the replay session was started due to session expiration. The new session
+        // is started before triggering a new checkout and contains the id
+        // of the previous session. Do not immediately flush in this case
+        // to avoid capturing only the checkout and instead the replay will
+        // be captured if they perform any follow-up actions.
+        if (session?.previousSessionId) {
+          return true;
+        }
+
+        if (replay.recordingMode === 'session') {
+          // If the full snapshot is due to an initial load, we will not have
+          // a previous session ID. In this case, we want to buffer events
+          // for a set amount of time before flushing. This can help avoid
+          // capturing replays of users that immediately close the window.
+
+          // This should never reject
+          // eslint-disable-next-line @typescript-eslint/no-floating-promises
+          void replay.flush();
+        }
+
+        return true;
+      });
+    } catch (error) {
+      replay.handleException(error);
+    }
+  };
+}
+
+export function syncMirrorAttributesFromMutationEvent(event: RecordingEvent): void {
+  const data = event.data;
+
+  if (
+    event.type !== EventType.IncrementalSnapshot ||
+    !data ||
+    typeof data !== 'object' ||
+    !('source' in data) ||
+    data.source !== IncrementalSource.Mutation ||
+    !('attributes' in data) ||
+    !Array.isArray(data.attributes)
+  ) {
+    return;
+  }
+
+  for (const mutation of data.attributes as MutationAttributeData[]) {
+    const node = record.mirror.getNode(mutation.id);
+    const meta = node && record.mirror.getMeta(node);
+
+    if (!node || meta?.type !== NodeType.Element) {
+      continue;
+    }
+
+    const attributes = { ...meta.attributes };
+    let changed = false;
+
+    for (const [attributeName, value] of Object.entries(mutation.attributes)) {
+      // We only need the handful of attributes that can show up in a click breadcrumb.
+      // Anything else (notably `style`) is dead weight here.
+      if (!BREADCRUMB_RELEVANT_ATTRIBUTES.has(attributeName)) {
+        continue;
+      }
+
+      if (value === null) {
+        // oxlint-disable-next-line typescript/no-dynamic-delete
+        delete attributes[attributeName];
+      } else {
+        attributes[attributeName] = value;
+      }
+      changed = true;
+    }
+
+    if (changed) {
+      // rrweb hands out the very same serialized node object that it emitted in an earlier `adds`
+      // payload, and that event may still be sitting unserialized in the event buffer (this is the
+      // case whenever compression is disabled). Mutating it in place rewrites already recorded
+      // history, so swap in a copy instead of touching the original.
+      record.mirror.add(node, { ...meta, attributes });
+    }
+  }
+}
+
+/**
+ * Exported for tests
+ */
+export function createOptionsEvent(replay: ReplayContainer): ReplayOptionFrameEvent {
+  const options = replay.getOptions();
+  return {
+    type: EventType.Custom,
+    timestamp: Date.now(),
+    data: {
+      tag: 'options',
+      payload: {
+        shouldRecordCanvas: replay.isRecordingCanvas(),
+        sessionSampleRate: options.sessionSampleRate,
+        errorSampleRate: options.errorSampleRate,
+        useCompressionOption: options.useCompression,
+        blockAllMedia: options.blockAllMedia,
+        maskAllText: options.maskAllText,
+        maskAllInputs: options.maskAllInputs,
+        useCompression: replay.eventBuffer ? replay.eventBuffer.type === 'worker' : false,
+        networkDetailHasUrls: options.networkDetailAllowUrls.length > 0,
+        networkCaptureBodies: options.networkCaptureBodies,
+        networkRequestHasHeaders: options.networkRequestHeaders.length > 0,
+        networkResponseHasHeaders: options.networkResponseHeaders.length > 0,
+      },
+    },
+  };
+}
+
+/**
+ * Add a "meta" event that contains a simplified view on current configuration
+ * options. This should only be included on the first segment of a recording.
+ */
+function addSettingsEvent(replay: ReplayContainer, isCheckout?: boolean): void {
+  // Only need to add this event when sending the first segment
+  if (!isCheckout || replay.session?.segmentId !== 0) {
+    return;
+  }
+
+  addEventSync(replay, createOptionsEvent(replay), false);
+}

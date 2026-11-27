@@ -1,0 +1,113 @@
+import * as path from 'path';
+import type { VercelCronsConfig } from '../../common/types';
+import type { RouteManifest } from '../manifest/types';
+import type { JSONValue, TurbopackMatcherWithRule } from '../types';
+import type { TunnelRouteInjectedValues } from '../withSentryConfig/tunnel';
+import { getPackageModules, supportsTurbopackRuleCondition } from '../util';
+
+/**
+ * Generate the value injection rules for client and server in turbopack config.
+ */
+export function generateValueInjectionRules({
+  routeManifest,
+  nextJsVersion,
+  tunnelRouteValues,
+  vercelCronsConfig,
+  releaseName,
+  distDirName,
+  basePath,
+}: {
+  routeManifest?: RouteManifest;
+  nextJsVersion?: string;
+  tunnelRouteValues?: TunnelRouteInjectedValues;
+  vercelCronsConfig?: VercelCronsConfig;
+  releaseName?: string;
+  distDirName?: string;
+  basePath?: string;
+}): TurbopackMatcherWithRule[] {
+  const rules: TurbopackMatcherWithRule[] = [];
+  const isomorphicValues: Record<string, JSONValue> = { ...tunnelRouteValues };
+  let clientValues: Record<string, JSONValue> = {};
+  let serverValues: Record<string, JSONValue> = {};
+
+  if (nextJsVersion) {
+    // This is used to determine version-based dev-symbolication behavior
+    isomorphicValues._sentryNextJsVersion = nextJsVersion;
+  }
+
+  // The server reads it to serve the managed tunnel under the base path.
+  if (basePath) {
+    isomorphicValues._sentryBasePath = basePath;
+  }
+
+  if (routeManifest) {
+    clientValues._sentryRouteManifest = JSON.stringify(routeManifest);
+  }
+
+  // Inject Vercel crons config for server-side cron auto-instrumentation
+  if (vercelCronsConfig) {
+    serverValues._sentryVercelCronsConfig = JSON.stringify(vercelCronsConfig);
+  }
+  // Next.js inlines the values of `nextConfig.env` and `process.turbopack` only into code it compiles. These globals are
+  // for a server SDK that Next.js does not compile, e.g. one in `serverExternalPackages`.
+  serverValues._sentryTurbopack = true;
+  if (releaseName) {
+    serverValues._sentryRelease = releaseName;
+  }
+  if (distDirName) {
+    serverValues._sentryRewriteFramesDistDir = distDirName;
+  }
+
+  // Inject server modules (matching webpack's __SENTRY_SERVER_MODULES__ behavior)
+  // Use process.cwd() to get the project directory at build time
+  serverValues.__SENTRY_SERVER_MODULES__ = getPackageModules(process.cwd());
+
+  if (Object.keys(isomorphicValues).length > 0) {
+    clientValues = { ...clientValues, ...isomorphicValues };
+    serverValues = { ...serverValues, ...isomorphicValues };
+  }
+
+  const hasConditionSupport = nextJsVersion ? supportsTurbopackRuleCondition(nextJsVersion) : false;
+
+  // Client value injection
+  if (Object.keys(clientValues).length > 0) {
+    rules.push({
+      matcher: '**/instrumentation-client.*',
+      rule: {
+        // Only run on user code, not node_modules or Next.js internals
+        // condition field is only supported in Next.js 16+
+        ...(hasConditionSupport ? { condition: { not: 'foreign' } } : {}),
+        loaders: [
+          {
+            loader: path.resolve(__dirname, '..', 'loaders', 'valueInjectionLoader.js'),
+            options: {
+              values: clientValues,
+            },
+          },
+        ],
+      },
+    });
+  }
+
+  // Server value injection
+  if (Object.keys(serverValues).length > 0) {
+    rules.push({
+      matcher: '**/instrumentation.*',
+      rule: {
+        // Only run on user code, not node_modules or Next.js internals
+        // condition field is only supported in Next.js 16+
+        ...(hasConditionSupport ? { condition: { not: 'foreign' } } : {}),
+        loaders: [
+          {
+            loader: path.resolve(__dirname, '..', 'loaders', 'valueInjectionLoader.js'),
+            options: {
+              values: serverValues,
+            },
+          },
+        ],
+      },
+    });
+  }
+
+  return rules;
+}
