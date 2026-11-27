@@ -1,0 +1,620 @@
+import type { EventEnvelopeHeaders, Span } from '@sentry/core';
+import { SENTRY_SEGMENT_NAME_SOURCE, HTTP_ROUTE } from '@sentry/conventions/attributes';
+import { getCapturedScopesOnSpan, getRootSpan, getSpanDescendants, spanIsSampled, spanToJSON } from '@sentry/core';
+import * as SentryCore from '@sentry/core';
+import { NodeClient, serveTunnelIntegration, setCurrentClient } from '@sentry/node';
+import { _INTERNAL_resetTunnelDefaults } from '@sentry/core/server';
+import { TUNNEL_BASE_PATH_GLOBAL } from '../../src/common/tunnel';
+import type { Handle } from '../../src/server-common/handleTypes';
+import { redirect } from '@sveltejs/kit';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  addSentryCodeToPage,
+  FETCH_PROXY_SCRIPT,
+  isFetchProxyRequired,
+  sentryHandle,
+} from '../../src/server-common/handle';
+import { getDefaultNodeClientOptions } from '../utils';
+
+const mockCaptureException = vi.spyOn(SentryCore, 'captureException').mockImplementation(() => 'xx');
+
+function mockEvent(override: Record<string, unknown> = {}): Parameters<Handle>[0]['event'] {
+  const event: Parameters<Handle>[0]['event'] = {
+    cookies: {} as any,
+    fetch: () => Promise.resolve({} as any),
+    getClientAddress: () => '',
+    locals: {},
+    params: { id: '123' },
+    platform: {},
+    request: {
+      method: 'GET',
+      headers: {
+        get: () => null,
+        append: () => {},
+        delete: () => {},
+        forEach: () => {},
+        has: () => false,
+        set: () => {},
+      },
+    } as any,
+    route: { id: '/users/[id]' },
+    setHeaders: () => {},
+    url: new URL('http://localhost:3000/users/123'),
+    isDataRequest: false,
+
+    ...override,
+  };
+
+  return event;
+}
+
+const mockResponse = { status: 200, headers: {}, body: '' } as any;
+
+const enum Type {
+  Sync = 'sync',
+  Async = 'async',
+}
+
+function resolve(
+  type: Type,
+  isError: boolean,
+  throwSpecialError?: 'redirect' | 'http',
+): Parameters<Handle>[0]['resolve'] {
+  if (throwSpecialError === 'redirect') {
+    throw redirect(302, '/redirect');
+  }
+  if (throwSpecialError === 'http') {
+    throw { status: 404, body: 'Not found' };
+  }
+
+  if (type === Type.Sync) {
+    return (..._args: unknown[]) => {
+      if (isError) {
+        throw new Error(type);
+      }
+
+      return mockResponse;
+    };
+  }
+
+  return (..._args: unknown[]) => {
+    return new Promise((resolve, reject) => {
+      if (isError) {
+        reject(new Error(type));
+      } else {
+        resolve(mockResponse);
+      }
+    });
+  };
+}
+
+let client: NodeClient;
+
+beforeEach(() => {
+  const options = getDefaultNodeClientOptions({ tracesSampleRate: 1.0 });
+  client = new NodeClient(options);
+  setCurrentClient(client);
+  client.init();
+
+  mockCaptureException.mockClear();
+  vi.clearAllMocks();
+});
+
+describe('sentryHandle with span streaming', () => {
+  let streamingClient: NodeClient;
+
+  beforeEach(() => {
+    streamingClient = new NodeClient(getDefaultNodeClientOptions({ tracesSampleRate: 1.0, traceLifecycle: 'stream' }));
+    setCurrentClient(streamingClient);
+    streamingClient.init();
+  });
+
+  async function rootSpanNameFor(event: Parameters<Handle>[0]['event']): Promise<string | undefined> {
+    let rootSpan: Span | undefined;
+    streamingClient.on('spanEnd', span => {
+      if (span === getRootSpan(span)) {
+        rootSpan = span;
+      }
+    });
+
+    await sentryHandle({ handleUnknownRoutes: true })({ event, resolve: async () => mockResponse });
+
+    return rootSpan && spanToJSON(rootSpan).name;
+  }
+
+  it('keeps the parameterized route as the span name', async () => {
+    expect(await rootSpanNameFor(mockEvent())).toEqual('GET /users/[id]');
+  });
+
+  it('names a span without a resolved route after the request method', async () => {
+    expect(await rootSpanNameFor(mockEvent({ route: { id: null } }))).toEqual('GET');
+  });
+
+  it("replaces SvelteKit's own root span name when no route resolves", async () => {
+    const kitRootSpan = SentryCore.startInactiveSpan({ name: 'GET http://localhost:3000/users/123' });
+
+    await sentryHandle({ handleUnknownRoutes: true })({
+      event: mockEvent({ route: { id: null }, tracing: { enabled: true, root: kitRootSpan } }),
+      resolve: async () => mockResponse,
+    });
+
+    expect(spanToJSON(kitRootSpan).name).toEqual('GET');
+    kitRootSpan.end();
+  });
+});
+
+describe('sentryHandle with the managed tunnel', () => {
+  const DSN = 'https://public@o1.ingest.sentry.io/1337';
+
+  function makeTunnelRequest(path: string): Request {
+    const body = SentryCore.serializeEnvelope(SentryCore.createEnvelope({ dsn: DSN }, [])) as string;
+
+    return new Request(`http://localhost:3000${path}`, {
+      method: 'POST',
+      body,
+      headers: { 'content-length': String(body.length) },
+    });
+  }
+
+  beforeEach(() => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() => Promise.resolve(new Response('forwarded'))),
+    );
+    const client = new NodeClient(getDefaultNodeClientOptions({ dsn: DSN, integrations: [serveTunnelIntegration()] }));
+    setCurrentClient(client);
+    client.init();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    _INTERNAL_resetTunnelDefaults();
+  });
+
+  it('answers tunnel requests without resolving the route', async () => {
+    const mockResolve = vi.fn();
+
+    const response = await sentryHandle()({
+      event: mockEvent({ request: makeTunnelRequest(SentryCore.getTunnelPath(DSN)!), route: { id: null } }),
+      resolve: mockResolve,
+    });
+
+    expect(await response.text()).toBe('forwarded');
+    expect(mockResolve).not.toHaveBeenCalled();
+  });
+
+  it('serves the tunnel under the base path `sentrySvelteKit()` set before the handle was created', async () => {
+    vi.stubGlobal(TUNNEL_BASE_PATH_GLOBAL, '/app');
+    const mockResolve = vi.fn(() => Promise.resolve(new Response('app')));
+    const handle = sentryHandle();
+
+    const underBasePath = await handle({
+      event: mockEvent({ request: makeTunnelRequest(`/app${SentryCore.getTunnelPath(DSN)!}`), route: { id: null } }),
+      resolve: mockResolve,
+    });
+    const atRoot = await handle({
+      event: mockEvent({ request: makeTunnelRequest(SentryCore.getTunnelPath(DSN)!), route: { id: null } }),
+      resolve: mockResolve,
+    });
+
+    expect(await underBasePath.text()).toBe('forwarded');
+    expect(await atRoot.text()).toBe('app');
+  });
+
+  it('resolves every other request', async () => {
+    const mockResolve = vi.fn(() => Promise.resolve(new Response('app')));
+
+    const response = await sentryHandle()({ event: mockEvent(), resolve: mockResolve });
+
+    expect(await response.text()).toBe('app');
+  });
+});
+
+describe('sentryHandle', () => {
+  describe.each([
+    // isSync, isError, expectedResponse
+    [Type.Sync, true, undefined],
+    [Type.Sync, false, mockResponse],
+    [Type.Async, true, undefined],
+    [Type.Async, false, mockResponse],
+  ])('%s resolve with error %s', (type, isError, mockResponse) => {
+    it('returns a response', async () => {
+      let response: any = undefined;
+      try {
+        response = await sentryHandle()({ event: mockEvent(), resolve: resolve(type, isError) });
+      } catch (e) {
+        expect(e).toBeInstanceOf(Error);
+        expect(e.message).toEqual(type);
+      }
+
+      expect(response).toEqual(mockResponse);
+    });
+
+    it("starts a span if there's no active span", async () => {
+      let _span: Span | undefined = undefined;
+      client.on('spanEnd', span => {
+        if (span === getRootSpan(span)) {
+          _span = span;
+        }
+      });
+
+      try {
+        await sentryHandle()({ event: mockEvent(), resolve: resolve(type, isError) });
+      } catch {
+        //
+      }
+
+      expect(_span!).toBeDefined();
+
+      expect(spanToJSON(_span!).name).toEqual('GET /users/[id]');
+      expect(spanToJSON(_span!).attributes['sentry.op']).toEqual('http.server');
+      expect(spanToJSON(_span!).status).toEqual(isError ? 'error' : 'ok');
+      expect(spanToJSON(_span!).attributes?.[SENTRY_SEGMENT_NAME_SOURCE]).toEqual('route');
+      expect(spanToJSON(_span!).attributes?.[HTTP_ROUTE]).toEqual('/users/[id]');
+
+      expect(spanToJSON(_span!).end_timestamp).toBeDefined();
+
+      const spans = getSpanDescendants(_span!);
+      expect(spans).toHaveLength(1);
+    });
+
+    it("doesn't start a span if sveltekit tracing is enabled", async () => {
+      const kitRootSpan = SentryCore.startInactiveSpan({ name: 'sveltekit.handle.root' });
+      let _span: Span | undefined = undefined;
+      client.on('spanEnd', span => {
+        if (span === getRootSpan(span)) {
+          _span = span;
+        }
+      });
+
+      try {
+        await sentryHandle()({
+          event: mockEvent({ tracing: { enabled: true, root: kitRootSpan } }),
+          resolve: resolve(type, isError),
+        });
+      } catch {
+        //
+      }
+
+      expect(_span).toBeUndefined();
+      expect(spanToJSON(kitRootSpan).name).toEqual('GET /users/[id]');
+      expect(spanToJSON(kitRootSpan).attributes?.[SENTRY_SEGMENT_NAME_SOURCE]).toEqual('route');
+      expect(spanToJSON(kitRootSpan).attributes?.[HTTP_ROUTE]).toEqual('/users/[id]');
+      kitRootSpan.end();
+    });
+
+    it('starts a child span for nested server calls (i.e. if there is an active span)', async () => {
+      let _span: Span | undefined = undefined;
+      let txnCount = 0;
+      client.on('spanEnd', span => {
+        if (span === getRootSpan(span)) {
+          _span = span;
+          ++txnCount;
+        }
+      });
+
+      try {
+        await sentryHandle()({
+          event: mockEvent(),
+          resolve: async _ => {
+            // simulating a nested load call:
+            await sentryHandle()({
+              event: mockEvent({ route: { id: 'api/users/details/[id]' }, isSubRequest: true }),
+              resolve: resolve(type, isError),
+            });
+            return mockResponse;
+          },
+        });
+      } catch {
+        //
+      }
+
+      expect(txnCount).toEqual(1);
+      expect(_span!).toBeDefined();
+
+      expect(spanToJSON(_span!).name).toEqual('GET /users/[id]');
+      expect(spanToJSON(_span!).attributes['sentry.op']).toEqual('http.server');
+      expect(spanToJSON(_span!).status).toEqual(isError ? 'error' : 'ok');
+      expect(spanToJSON(_span!).attributes?.[SENTRY_SEGMENT_NAME_SOURCE]).toEqual('route');
+
+      expect(spanToJSON(_span!).end_timestamp).toBeDefined();
+
+      const spans = getSpanDescendants(_span!).map(spanToJSON);
+
+      expect(spans).toHaveLength(2);
+      expect(spans).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            name: 'GET /users/[id]',
+            attributes: expect.objectContaining({ 'sentry.op': 'http.server' }),
+          }),
+          expect.objectContaining({
+            name: 'GET api/users/details/[id]',
+            attributes: expect.objectContaining({ 'sentry.op': 'http.server' }),
+          }),
+        ]),
+      );
+    });
+
+    it("starts a span from sentry-trace header but doesn't populate a new DSC", async () => {
+      const event = mockEvent({
+        request: {
+          headers: {
+            get: (key: string) => {
+              if (key === 'sentry-trace') {
+                return '1234567890abcdef1234567890abcdef-1234567890abcdef-1';
+              }
+
+              return null;
+            },
+          },
+        },
+      });
+
+      let _span: Span | undefined = undefined;
+      client.on('spanEnd', span => {
+        if (span === getRootSpan(span)) {
+          _span = span;
+        }
+      });
+
+      let envelopeHeaders: EventEnvelopeHeaders | undefined = undefined;
+      client.on('beforeEnvelope', env => {
+        envelopeHeaders = env[0] as EventEnvelopeHeaders;
+      });
+
+      try {
+        await sentryHandle()({ event, resolve: resolve(type, isError) });
+      } catch {
+        //
+      }
+
+      // The transaction is captured on a debounce (deferred so children ending after the root still
+      // join it), so flush to emit the envelope before asserting its trace header.
+      await client.flush();
+
+      expect(_span).toBeDefined();
+      expect(_span!.spanContext().traceId).toEqual('1234567890abcdef1234567890abcdef');
+      expect(spanToJSON(_span!).parent_span_id).toEqual('1234567890abcdef');
+      expect(spanIsSampled(_span!)).toEqual(true);
+      // Continuing a trace without incoming baggage does not populate a new DSC, but the scope's
+      // `sample_rand` is still propagated so downstream sampling decisions stay consistent. Assert it
+      // matches the scope value rather than just any number, so a freshly-minted rand would fail.
+      const scopeSampleRand = getCapturedScopesOnSpan(_span!).scope!.getPropagationContext().sampleRand;
+      expect(envelopeHeaders!.trace).toEqual({ sample_rand: scopeSampleRand.toString() });
+    });
+
+    it('creates a transaction with dynamic sampling context from baggage header', async () => {
+      const event = mockEvent({
+        request: {
+          headers: {
+            get: (key: string) => {
+              if (key === 'sentry-trace') {
+                return '1234567890abcdef1234567890abcdef-1234567890abcdef-1';
+              }
+
+              if (key === 'baggage') {
+                return (
+                  'sentry-environment=production,sentry-release=1.0.0,sentry-transaction=dogpark,' +
+                  'sentry-public_key=dogsarebadatkeepingsecrets,' +
+                  'sentry-trace_id=1234567890abcdef1234567890abcdef,sentry-sample_rate=1,' +
+                  'sentry-sample_rand=0.42'
+                );
+              }
+
+              return null;
+            },
+          },
+        },
+      });
+
+      let _span: Span | undefined = undefined;
+      client.on('spanEnd', span => {
+        if (span === getRootSpan(span)) {
+          _span = span;
+        }
+      });
+
+      let envelopeHeaders: EventEnvelopeHeaders | undefined = undefined;
+      client.on('beforeEnvelope', env => {
+        envelopeHeaders = env[0] as EventEnvelopeHeaders;
+      });
+
+      try {
+        await sentryHandle()({ event, resolve: resolve(type, isError) });
+      } catch {
+        //
+      }
+
+      // The transaction is captured on a debounce (deferred so children ending after the root still
+      // join it), so flush to emit the envelope before asserting its trace header.
+      await client.flush();
+
+      expect(_span!).toBeDefined();
+      expect(envelopeHeaders!.trace).toEqual({
+        environment: 'production',
+        release: '1.0.0',
+        public_key: 'dogsarebadatkeepingsecrets',
+        sample_rate: '1',
+        trace_id: '1234567890abcdef1234567890abcdef',
+        transaction: 'dogpark',
+        sample_rand: '0.42',
+      });
+    });
+
+    it('send errors to Sentry', async () => {
+      try {
+        await sentryHandle()({ event: mockEvent(), resolve: resolve(type, isError) });
+      } catch {
+        expect(mockCaptureException).toBeCalledTimes(1);
+        expect(mockCaptureException).toBeCalledWith(expect.any(Error), {
+          mechanism: { handled: false, type: 'auto.function.sveltekit.handle' },
+        });
+      }
+    });
+
+    it("doesn't send redirects in a request handler to Sentry", async () => {
+      try {
+        await sentryHandle()({ event: mockEvent(), resolve: resolve(type, false, 'redirect') });
+      } catch {
+        expect(mockCaptureException).toBeCalledTimes(0);
+      }
+    });
+
+    it("doesn't send Http 4xx errors in a request handler to Sentry", async () => {
+      try {
+        await sentryHandle()({ event: mockEvent(), resolve: resolve(type, false, 'http') });
+      } catch {
+        expect(mockCaptureException).toBeCalledTimes(0);
+      }
+    });
+
+    it('calls `transformPageChunk`', async () => {
+      const mockResolve = vi.fn().mockImplementation(resolve(type, isError));
+      const event = mockEvent();
+      try {
+        await sentryHandle()({ event, resolve: mockResolve });
+      } catch (e) {
+        expect(e).toBeInstanceOf(Error);
+        // @ts-expect-error - this is fine
+        expect(e.message).toEqual(type);
+      }
+
+      expect(mockResolve).toHaveBeenCalledTimes(1);
+      expect(mockResolve).toHaveBeenCalledWith(event, { transformPageChunk: expect.any(Function) });
+    });
+
+    it("doesn't create a transaction if there's no route", async () => {
+      let _span: Span | undefined = undefined;
+      client.on('spanEnd', span => {
+        if (span === getRootSpan(span)) {
+          _span = span;
+        }
+      });
+
+      try {
+        await sentryHandle()({ event: mockEvent({ route: undefined }), resolve: resolve(type, isError) });
+      } catch {
+        //
+      }
+
+      expect(_span!).toBeUndefined();
+    });
+
+    it("Creates a transaction if there's no route but `handleUnknownRequests` is true", async () => {
+      let _span: Span | undefined = undefined;
+      client.on('spanEnd', span => {
+        if (span === getRootSpan(span)) {
+          _span = span;
+        }
+      });
+
+      try {
+        await sentryHandle({ handleUnknownRoutes: true })({
+          event: mockEvent({ route: undefined }),
+          resolve: resolve(type, isError),
+        });
+      } catch {
+        //
+      }
+
+      expect(_span!).toBeDefined();
+    });
+
+    it("doesn't create an isolation scope when the `_sentrySkipRequestIsolation` local is set", async () => {
+      const withIsolationScopeSpy = vi.spyOn(SentryCore, 'withIsolationScope');
+      const continueTraceSpy = vi.spyOn(SentryCore, 'continueTrace');
+
+      try {
+        await sentryHandle({ handleUnknownRoutes: true })({
+          event: { ...mockEvent({ route: undefined }), locals: { _sentrySkipRequestIsolation: true } },
+          resolve: resolve(type, isError),
+        });
+      } catch {
+        //
+      }
+
+      expect(withIsolationScopeSpy).not.toHaveBeenCalled();
+      expect(continueTraceSpy).not.toHaveBeenCalled();
+    });
+  });
+});
+
+describe('addSentryCodeToPage', () => {
+  const html = `<!DOCTYPE html>
+  <html lang="en">
+    <head>
+      <meta charset="utf-8" />
+      <link rel="icon" href="%sveltekit.assets%/favicon.png" />
+      <meta name="viewport" content="width=device-width" />
+    </head>
+    <body data-sveltekit-preload-data="hover">
+      <div style="display: contents">%sveltekit.body%</div>
+    </body>
+  </html>`;
+
+  it("Adds add meta tags and fetch proxy script if there's no active transaction", () => {
+    const transformPageChunk = addSentryCodeToPage({ injectFetchProxyScript: true });
+    const transformed = transformPageChunk({ html, done: true });
+
+    expect(transformed).toContain('<meta name="sentry-trace"');
+    expect(transformed).toContain('<meta name="baggage"');
+    expect(transformed).not.toContain('sentry-transaction=');
+    expect(transformed).toContain(`<script>${FETCH_PROXY_SCRIPT}</script>`);
+  });
+
+  it('adds meta tags and the fetch proxy script if there is an active transaction', () => {
+    const transformPageChunk = addSentryCodeToPage({ injectFetchProxyScript: true });
+    SentryCore.startSpan({ name: 'test' }, () => {
+      const transformed = transformPageChunk({ html, done: true }) as string;
+
+      expect(transformed).toContain('<meta name="sentry-trace"');
+      expect(transformed).toContain('<meta name="baggage"');
+      expect(transformed).toContain('sentry-transaction=test');
+      expect(transformed).toContain(`<script>${FETCH_PROXY_SCRIPT}</script>`);
+    });
+  });
+
+  it('does not add the fetch proxy script if the `injectFetchProxyScript` option is false', () => {
+    const transformPageChunk = addSentryCodeToPage({ injectFetchProxyScript: false });
+    const transformed = transformPageChunk({ html, done: true }) as string;
+
+    expect(transformed).toContain('<meta name="sentry-trace"');
+    expect(transformed).toContain('<meta name="baggage"');
+    expect(transformed).not.toContain(`<script >${FETCH_PROXY_SCRIPT}</script>`);
+  });
+
+  describe('while SvelteKit builds the app', () => {
+    afterEach(() => {
+      vi.unstubAllEnvs();
+    });
+
+    it("doesn't add meta tags but still adds the fetch proxy script if _SENTRY_SVELTEKIT_BUILDING is set", () => {
+      vi.stubEnv('_SENTRY_SVELTEKIT_BUILDING', 'true');
+
+      const transformPageChunk = addSentryCodeToPage({ injectFetchProxyScript: true });
+      const transformed = transformPageChunk({ html, done: true }) as string;
+
+      expect(transformed).not.toContain('<meta name="sentry-trace"');
+      expect(transformed).not.toContain('<meta name="baggage"');
+      expect(transformed).toContain(`<script>${FETCH_PROXY_SCRIPT}</script>`);
+    });
+  });
+});
+
+describe('isFetchProxyRequired', () => {
+  it.each(['2.16.0', '2.16.1', '2.17.0', '3.0.0', '3.0.0-alpha.0'])(
+    'returns false if the version is greater than or equal to 2.16.0 (%s)',
+    version => {
+      expect(isFetchProxyRequired(version)).toBe(false);
+    },
+  );
+
+  it.each(['2.15.0', '2.15.1', '1.30.0', '1.0.0'])('returns true if the version is lower than 2.16.0 (%s)', version => {
+    expect(isFetchProxyRequired(version)).toBe(true);
+  });
+
+  it.each(['invalid', 'a.b.c'])('returns true for an invalid version (%s)', version => {
+    expect(isFetchProxyRequired(version)).toBe(true);
+  });
+});

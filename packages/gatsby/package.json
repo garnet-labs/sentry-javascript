@@ -1,0 +1,96 @@
+{
+  "name": "@sentry/gatsby",
+  "version": "11.11.0",
+  "description": "Official Sentry SDK for Gatsby.js",
+  "repository": "git://github.com/getsentry/sentry-javascript.git",
+  "homepage": "https://github.com/getsentry/sentry-javascript/tree/master/packages/gatsby",
+  "author": "Sentry",
+  "license": "MIT",
+  "keywords": [
+    "gatsby",
+    "gatsby-plugin"
+  ],
+  "engines": {
+    "node": ">=20.19.0 <22.0.0 || >=22.12.0 <23.0.0 || >=23.2.0"
+  },
+  "files": [
+    "/build",
+    "gatsby-node.js",
+    "gatsby-node.d.ts"
+  ],
+  "main": "build/cjs/index.js",
+  "module": "build/esm/index.js",
+  "types": "build/types/index.d.ts",
+  "exports": {
+    "./package.json": "./package.json",
+    ".": {
+      "import": {
+        "types": "./build/types/index.d.ts",
+        "default": "./build/esm/index.js"
+      },
+      "require": {
+        "types": "./build/types/index.d.ts",
+        "default": "./build/cjs/index.js"
+      }
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@sentry/core": "11.11.0",
+    "@sentry/react": "11.11.0",
+    "@sentry/bundler-plugins": "11.11.0"
+  },
+  "peerDependencies": {
+    "gatsby": "^3.0.0 || ^4.0.0 || ^5.0.0",
+    "react": "17.x || 18.x || 19.x"
+  },
+  "devDependencies": {
+    "@sentry-internal/rollup-utils": "11.11.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "webpack": "^5.112.2"
+  },
+  "scripts": {
+    "build": "run-p build:transpile build:types",
+    "build:dev": "pnpm run build",
+    "build:plugin": "tsc -p tsconfig.plugin.json",
+    "build:transpile": "run-p build:rollup build:plugin",
+    "build:rollup": "rollup -c rollup.npm.config.mjs",
+    "build:types": "tsc -p tsconfig.types.json",
+    "build:watch": "run-p build:transpile:watch",
+    "build:dev:watch": "pnpm run build:watch",
+    "build:transpile:watch": "rollup -c rollup.npm.config.mjs --watch",
+    "build:tarball": "pnpm pack",
+    "circularDepCheck": "madge --circular src/index.ts",
+    "clean": "rimraf build coverage *.d.ts sentry-gatsby-*.tgz",
+    "lint:fix": "oxlint . --fix --type-aware",
+    "lint": "oxlint . --type-aware",
+    "lint:types": "oxlint src --type-aware --type-check",
+    "lint:es-compatibility": "es-check es2020 ./build/cjs/*.js && es-check es2020 ./build/esm/*.js --module",
+    "test": "vitest run",
+    "test:watch": "vitest --watch",
+    "yalc:publish": "yalc publish --push --sig"
+  },
+  "nx": {
+    "targets": {
+      "build:transpile": {
+        "inputs": [
+          "production",
+          "^production"
+        ],
+        "outputs": [
+          "{projectRoot}/build/esm",
+          "{projectRoot}/build/cjs",
+          "{projectRoot}/*.d.ts"
+        ],
+        "dependsOn": [
+          "^build:transpile"
+        ],
+        "cache": true
+      }
+    }
+  },
+  "sideEffects": false
+}

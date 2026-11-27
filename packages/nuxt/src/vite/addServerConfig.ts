@@ -1,0 +1,382 @@
+import { existsSync } from 'node:fs';
+import { basename } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { addNitroPlugin, addTemplate, createResolver } from '@nuxt/kit';
+import type { Nuxt } from '@nuxt/schema';
+import { consoleSandbox, debug } from '@sentry/core';
+import * as fs from 'fs';
+import type { Nitro } from 'nitropack';
+import type { InputPluginOption } from 'rollup';
+import type { SentryNuxtModuleOptions } from '../common/types';
+import {
+  addRuntimeFlagsTemplate,
+  constructFunctionReExport,
+  constructWrappedFunctionExportQuery,
+  getFilenameFromNodeStartCommand,
+  isCloudflarePreset,
+  QUERY_END_INDICATOR,
+  removeSentryQueryFromPath,
+  SENTRY_REEXPORTED_FUNCTIONS,
+  SENTRY_WRAPPED_ENTRY,
+  SENTRY_WRAPPED_FUNCTIONS,
+  SERVER_CONFIG_FILENAME,
+  toResolvablePath,
+} from './utils';
+
+const CONFIG_EXTENSIONS = ['.ts', '.js', '.mjs', '.cjs', '.mts', '.cts'];
+
+function isServerConfigFile(sourcePath: string, resolvedPath: string): boolean {
+  if (sourcePath === resolvedPath) {
+    return true;
+  }
+  const name = basename(sourcePath);
+  return name === SERVER_CONFIG_FILENAME || CONFIG_EXTENSIONS.some(ext => name === `${SERVER_CONFIG_FILENAME}${ext}`);
+}
+
+/**
+ *  Adds the `sentry.server.config.ts` file as `sentry.server.config.mjs` to the `.output` directory to be able to reference this file in the node --import option.
+ *
+ *  By adding a Rollup plugin to the Nitro Rollup options, the Sentry server config is transpiled and emitted to the server build.
+ */
+export function addServerConfigToBuild(
+  moduleOptions: SentryNuxtModuleOptions,
+  nitro: Nitro,
+  serverConfigFile: string,
+): void {
+  nitro.hooks.hook('rollup:before', (nitro, rollupConfig) => {
+    if (rollupConfig?.plugins === null || rollupConfig?.plugins === undefined) {
+      rollupConfig.plugins = [];
+    } else if (!Array.isArray(rollupConfig.plugins)) {
+      // `rollupConfig.plugins` can be a single plugin, so we want to put it into an array so that we can push our own plugin
+      rollupConfig.plugins = [rollupConfig.plugins];
+    }
+
+    rollupConfig.plugins.push(injectServerConfigPlugin(nitro, serverConfigFile, moduleOptions.debug));
+  });
+}
+
+/**
+ *  Adds the Sentry server config import at the top of the server entry file to load the SDK on the server.
+ *  This is necessary for environments where modifying the node option `--import` is not possible.
+ *  However, only limited tracing instrumentation is supported when doing this.
+ */
+export function addSentryTopImport(moduleOptions: SentryNuxtModuleOptions, nitro: Nitro): void {
+  nitro.hooks.hook('close', async () => {
+    const fileNameFromCommand =
+      nitro.options.commands.preview && getFilenameFromNodeStartCommand(nitro.options.commands.preview);
+
+    // other presets ('node-server' or 'vercel') have an index.mjs
+    const presetsWithServerFile = ['netlify'];
+
+    const entryFileName = fileNameFromCommand
+      ? fileNameFromCommand
+      : typeof nitro.options.rollupConfig?.output.entryFileNames === 'string'
+        ? nitro.options.rollupConfig?.output.entryFileNames
+        : presetsWithServerFile.includes(nitro.options.preset)
+          ? 'server.mjs'
+          : 'index.mjs';
+
+    const serverDirResolver = createResolver(nitro.options.output.serverDir);
+    const entryFilePath = serverDirResolver.resolve(entryFileName);
+
+    try {
+      fs.readFile(entryFilePath, 'utf8', (err, data) => {
+        const updatedContent = `import './${SERVER_CONFIG_FILENAME}.mjs';\n${data}`;
+
+        fs.writeFile(entryFilePath, updatedContent, 'utf8', () => {
+          if (moduleOptions.debug) {
+            // eslint-disable-next-line no-console
+            console.log(
+              `[Sentry] Successfully added the Sentry import to the server entry file "\`${entryFilePath}\`"`,
+            );
+          }
+        });
+      });
+    } catch (err) {
+      if (moduleOptions.debug) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[Sentry] An error occurred when trying to add the Sentry import to the server entry file "\`${entryFilePath}\`":`,
+          err,
+        );
+      }
+    }
+  });
+}
+
+/**
+ * Registers a Nitro plugin that statically imports the Sentry server config, so the SDK initializes
+ * at server startup without a `node --import` preload.
+ */
+export function addServerConfigPlugin(nuxt: Nuxt, serverConfigFile: string, isLegacyNitro: boolean): void {
+  const configPath = createResolver(nuxt.options.rootDir).resolve(serverConfigFile);
+  const runtimeFlagsTemplate = addRuntimeFlagsTemplate();
+
+  const configPluginTemplate = addTemplate({
+    filename: 'sentry-server-config-plugin.mjs',
+    write: true,
+    getContents: () =>
+      `import ${JSON.stringify(runtimeFlagsTemplate.dst)};\nimport ${JSON.stringify(configPath)};\nexport default () => {};\n`,
+  });
+
+  addNitroPlugin(configPluginTemplate.dst);
+
+  // Nitro v2 treeshakes side-effect-only imports outside its runtime dir, which would silently drop
+  // the top-level `Sentry.init` and the flag assignments.
+  // Nitro v3 dropped the option and keeps both.
+  if (isLegacyNitro) {
+    nuxt.options.nitro.moduleSideEffects = [
+      ...(nuxt.options.nitro.moduleSideEffects ?? []),
+      configPath,
+      runtimeFlagsTemplate.dst,
+    ];
+  }
+
+  nuxt.hook('nitro:config', nitroConfig => {
+    // Early skip for explicitly configured Cloudflare presets. The authoritative check runs on
+    // `nitro:init`: env-derived presets (`NITRO_PRESET`, Cloudflare Pages CI) resolve only inside Nitro.
+    if (isCloudflarePreset(nitroConfig.preset)) {
+      nitroConfig.plugins = (nitroConfig.plugins ?? []).filter(plugin => plugin !== configPluginTemplate.dst);
+      return;
+    }
+
+    // Front the config plugin so `Sentry.init` evaluates before plugins registered by other Nuxt
+    // modules (Nitro appends scanned user plugins after the configured ones anyway).
+    const plugins = nitroConfig.plugins ?? [];
+    nitroConfig.plugins = [configPluginTemplate.dst, ...plugins.filter(plugin => plugin !== configPluginTemplate.dst)];
+
+    // The Nitro v2 dev bundle would otherwise externalize these files, making Node load the raw
+    // `.ts` config — which needs type stripping (Node >= 22.18). Inlining keeps them transpiled.
+    // Nitro v3 has no `externals` option; its dev server runs the config through Vite's transform.
+    if (isLegacyNitro) {
+      const externals = (nitroConfig.externals ??= {});
+      const inline = externals.inline;
+      const existingInline = Array.isArray(inline) ? inline : inline ? [inline] : [];
+      externals.inline = [...existingInline, configPath, configPluginTemplate.dst, runtimeFlagsTemplate.dst];
+    }
+  });
+
+  // On Cloudflare the SDK is set up through `sentryCloudflareNitroPlugin`; the Node SDK config
+  // must not end up in the worker bundle. `nitro.options.preset` is resolved here.
+  nuxt.hook('nitro:init', nitro => {
+    if (nuxt.options._prepare || !isCloudflarePreset(nitro.options.preset)) {
+      return;
+    }
+
+    nitro.options.plugins = (nitro.options.plugins ?? []).filter(plugin => plugin !== configPluginTemplate.dst);
+    consoleSandbox(() => {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[Sentry] Found \`${basename(configPath)}\`, but the Nitro preset targets Cloudflare, where this file is not used. Set up the SDK with \`sentryCloudflareNitroPlugin\` instead: https://docs.sentry.io/platforms/javascript/guides/nuxt/install/cloudflare-workers/`,
+      );
+    });
+  });
+}
+
+/**
+ * Writes a shim to the former `--import` config path, so existing `node --import` start commands
+ * keep working now that the config is bundled into the server build.
+ */
+export function addServerConfigShimWithWarning(nitro: Nitro): void {
+  nitro.hooks.hook('close', async () => {
+    if (nitro.options.dev || nitro.options.preset === 'nitro-prerender' || isCloudflarePreset(nitro.options.preset)) {
+      return;
+    }
+
+    const shimPath = createResolver(nitro.options.output.serverDir).resolve(`${SERVER_CONFIG_FILENAME}.mjs`);
+    const contents = [
+      '// Generated by @sentry/nuxt.',
+      '// The Sentry server config is bundled into the server build and initializes automatically.',
+      '// This file only keeps existing `node --import ./.output/server/sentry.server.config.mjs` commands working.',
+      "console.warn('[Sentry] The `--import` flag for the Sentry server config is no longer needed and should be removed.');",
+      '',
+    ].join('\n');
+
+    try {
+      await fs.promises.writeFile(shimPath, contents, 'utf8');
+    } catch (error) {
+      // A missing shim breaks `node --import` start commands, so always warn (`debug` is off at build time).
+      consoleSandbox(() => {
+        // eslint-disable-next-line no-console
+        console.warn(`[Sentry] Could not write the \`--import\` compatibility shim to ${shimPath}`, error);
+      });
+    }
+  });
+}
+
+/**
+ * This function modifies the Rollup configuration to include a plugin that wraps the entry file with a dynamic import (`import()`)
+ * and adds the Sentry server config with the static `import` declaration.
+ *
+ * With this, the Sentry server config can be loaded before all other modules of the application.
+ * See: https://nodejs.org/api/module.html#enabling
+ */
+export function addDynamicImportEntryFileWrapper(
+  nitro: Nitro,
+  serverConfigFile: string,
+  moduleOptions: Omit<SentryNuxtModuleOptions, 'experimental_entrypointWrappedFunctions'> &
+    Required<Pick<SentryNuxtModuleOptions, 'experimental_entrypointWrappedFunctions'>>,
+): void {
+  if (!nitro.options.rollupConfig) {
+    nitro.options.rollupConfig = { output: {} };
+  }
+
+  if (nitro.options.rollupConfig?.plugins === null || nitro.options.rollupConfig?.plugins === undefined) {
+    nitro.options.rollupConfig.plugins = [];
+  } else if (!Array.isArray(nitro.options.rollupConfig.plugins)) {
+    // `rollupConfig.plugins` can be a single plugin, so we want to put it into an array so that we can push our own plugin
+    nitro.options.rollupConfig.plugins = [nitro.options.rollupConfig.plugins];
+  }
+
+  nitro.options.rollupConfig.plugins.push(
+    wrapEntryWithDynamicImport({
+      resolvedSentryConfigPath: createResolver(nitro.options.rootDir).resolve(serverConfigFile),
+      // oxlint-disable-next-line typescript/no-deprecated -- supported until removal
+      experimental_entrypointWrappedFunctions: moduleOptions.experimental_entrypointWrappedFunctions,
+    }),
+  );
+}
+
+/**
+ * Rollup plugin to include the Sentry server configuration file to the server build output.
+ */
+function injectServerConfigPlugin(nitro: Nitro, serverConfigFile: string, isDebug?: boolean): InputPluginOption {
+  const filePrefix = '\0virtual:sentry-server-config:';
+
+  return {
+    name: 'rollup-plugin-inject-sentry-server-config',
+
+    buildStart() {
+      const configPath = createResolver(nitro.options.rootDir).resolve(serverConfigFile);
+
+      if (!existsSync(configPath)) {
+        if (isDebug) {
+          debug.log(`[Sentry] Sentry server config file not found: ${configPath}`);
+        }
+        return;
+      }
+
+      // Emitting a file adds it to the build output (Rollup is aware of the file, and we can later return the code in resolveId)
+      this.emitFile({
+        type: 'chunk',
+        id: `${filePrefix}${serverConfigFile}`,
+        fileName: `${SERVER_CONFIG_FILENAME}.mjs`,
+      });
+    },
+
+    resolveId(source) {
+      if (source.startsWith(filePrefix)) {
+        const originalFilePath = source.replace(filePrefix, '');
+        const configPath = createResolver(nitro.options.rootDir).resolve(originalFilePath);
+
+        return { id: configPath };
+      }
+      return null;
+    },
+  };
+}
+
+/**
+ * A Rollup plugin which wraps the server entry with a dynamic `import()`. This makes it possible to initialize Sentry first
+ * by using a regular `import` and load the server after that.
+ * This also works with serverless `handler` functions, as it re-exports the `handler`.
+ *
+ * Only exported for testing.
+ */
+export function wrapEntryWithDynamicImport({
+  resolvedSentryConfigPath,
+  experimental_entrypointWrappedFunctions,
+  debug,
+}: {
+  resolvedSentryConfigPath: string;
+  experimental_entrypointWrappedFunctions: string[];
+  debug?: boolean;
+}): InputPluginOption {
+  // In order to correctly import the server config file
+  // and dynamically import the nitro runtime, we need to
+  // mark the resolutionId with '\0raw' to fall into the
+  // raw chunk group, c.f. https://github.com/nitrojs/nitro/commit/8b4a408231bdc222569a32ce109796a41eac4aa6#diff-e58102d2230f95ddeef2662957b48d847a6e891e354cfd0ae6e2e03ce848d1a2R142
+  const resolutionIdPrefix = '\0raw';
+
+  return {
+    name: 'sentry-wrap-entry-with-dynamic-import',
+    async resolveId(source, importer, options) {
+      // `load()` emits `file://` specifiers because Node's ESM loader rejects bare Windows paths,
+      // but Rollup's resolver only understands filesystem paths.
+      const resolvable = toResolvablePath(source);
+      if (!resolvable) {
+        return null;
+      }
+      const { path: normalizedSource, wasFileUrl } = resolvable;
+
+      if (isServerConfigFile(normalizedSource, resolvedSentryConfigPath)) {
+        return { id: normalizedSource, moduleSideEffects: true };
+      }
+
+      if (
+        options.isEntry &&
+        normalizedSource.includes('.mjs') &&
+        !normalizedSource.includes(`.mjs${SENTRY_WRAPPED_ENTRY}`)
+      ) {
+        const resolution = await this.resolve(normalizedSource, importer, options);
+
+        // If it cannot be resolved or is external, just return it so that Rollup can display an error
+        if (!resolution || resolution?.external) return resolution;
+
+        const moduleInfo = await this.load(resolution);
+
+        moduleInfo.moduleSideEffects = true;
+
+        // The enclosing `if` already checks for the suffix in `source`, but a check in `resolution.id` is needed as well to prevent multiple attachment of the suffix
+        return resolution.id.includes(`.mjs${SENTRY_WRAPPED_ENTRY}`)
+          ? resolution.id
+          : `${resolutionIdPrefix}${resolution.id
+              // Concatenates the query params to mark the file (also attaches names of re-exports - this is needed for serverless functions to re-export the handler)
+              .concat(SENTRY_WRAPPED_ENTRY)
+              .concat(
+                constructWrappedFunctionExportQuery(
+                  moduleInfo.exportedBindings,
+                  experimental_entrypointWrappedFunctions,
+                  debug,
+                ),
+              )
+              .concat(QUERY_END_INDICATOR)}`;
+      }
+
+      // Pass isEntry:false to avoid re-entering the isEntry branch and double-wrapping
+      // (normalizedSource strips the SENTRY_WRAPPED_ENTRY query suffix).
+      if (wasFileUrl) {
+        const resolved = await this.resolve(normalizedSource, importer, { ...options, isEntry: false });
+        if (resolved) return resolved;
+        return { id: normalizedSource };
+      }
+
+      return null;
+    },
+    load(id: string) {
+      if (id.includes(`.mjs${SENTRY_WRAPPED_ENTRY}`)) {
+        const entryId = removeSentryQueryFromPath(id).slice(resolutionIdPrefix.length);
+        const entryIdUrl = pathToFileURL(entryId).href;
+        const configUrl = pathToFileURL(resolvedSentryConfigPath).href;
+
+        // Use entryIdUrl so Node's runtime ESM loader receives file:// on Windows; Rollup normalizes it in resolveId.
+        // Mostly useful for serverless `handler` functions
+        const reExportedFunctions =
+          id.includes(SENTRY_WRAPPED_FUNCTIONS) || id.includes(SENTRY_REEXPORTED_FUNCTIONS)
+            ? constructFunctionReExport(id, entryIdUrl)
+            : '';
+
+        return (
+          // Regular `import` of the Sentry config
+          `import ${JSON.stringify(configUrl)};\n` +
+          // Dynamic `import()` for the previous, actual entry point.
+          // `import()` can be used for any code that should be run after the hooks are registered (https://nodejs.org/api/module.html#enabling)
+          `import(${JSON.stringify(entryIdUrl)});\n` +
+          `${reExportedFunctions}\n`
+        );
+      }
+
+      return null;
+    },
+  };
+}

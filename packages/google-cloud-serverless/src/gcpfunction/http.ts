@@ -1,0 +1,111 @@
+import {
+  SENTRY_SEGMENT_NAME_SOURCE,
+  FAAS_NAME,
+  FAAS_TRIGGER,
+  HTTP_REQUEST_METHOD,
+  SENTRY_OP,
+  URL_PATH,
+  SENTRY_ORIGIN,
+} from '@sentry/conventions/attributes';
+import { FUNCTION_GCP } from '@sentry/conventions/op';
+import {
+  debug,
+  getClient,
+  handleCallbackErrors,
+  hasSpanStreamingEnabled,
+  httpRequestToRequestData,
+  isString,
+  SERVERLESS_FUNCTION_SPAN_NAME_FALLBACK,
+  setHttpStatus,
+  stripUrlQueryAndFragment,
+} from '@sentry/core';
+import { captureException, continueTrace, flush, getCurrentScope, startSpanManual } from '@sentry/node';
+import { DEBUG_BUILD } from '../debug-build';
+import { domainify, getFunctionName, markEventUnhandled, proxyFunction } from '../utils';
+import type { HttpFunction, WrapperOptions } from './general';
+
+/**
+ * Wraps an HTTP function handler adding it error capture and tracing capabilities.
+ *
+ * @param fn HTTP Handler
+ * @param options Options
+ * @returns HTTP handler
+ */
+export function wrapHttpFunction(fn: HttpFunction, wrapOptions: Partial<WrapperOptions> = {}): HttpFunction {
+  const wrap = (f: HttpFunction): HttpFunction => domainify(_wrapHttpFunction(f, wrapOptions));
+
+  let overrides: Record<PropertyKey, unknown> | undefined;
+
+  // Functions emulator from firebase-tools has a hack-ish workaround that saves the actual function
+  // passed to `onRequest(...)` and in fact runs it so we need to wrap it too.
+  const emulatorFunc = (fn as HttpFunction & { __emulator_func?: HttpFunction }).__emulator_func;
+  if (emulatorFunc) {
+    overrides = { __emulator_func: proxyFunction(emulatorFunc, wrap) };
+  }
+  return proxyFunction(fn, wrap, overrides);
+}
+
+/** */
+function _wrapHttpFunction(fn: HttpFunction, options: Partial<WrapperOptions>): HttpFunction {
+  const flushTimeout = options.flushTimeout || 2000;
+  return (req, res) => {
+    const reqMethod = (req.method || '').toUpperCase();
+    const reqUrl = stripUrlQueryAndFragment(req.originalUrl || req.url || '');
+
+    const sentryTrace = req.headers && isString(req.headers['sentry-trace']) ? req.headers['sentry-trace'] : undefined;
+    const baggage = req.headers?.baggage;
+
+    return continueTrace({ sentryTrace, baggage }, () => {
+      const normalizedRequest = httpRequestToRequestData(req);
+      getCurrentScope().setSDKProcessingMetadata({ normalizedRequest });
+
+      const functionName = getFunctionName();
+
+      const client = getClient();
+      const hasSpanStreaming = client && hasSpanStreamingEnabled(client);
+      const name = hasSpanStreaming ? functionName || SERVERLESS_FUNCTION_SPAN_NAME_FALLBACK : `${reqMethod} ${reqUrl}`;
+
+      return startSpanManual(
+        {
+          name,
+          attributes: {
+            [SENTRY_OP]: FUNCTION_GCP,
+            [FAAS_NAME]: functionName,
+            [FAAS_TRIGGER]: 'http',
+            [SENTRY_SEGMENT_NAME_SOURCE]: hasSpanStreaming ? 'component' : 'route',
+            [SENTRY_ORIGIN]: 'auto.function.serverless.gcp_http',
+            // The method and path used to be the span name; they stay on the span so that
+            // information survives the low-cardinality rename.
+            [HTTP_REQUEST_METHOD]: reqMethod || undefined,
+            [URL_PATH]: reqUrl || undefined,
+          },
+        },
+        span => {
+          // eslint-disable-next-line @typescript-eslint/unbound-method
+          const _end = res.end;
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          res.end = function (chunk?: any | (() => void), encoding?: string | (() => void), cb?: () => void): any {
+            setHttpStatus(span, res.statusCode);
+            span.end();
+
+            // eslint-disable-next-line @typescript-eslint/no-floating-promises
+            flush(flushTimeout)
+              .then(null, e => {
+                DEBUG_BUILD && debug.error(e);
+              })
+              .then(() => {
+                _end.call(this, chunk, encoding, cb);
+              });
+          };
+
+          return handleCallbackErrors(
+            () => fn(req, res),
+            err => {
+              captureException(err, scope => markEventUnhandled(scope, 'auto.function.serverless.gcp_http'));
+            },
+          );
+        },
+      );
+    });
+  };
+}

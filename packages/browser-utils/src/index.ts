@@ -1,0 +1,79 @@
+export {
+  addPerformanceInstrumentationHandler,
+  addClsInstrumentationHandler,
+  addTtfbInstrumentationHandler,
+  addLcpInstrumentationHandler,
+  addInpInstrumentationHandler,
+  addFcpInstrumentationHandler,
+  enableBfcacheReporting,
+  enableSoftNavigationReporting,
+} from './instrumentation/performanceObserver';
+
+export { startSoftNavigationCorrelation, supportsSoftNavigations } from './web-vitals/softNavs';
+
+export { addPerformanceEntries, startTrackingLongTasks, startTrackingLongAnimationFrames } from './performance/entries';
+
+export {
+  addWebVitalsToSpan,
+  // eslint-disable-next-line typescript/no-deprecated
+  startTrackingWebVitals,
+  registerInpInteractionListener,
+} from './web-vitals/tracking';
+
+// eslint-disable-next-line typescript/no-deprecated
+export { elementTimingIntegration, startTrackingElementTiming } from './performance/elementTiming';
+
+export { interactionsIntegration } from './performance/interactions';
+
+export { isBotUserAgent } from './isBotUserAgent';
+
+export { getLocationHref } from './getLocationHref';
+
+export {
+  createCachedRouteProvider,
+  createUrlRouteProvider,
+  getRouteProvider,
+  resolveCurrentRoute,
+  resolveRoute,
+  setRouteProvider,
+} from './routing';
+export type { CachedRouteProvider, RouteProvider } from './routing';
+
+export { userTimingIntegration } from './performance/userTiming';
+
+export { extractNetworkProtocol } from './performance/utils';
+
+export { trackClsAsSpan, trackInpAsSpan, trackLcpAsSpan } from './web-vitals/spans';
+
+export { whenIdleOrHidden } from './web-vitals/utils';
+
+export { addClickKeypressInstrumentationHandler } from './instrumentation/dom';
+
+export { addHistoryInstrumentationHandler } from './instrumentation/history';
+
+export { fetch, setTimeout, clearCachedImplementation, getNativeImplementation } from './getNativeImplementation';
+
+export { addXhrInstrumentationHandler, SENTRY_XHR_DATA_KEY } from './instrumentation/xhr';
+
+export { getBodyString, getFetchRequestArgBody, serializeFormData, parseXhrResponseHeaders } from './networkUtils';
+
+export { resourceTimingToSpanAttributes } from './performance/resourceTiming';
+
+export { htmlTreeAsString } from './htmlTreeAsString';
+
+export { getComponentName } from './component-name';
+
+export { isElement } from './is';
+
+export { getAbsoluteUrl } from './instrumentation/location';
+
+export type {
+  FetchHint,
+  HandlerDataDom,
+  HandlerDataHistory,
+  HandlerDataXhr,
+  NetworkMetaWarning,
+  SentryWrappedXMLHttpRequest,
+  SentryXhrData,
+  XhrHint,
+} from './types';

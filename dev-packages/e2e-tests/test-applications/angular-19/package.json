@@ -1,0 +1,50 @@
+{
+  "name": "angular-19",
+  "version": "0.0.0",
+  "scripts": {
+    "ng": "ng",
+    "dev": "ng serve",
+    "proxy": "node start-event-proxy.mjs",
+    "preview": "http-server dist/angular-19/browser --port 8080 --silent",
+    "build": "ng build",
+    "watch": "ng build --watch --configuration development",
+    "test": "playwright test",
+    "test:build": "pnpm install && pnpm build",
+    "test:assert": "playwright test",
+    "clean": "npx rimraf .angular node_modules pnpm-lock.yaml dist",
+    "build:streamed": "ng build --configuration production,streamed",
+    "test:build:streamed": "pnpm install && pnpm build:streamed",
+    "test:assert:streamed": "E2E_TEST_TRACE_LIFECYCLE=stream playwright test"
+  },
+  "private": true,
+  "dependencies": {
+    "@angular/common": "^19.0.0",
+    "@angular/compiler": "^19.0.0",
+    "@angular/core": "^19.0.0",
+    "@angular/platform-browser": "^19.0.0",
+    "@angular/router": "^19.0.0",
+    "@sentry/angular": "file:../../packed/sentry-angular-packed.tgz",
+    "rxjs": "~7.8.0",
+    "tslib": "^2.3.0",
+    "zone.js": "~0.15.0"
+  },
+  "devDependencies": {
+    "@angular-devkit/build-angular": "^19.0.0",
+    "@angular/cli": "^19.0.0",
+    "@angular/compiler-cli": "^19.0.0",
+    "@playwright/test": "1.64.1",
+    "@sentry/conventions": "0.32.0",
+    "@sentry-internal/test-utils": "file:../../packed/sentry-internal-test-utils-packed.tgz",
+    "http-server": "^14.1.1",
+    "typescript": "~5.6.2"
+  },
+  "sentryTest": {
+    "variants": [
+      {
+        "label": "angular-19 (streamed)",
+        "build-command": "pnpm test:build:streamed",
+        "assert-command": "pnpm test:assert:streamed"
+      }
+    ]
+  }
+}

@@ -1,0 +1,840 @@
+import { describe, expect, it, test, vi } from 'vitest';
+import { getCurrentScope } from '../../../src/currentScopes';
+import { setCurrentClient } from '../../../src/sdk';
+import {
+  SEMANTIC_ATTRIBUTE_SENTRY_MEASUREMENT_UNIT,
+  SEMANTIC_ATTRIBUTE_SENTRY_MEASUREMENT_VALUE,
+} from '../../../src/semanticAttributes';
+import { SentrySpan } from '../../../src/tracing/sentrySpan';
+import { SPAN_STATUS_ERROR } from '../../../src/tracing/spanstatus';
+import { startInactiveSpan, startSpan, withActiveSpan } from '../../../src/tracing/trace';
+import { markSpanAsTracerProviderSpan } from '../../../src/tracing/utils';
+import { withStaticSpan } from '../../../src/tracing/spans/beforeSendSpan';
+import type { Envelope } from '../../../src/types/envelope';
+import type { Span, SpanJSON } from '../../../src/types/span';
+import {
+  getRootSpan,
+  spanToJSON,
+  spanToStaticSpanJSON,
+  TRACE_FLAG_NONE,
+  TRACE_FLAG_SAMPLED,
+} from '../../../src/utils/spanUtils';
+import { browserPerformanceTimeOrigin, timestampInSeconds } from '../../../src/utils/time';
+import { getDefaultTestClientOptions, TestClient } from '../../mocks/client';
+import { SENTRY_SEGMENT_NAME_SOURCE } from '@sentry/conventions/attributes';
+
+function childSpansOf(span: Span): Set<Span> {
+  return (span as unknown as { _sentryChildSpans?: Set<Span> })._sentryChildSpans ?? new Set();
+}
+
+describe('SentrySpan', () => {
+  describe('name', () => {
+    it('works with name', () => {
+      const span = new SentrySpan({ name: 'span name' });
+      expect(spanToStaticSpanJSON(span).description).toEqual('span name');
+    });
+
+    it('allows to update the name via updateName', () => {
+      const span = new SentrySpan({ name: 'span name' });
+      expect(spanToStaticSpanJSON(span).description).toEqual('span name');
+
+      span.updateName('new name');
+
+      expect(spanToStaticSpanJSON(span).description).toEqual('new name');
+    });
+
+    it('sets the source to custom when calling updateName', () => {
+      const span = new SentrySpan({
+        name: 'original name',
+        attributes: { [SENTRY_SEGMENT_NAME_SOURCE]: 'url' },
+      });
+
+      span.updateName('new name');
+
+      const spanJson = spanToStaticSpanJSON(span);
+      expect(spanJson.description).toEqual('new name');
+      expect(spanJson.data[SENTRY_SEGMENT_NAME_SOURCE]).toEqual('custom');
+    });
+
+    it('sets the source to custom when calling updateName on a span without a source', () => {
+      const span = new SentrySpan({ name: 'original name' });
+
+      span.updateName('new name');
+
+      const spanJson = spanToStaticSpanJSON(span);
+      expect(spanJson.description).toEqual('new name');
+    });
+  });
+
+  describe('setters', () => {
+    test('setName', () => {
+      const span = new SentrySpan({});
+      expect(spanToStaticSpanJSON(span).description).toBeUndefined();
+      span.updateName('foo');
+      expect(spanToStaticSpanJSON(span).description).toBe('foo');
+    });
+  });
+
+  describe('status', () => {
+    test('setStatus', () => {
+      const span = new SentrySpan({});
+      span.setStatus({ code: SPAN_STATUS_ERROR, message: 'permission_denied' });
+      expect(spanToStaticSpanJSON(span).status).toBe('permission_denied');
+    });
+  });
+
+  describe('toJSON', () => {
+    test('simple', () => {
+      const span = spanToStaticSpanJSON(
+        new SentrySpan({ traceId: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', spanId: 'bbbbbbbbbbbbbbbb' }),
+      );
+      expect(span).toHaveProperty('span_id', 'bbbbbbbbbbbbbbbb');
+      expect(span).toHaveProperty('trace_id', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+    });
+
+    test('with parent', () => {
+      const spanA = new SentrySpan({ traceId: 'a', spanId: 'b' });
+      const spanB = new SentrySpan({
+        traceId: 'c',
+        spanId: 'd',
+        sampled: false,
+        parentSpanId: spanA.spanContext().spanId,
+      });
+      const serialized = spanToStaticSpanJSON(spanB);
+      expect(serialized).toHaveProperty('parent_span_id', 'b');
+      expect(serialized).toHaveProperty('span_id', 'd');
+      expect(serialized).toHaveProperty('trace_id', 'c');
+    });
+  });
+
+  describe('tracer-provider span sealing', () => {
+    it('seals a tracer-provider span against all mutation after it ends', () => {
+      const span = new SentrySpan({ name: 'original', startTimestamp: 1, attributes: { key: 'before' } });
+      span.setStatus({ code: SPAN_STATUS_ERROR, message: 'permission_denied' });
+      span.addEvent('measurement', {
+        [SEMANTIC_ATTRIBUTE_SENTRY_MEASUREMENT_VALUE]: 1,
+        [SEMANTIC_ATTRIBUTE_SENTRY_MEASUREMENT_UNIT]: 'millisecond',
+      });
+      const linked = new SentrySpan({ name: 'linked' });
+
+      markSpanAsTracerProviderSpan(span);
+      span.end();
+
+      // Every mutator must no-op on a tracer-provider span once it has ended, mirroring OTel SDK spans.
+      span.setAttribute('key', 'after');
+      span.setAttributes({ key2: 'after' });
+      span.setStatus({ code: SPAN_STATUS_ERROR, message: 'already_exists' });
+      span.updateName('after');
+      span.updateStartTime(999);
+      span.addLink({ context: linked.spanContext() });
+      span.addLinks([{ context: linked.spanContext() }]);
+      span.addEvent('measurement', {
+        [SEMANTIC_ATTRIBUTE_SENTRY_MEASUREMENT_VALUE]: 2,
+        [SEMANTIC_ATTRIBUTE_SENTRY_MEASUREMENT_UNIT]: 'millisecond',
+      });
+
+      const json = spanToStaticSpanJSON(span);
+      expect(json.data?.['key']).toBe('before');
+      expect(json.data?.['key2']).toBeUndefined();
+      expect(json.status).toBe('permission_denied');
+      expect(json.description).toBe('original');
+      expect(json.start_timestamp).toBe(1);
+      expect(json.links).toBeUndefined();
+      expect(json.measurements).toEqual({ measurement: { value: 1, unit: 'millisecond' } });
+    });
+
+    it('keeps a span that is not a tracer-provider span mutable after it ends', () => {
+      const span = new SentrySpan({ name: 'original', startTimestamp: 1, attributes: { key: 'before' } });
+      const linked = new SentrySpan({ name: 'linked' });
+
+      span.end();
+
+      span.setAttribute('key', 'after');
+      span.updateName('after');
+      span.updateStartTime(999);
+      span.addLink({ context: linked.spanContext() });
+
+      const json = spanToStaticSpanJSON(span);
+      expect(json.data?.['key']).toBe('after');
+      expect(json.description).toBe('after');
+      expect(json.start_timestamp).toBe(999);
+      expect(json.links).toHaveLength(1);
+    });
+
+    it('keeps a tracer-provider span sealed across repeated `end()` calls', () => {
+      const span = new SentrySpan({
+        name: 'original',
+        startTimestamp: 1,
+        attributes: { key: 'before' },
+      });
+      markSpanAsTracerProviderSpan(span);
+
+      span.end([2, 0]);
+      span.end([3, 0]);
+
+      span.setAttribute('key', 'after');
+      expect(spanToStaticSpanJSON(span).data?.['key']).toBe('before');
+      expect(spanToStaticSpanJSON(span).timestamp).toBe(2);
+    });
+  });
+
+  describe('tracer-provider span timestamps', () => {
+    it('reads numbers as OpenTelemetry milliseconds', () => {
+      const origin = browserPerformanceTimeOrigin()!;
+      const span = new SentrySpan({ name: 'span' });
+      markSpanAsTracerProviderSpan(span);
+
+      span.updateStartTime(1_000);
+      span.addEvent('event', 1_010);
+      span.end(1_025);
+
+      const json = spanToStaticSpanJSON(span);
+      expect(json.start_timestamp).toBe((origin + 1_000) / 1000);
+      expect(json.timestamp).toBe((origin + 1_025) / 1000);
+      expect(span['_events'][0]?.time).toBe((origin + 1_010) / 1000);
+    });
+
+    it('defaults an event without a time to now', () => {
+      const span = new SentrySpan({ name: 'span' });
+      markSpanAsTracerProviderSpan(span);
+
+      const before = timestampInSeconds();
+      span.addEvent('event');
+
+      expect(span['_events'][0]?.time).toBeGreaterThanOrEqual(before);
+      expect(span['_events'][0]?.time).toBeLessThanOrEqual(timestampInSeconds());
+    });
+
+    it('keeps reading numbers as seconds on other spans', () => {
+      const span = new SentrySpan({ name: 'span' });
+
+      span.updateStartTime(1_000);
+      span.addEvent('event', 1_010);
+      span.end(1_025);
+
+      const json = spanToStaticSpanJSON(span);
+      expect(json.start_timestamp).toBe(1_000);
+      expect(json.timestamp).toBe(1_025);
+      expect(span['_events'][0]?.time).toBe(1_010);
+    });
+  });
+
+  describe('child span retention', () => {
+    it('stops tracking children on a segment span once it has been captured', () => {
+      const client = new TestClient(getDefaultTestClientOptions({ tracesSampleRate: 1 }));
+      setCurrentClient(client);
+      const captureEvent = vi.spyOn(client, 'captureEvent');
+
+      let rootSpan: Span | undefined;
+      startSpan({ name: 'root' }, span => {
+        rootSpan = span;
+        startSpan({ name: 'child' }, () => {});
+      });
+
+      expect(captureEvent).toHaveBeenCalledTimes(1);
+      expect(captureEvent).toHaveBeenCalledWith(
+        expect.objectContaining({ spans: [expect.objectContaining({ description: 'child' })] }),
+        expect.any(Object),
+        expect.any(Object),
+      );
+      expect(childSpansOf(rootSpan!).size).toBe(1);
+
+      // A child that starts after the tree was read is not tracked, but can still find its root span,
+      // which is all that re-emitting it as its own transaction needs.
+      const lateChild = withActiveSpan(rootSpan!, () => startInactiveSpan({ name: 'late child' }));
+      expect(childSpansOf(rootSpan!).size).toBe(1);
+      expect(getRootSpan(lateChild)).toBe(rootSpan);
+    });
+
+    it('stops tracking children on a segment span that has streamed', () => {
+      const client = new TestClient(getDefaultTestClientOptions({ tracesSampleRate: 1, traceLifecycle: 'stream' }));
+      setCurrentClient(client);
+
+      let rootSpan: Span | undefined;
+      startSpan({ name: 'root' }, span => {
+        rootSpan = span;
+        startSpan({ name: 'child' }, () => {});
+      });
+
+      expect(childSpansOf(rootSpan!).size).toBe(1);
+
+      const lateChild = withActiveSpan(rootSpan!, () => startInactiveSpan({ name: 'late child' }));
+      expect(childSpansOf(rootSpan!).size).toBe(1);
+      expect(getRootSpan(lateChild)).toBe(rootSpan);
+    });
+  });
+
+  describe('end', () => {
+    test('simple', () => {
+      const span = new SentrySpan({});
+      expect(spanToStaticSpanJSON(span).timestamp).toBeUndefined();
+      span.end();
+      expect(spanToStaticSpanJSON(span).timestamp).toBeGreaterThan(1);
+    });
+
+    test('with endTime in seconds', () => {
+      const span = new SentrySpan({});
+      expect(spanToStaticSpanJSON(span).timestamp).toBeUndefined();
+      const endTime = Date.now() / 1000;
+      span.end(endTime);
+      expect(spanToStaticSpanJSON(span).timestamp).toBe(endTime);
+    });
+
+    test('with endTime in milliseconds', () => {
+      const span = new SentrySpan({});
+      expect(spanToStaticSpanJSON(span).timestamp).toBeUndefined();
+      const endTime = Date.now();
+      span.end(endTime);
+      expect(spanToStaticSpanJSON(span).timestamp).toBe(endTime / 1000);
+    });
+
+    test('uses sampled config for standalone span', () => {
+      const client = new TestClient(
+        getDefaultTestClientOptions({
+          dsn: 'https://username@domain/123',
+          enableSend: true,
+        }),
+      );
+      setCurrentClient(client);
+
+      // @ts-expect-error Accessing private transport API
+      const mockSend = vi.spyOn(client._transport, 'send');
+
+      const notSampledSpan = new SentrySpan({
+        name: 'not-sampled',
+        isStandalone: true,
+        startTimestamp: 1,
+        sampled: false,
+      });
+      notSampledSpan.end(2);
+      expect(mockSend).not.toHaveBeenCalled();
+
+      const sampledSpan = new SentrySpan({
+        name: 'is-sampled',
+        isStandalone: true,
+        startTimestamp: 1,
+        sampled: true,
+      });
+      sampledSpan.end(2);
+      expect(mockSend).toHaveBeenCalledTimes(1);
+    });
+
+    test('sends the span if `beforeSendSpan` does not modify the span', () => {
+      const beforeSendSpan = withStaticSpan(vi.fn(span => span));
+      const client = new TestClient(
+        getDefaultTestClientOptions({
+          dsn: 'https://username@domain/123',
+          enableSend: true,
+          beforeSendSpan,
+        }),
+      );
+      setCurrentClient(client);
+
+      // @ts-expect-error Accessing private transport API
+      const mockSend = vi.spyOn(client._transport, 'send');
+      const span = new SentrySpan({
+        name: 'test',
+        isStandalone: true,
+        startTimestamp: 1,
+        sampled: true,
+      });
+      span.end(2);
+      expect(mockSend).toHaveBeenCalled();
+    });
+
+    test('runs a static `beforeSendSpan` for standalone spans', () => {
+      // A standalone span is sent as a v2 streamed span, but a user opting out of span streaming still
+      // writes `beforeSendSpan` in the v1 `SpanJSON` format. We scrub the span in its v1 shape before
+      // converting it forward to v2, so the callback runs and its changes are applied.
+      const beforeSendSpan = withStaticSpan(vi.fn((span: SpanJSON) => ({ ...span, description: 'scrubbed' })));
+      const client = new TestClient(
+        getDefaultTestClientOptions({
+          dsn: 'https://username@domain/123',
+          enableSend: true,
+          beforeSendSpan,
+        }),
+      );
+      setCurrentClient(client);
+
+      const recordDroppedEventSpy = vi.spyOn(client, 'recordDroppedEvent');
+      const envelopes: Envelope[] = [];
+      client.on('beforeEnvelope', envelope => {
+        envelopes.push(envelope);
+      });
+      // @ts-expect-error Accessing private transport API
+      const mockSend = vi.spyOn(client._transport, 'send');
+      const span = new SentrySpan({
+        name: 'test',
+        isStandalone: true,
+        startTimestamp: 1,
+        sampled: true,
+      });
+      span.end(2);
+
+      expect(beforeSendSpan).toHaveBeenCalledTimes(1);
+      expect(mockSend).toHaveBeenCalled();
+      expect(recordDroppedEventSpy).not.toHaveBeenCalled();
+
+      const spanItem = envelopes[0]?.[1][0] as [{ type: string }, { items: Array<{ name: string }> }];
+      expect(spanItem[0].type).toBe('span');
+      expect(spanItem[1].items[0]!.name).toBe('scrubbed');
+    });
+
+    test('does not apply scope attributes to standalone spans with a static `beforeSendSpan`', () => {
+      // Scope attributes can hold `{ unit, value }` objects, unexpected for a static callback, so they
+      // are not applied to the standalone (INP) span, just as they are not applied to transactions.
+      const seen: SpanJSON['data'][] = [];
+      const beforeSendSpan = withStaticSpan(
+        vi.fn((span: SpanJSON) => {
+          seen.push({ ...span.data });
+          return span;
+        }),
+      );
+      const client = new TestClient(
+        getDefaultTestClientOptions({
+          dsn: 'https://username@domain/123',
+          enableSend: true,
+          beforeSendSpan,
+        }),
+      );
+      setCurrentClient(client);
+      getCurrentScope().setAttribute('my.scope.attr', 'from-scope');
+
+      const span = new SentrySpan({
+        name: 'test',
+        isStandalone: true,
+        startTimestamp: 1,
+        sampled: true,
+      });
+      span.end(2);
+
+      expect(seen[0]!['my.scope.attr']).toBeUndefined();
+    });
+
+    test('sends a standalone span on its own and excludes it from the parent transaction', async () => {
+      const client = new TestClient(
+        getDefaultTestClientOptions({
+          dsn: 'https://username@domain/123',
+          enableSend: true,
+          tracesSampleRate: 1,
+        }),
+      );
+      setCurrentClient(client);
+
+      const envelopes: Envelope[] = [];
+      client.on('beforeEnvelope', envelope => {
+        envelopes.push(envelope);
+      });
+
+      startSpan({ name: 'root' }, () => {
+        const standaloneChild = startInactiveSpan({ name: 'inp', experimental: { standalone: true } });
+        standaloneChild.end();
+      });
+
+      await client.flush();
+
+      const items = envelopes.flatMap(
+        envelope => envelope[1] as Array<[{ type?: string; content_type?: string }, any]>,
+      );
+
+      // The standalone child is sent on its own as a v2 streamed span...
+      const streamedItem = items.find(item => item[0]?.content_type === 'application/vnd.sentry.items.span.v2+json');
+      expect(streamedItem?.[1]?.items?.[0]?.name).toBe('inp');
+
+      // ...and is NOT folded into the root transaction (no double-send).
+      const transactionItem = items.find(item => item[0]?.type === 'transaction');
+      expect(transactionItem?.[1]?.spans?.map((span: { description?: string }) => span.description)).not.toContain(
+        'inp',
+      );
+    });
+
+    test('build TransactionEvent for basic root span', () => {
+      const client = new TestClient(
+        getDefaultTestClientOptions({
+          dsn: 'https://username@domain/123',
+        }),
+      );
+      setCurrentClient(client);
+
+      const scope = getCurrentScope();
+      const captureEventSpy = vi.spyOn(scope, 'captureEvent').mockImplementation(() => 'testId');
+
+      const span = new SentrySpan({
+        name: 'test',
+        startTimestamp: 1,
+        sampled: true,
+      });
+      span.end(2);
+
+      expect(captureEventSpy).toHaveBeenCalledTimes(1);
+      expect(captureEventSpy).toHaveBeenCalledWith({
+        contexts: {
+          trace: {
+            data: {
+              'sentry.origin': 'manual',
+            },
+            origin: 'manual',
+            span_id: expect.stringMatching(/^[a-f0-9]{16}$/),
+            trace_id: expect.stringMatching(/^[a-f0-9]{32}$/),
+            status: 'ok',
+          },
+        },
+        sdkProcessingMetadata: {
+          capturedSpanIsolationScope: undefined,
+          capturedSpanScope: undefined,
+          dynamicSamplingContext: {
+            environment: 'production',
+            public_key: 'username',
+            trace_id: expect.stringMatching(/^[a-f0-9]{32}$/),
+            transaction: 'test',
+          },
+          hasGenAiSpans: false,
+        },
+        spans: [],
+        start_timestamp: 1,
+        timestamp: 2,
+        transaction: 'test',
+        type: 'transaction',
+      });
+    });
+
+    test('records an `invalid` span outcome for unfinished child spans', () => {
+      const client = new TestClient(getDefaultTestClientOptions({ tracesSampleRate: 1 }));
+      setCurrentClient(client);
+      const recordDroppedEventSpy = vi.spyOn(client, 'recordDroppedEvent');
+      const captureEventSpy = vi.spyOn(getCurrentScope(), 'captureEvent').mockImplementation(() => 'testId');
+
+      const root = startInactiveSpan({ name: 'root' });
+      withActiveSpan(root, () => {
+        startInactiveSpan({ name: 'unfinished-1' });
+        startInactiveSpan({ name: 'unfinished-2' });
+        startInactiveSpan({ name: 'finished' }).end();
+      });
+      root.end();
+
+      expect(captureEventSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ spans: [expect.objectContaining({ description: 'finished' })] }),
+      );
+      expect(recordDroppedEventSpy).toHaveBeenCalledTimes(1);
+      expect(recordDroppedEventSpy).toHaveBeenCalledWith('invalid', 'span', 2);
+    });
+
+    test('records a `buffer_overflow` span outcome for spans beyond the 1000 span limit', () => {
+      const client = new TestClient(getDefaultTestClientOptions({ tracesSampleRate: 1 }));
+      setCurrentClient(client);
+      const recordDroppedEventSpy = vi.spyOn(client, 'recordDroppedEvent');
+      const captureEventSpy = vi.spyOn(getCurrentScope(), 'captureEvent').mockImplementation(() => 'testId');
+
+      const root = startInactiveSpan({ name: 'root' });
+      withActiveSpan(root, () => {
+        for (let i = 0; i < 1005; i++) {
+          startInactiveSpan({ name: `child-${i}` }).end();
+        }
+      });
+      root.end();
+
+      expect(captureEventSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ spans: expect.objectContaining({ length: 1000 }) }),
+      );
+      expect(recordDroppedEventSpy).toHaveBeenCalledTimes(1);
+      expect(recordDroppedEventSpy).toHaveBeenCalledWith('buffer_overflow', 'span', 5);
+    });
+
+    test('does not record span outcomes for an unsampled root span', () => {
+      const client = new TestClient(getDefaultTestClientOptions({ tracesSampleRate: 1 }));
+      setCurrentClient(client);
+      const recordDroppedEventSpy = vi.spyOn(client, 'recordDroppedEvent');
+
+      const root = new SentrySpan({ name: 'root', sampled: false });
+      withActiveSpan(root, () => {
+        startInactiveSpan({ name: 'unfinished' });
+      });
+      root.end();
+
+      expect(recordDroppedEventSpy).not.toHaveBeenCalledWith('invalid', 'span', expect.anything());
+    });
+
+    test('does not record span outcomes for unfinished standalone child spans', () => {
+      const client = new TestClient(getDefaultTestClientOptions({ tracesSampleRate: 1 }));
+      setCurrentClient(client);
+      const recordDroppedEventSpy = vi.spyOn(client, 'recordDroppedEvent');
+      vi.spyOn(getCurrentScope(), 'captureEvent').mockImplementation(() => 'testId');
+
+      const root = startInactiveSpan({ name: 'root' });
+      withActiveSpan(root, () => {
+        startInactiveSpan({ name: 'inp', experimental: { standalone: true } });
+      });
+      root.end();
+
+      expect(recordDroppedEventSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('setAttribute', () => {
+    it('allows to set attributes', () => {
+      const span = new SentrySpan();
+
+      span.setAttribute('str', 'bar');
+      span.setAttribute('num', 1);
+      span.setAttribute('zero', 0);
+      span.setAttribute('bool', true);
+      span.setAttribute('false', false);
+      span.setAttribute('undefined', undefined);
+      span.setAttribute('numArray', [1, 2]);
+      span.setAttribute('strArray', ['aa', 'bb']);
+      span.setAttribute('boolArray', [true, false]);
+      span.setAttribute('arrayWithUndefined', [1, undefined, 2]);
+
+      expect(span['_attributes']).toEqual({
+        str: 'bar',
+        num: 1,
+        zero: 0,
+        bool: true,
+        false: false,
+        numArray: [1, 2],
+        strArray: ['aa', 'bb'],
+        boolArray: [true, false],
+        arrayWithUndefined: [1, undefined, 2],
+        // origin is set by default to 'manual' in the SentrySpan constructor
+        'sentry.origin': 'manual',
+      });
+    });
+
+    it('deletes attributes when setting to `undefined`', () => {
+      const span = new SentrySpan();
+
+      span.setAttribute('str', 'bar');
+
+      // length 2 because `sentry.origin` is always set by default
+      expect(Object.keys(span['_attributes']).length).toEqual(2);
+
+      span.setAttribute('str', undefined);
+
+      expect(Object.keys(span['_attributes']).length).toEqual(1);
+    });
+
+    it('disallows invalid attribute types', () => {
+      const span = new SentrySpan();
+
+      /** @ts-expect-error this is invalid */
+      span.setAttribute('str', {});
+
+      /** @ts-expect-error this is invalid */
+      span.setAttribute('str', null);
+
+      /** @ts-expect-error this is invalid */
+      span.setAttribute('str', [1, 'a']);
+    });
+  });
+
+  describe('setAttributes', () => {
+    it('allows to set attributes', () => {
+      const span = new SentrySpan();
+
+      const initialAttributes = span['_attributes'];
+
+      expect(initialAttributes).toEqual({
+        // origin is set by default to 'manual' in the SentrySpan constructor
+        'sentry.origin': 'manual',
+      });
+
+      const newAttributes = {
+        str: 'bar',
+        num: 1,
+        zero: 0,
+        bool: true,
+        false: false,
+        undefined: undefined,
+        numArray: [1, 2],
+        strArray: ['aa', 'bb'],
+        boolArray: [true, false],
+        arrayWithUndefined: [1, undefined, 2],
+      };
+      span.setAttributes(newAttributes);
+
+      expect(span['_attributes']).toEqual({
+        str: 'bar',
+        num: 1,
+        zero: 0,
+        bool: true,
+        false: false,
+        numArray: [1, 2],
+        strArray: ['aa', 'bb'],
+        boolArray: [true, false],
+        arrayWithUndefined: [1, undefined, 2],
+        'sentry.origin': 'manual',
+      });
+
+      expect(span['_attributes']).not.toBe(newAttributes);
+
+      span.setAttributes({
+        num: 2,
+        numArray: [3, 4],
+      });
+
+      expect(span['_attributes']).toEqual({
+        str: 'bar',
+        num: 2,
+        zero: 0,
+        bool: true,
+        false: false,
+        numArray: [3, 4],
+        strArray: ['aa', 'bb'],
+        boolArray: [true, false],
+        arrayWithUndefined: [1, undefined, 2],
+        'sentry.origin': 'manual',
+      });
+    });
+
+    it('deletes attributes when setting to `undefined`', () => {
+      const span = new SentrySpan();
+
+      span.setAttribute('str', 'bar');
+
+      // length 2 because `sentry.origin` is always set by default
+      expect(Object.keys(span['_attributes']).length).toEqual(2);
+
+      span.setAttributes({ str: undefined });
+
+      expect(Object.keys(span['_attributes']).length).toEqual(1);
+    });
+  });
+
+  describe('end', () => {
+    it('works without endTimestamp', () => {
+      const span = new SentrySpan();
+      const now = timestampInSeconds();
+      span.end();
+
+      const { start_timestamp, end_timestamp } = spanToJSON(span);
+      expect(end_timestamp).toBeGreaterThanOrEqual(start_timestamp);
+      expect(end_timestamp).toBeCloseTo(now, 2);
+    });
+
+    it('works with endTimestamp in seconds', () => {
+      const span = new SentrySpan();
+      const timestamp = timestampInSeconds() - 1;
+      span.end(timestamp);
+
+      expect(spanToStaticSpanJSON(span).timestamp).toEqual(timestamp);
+    });
+
+    it('works with endTimestamp in milliseconds', () => {
+      const span = new SentrySpan();
+      const timestamp = Date.now() - 1000;
+      span.end(timestamp);
+
+      expect(spanToStaticSpanJSON(span).timestamp).toEqual(timestamp / 1000);
+    });
+
+    it('works with endTimestamp in array form', () => {
+      const span = new SentrySpan();
+      const seconds = Math.floor(timestampInSeconds() - 1);
+      span.end([seconds, 0]);
+
+      expect(spanToStaticSpanJSON(span).timestamp).toEqual(seconds);
+    });
+
+    it('uses the `performance.now()` duration if the wall clock jumps forward while the span runs', () => {
+      vi.useFakeTimers();
+      const span = new SentrySpan();
+      const startTimestamp = spanToStaticSpanJSON(span).start_timestamp;
+
+      // The device sleeps for an hour: `Date.now()` moves on, `performance.now()` only moves by 500ms.
+      vi.setSystemTime(Date.now() + 3_600_000);
+      vi.advanceTimersByTime(500);
+      span.end();
+      vi.useRealTimers();
+
+      expect(spanToStaticSpanJSON(span).timestamp! - startTimestamp).toBeCloseTo(0.5, 1);
+    });
+
+    it('never has a negative duration if the wall clock jumps backwards while the span runs', () => {
+      vi.useFakeTimers();
+      const span = new SentrySpan();
+      const startTimestamp = spanToStaticSpanJSON(span).start_timestamp;
+
+      vi.setSystemTime(Date.now() - 60_000);
+      vi.advanceTimersByTime(500);
+      span.end();
+      vi.useRealTimers();
+
+      expect(spanToStaticSpanJSON(span).timestamp! - startTimestamp).toBeCloseTo(0.5, 1);
+    });
+
+    it('uses the current time as end if the span was started with a start time', () => {
+      const startTimestamp = timestampInSeconds() - 10;
+      const span = new SentrySpan({ startTimestamp });
+      span.end();
+
+      expect(spanToStaticSpanJSON(span).timestamp! - startTimestamp).toBeCloseTo(10, 1);
+    });
+
+    it('uses the current time as end if the start time was updated', () => {
+      const span = new SentrySpan();
+      const startTimestamp = timestampInSeconds() - 10;
+      span.updateStartTime(startTimestamp);
+      span.end();
+
+      expect(spanToStaticSpanJSON(span).timestamp! - startTimestamp).toBeCloseTo(10, 1);
+    });
+
+    it('skips if span is already ended', () => {
+      const startTimestamp = timestampInSeconds() - 5;
+      const endTimestamp = timestampInSeconds() - 1;
+      const span = new SentrySpan({ startTimestamp });
+
+      span.end(endTimestamp);
+      span.end();
+
+      expect(spanToStaticSpanJSON(span).timestamp).toBe(endTimestamp);
+    });
+  });
+
+  describe('isRecording', () => {
+    it('returns true for sampled span', () => {
+      const span = new SentrySpan({ sampled: true });
+      expect(span.isRecording()).toEqual(true);
+    });
+
+    it('returns false for sampled, finished span', () => {
+      const span = new SentrySpan({ sampled: true });
+      span.end();
+      expect(span.isRecording()).toEqual(false);
+    });
+
+    it('returns false for unsampled span', () => {
+      const span = new SentrySpan({ sampled: false });
+      expect(span.isRecording()).toEqual(false);
+    });
+  });
+
+  describe('spanContext', () => {
+    it('works with default span', () => {
+      const span = new SentrySpan();
+      expect(span.spanContext()).toEqual({
+        spanId: span['_spanId'],
+        traceId: span['_traceId'],
+        traceFlags: TRACE_FLAG_NONE,
+      });
+    });
+
+    it('works sampled span', () => {
+      const span = new SentrySpan({ sampled: true });
+      expect(span.spanContext()).toEqual({
+        spanId: span['_spanId'],
+        traceId: span['_traceId'],
+        traceFlags: TRACE_FLAG_SAMPLED,
+      });
+    });
+
+    it('works unsampled span', () => {
+      const span = new SentrySpan({ sampled: false });
+      expect(span.spanContext()).toEqual({
+        spanId: span['_spanId'],
+        traceId: span['_traceId'],
+        traceFlags: TRACE_FLAG_NONE,
+      });
+    });
+  });
+});

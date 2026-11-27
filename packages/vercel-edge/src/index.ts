@@ -1,0 +1,140 @@
+export type {
+  Breadcrumb,
+  BreadcrumbHint,
+  PolymorphicRequest,
+  RequestEventData,
+  SdkInfo,
+  Event,
+  EventHint,
+  ErrorEvent,
+  Exception,
+  FeatureFlagsIntegration,
+  Session,
+  SeverityLevel,
+  Span,
+  StackFrame,
+  Stacktrace,
+  Thread,
+  User,
+  Metric,
+} from '@sentry/core';
+
+export type { VercelEdgeOptions } from './types';
+
+export {
+  addEventProcessor,
+  addBreadcrumb,
+  addIntegration,
+  captureException,
+  captureEvent,
+  captureMessage,
+  captureFeedback,
+  close,
+  createTransport,
+  lastEventId,
+  flush,
+  getClient,
+  isInitialized,
+  isEnabled,
+  getCurrentScope,
+  getGlobalScope,
+  getIsolationScope,
+  setCurrentClient,
+  Scope,
+  SDK_VERSION,
+  setContext,
+  setExtra,
+  setExtras,
+  setTag,
+  setTags,
+  setAttribute,
+  setAttributes,
+  setUser,
+  setConversationId,
+  getSpanStatusFromHttpCode,
+  setHttpStatus,
+  withScope,
+  withIsolationScope,
+  captureCheckIn,
+  withMonitor,
+  setMeasurement,
+  getActiveSpan,
+  getRootSpan,
+  getTraceData,
+  getTraceMetaTags,
+  startSpan,
+  startInactiveSpan,
+  startSpanManual,
+  startNewTrace,
+  bindScopeToEmitter,
+  suppressTracing,
+  withActiveSpan,
+  getSpanDescendants,
+  continueTrace,
+  functionToStringIntegration,
+  eventFiltersIntegration,
+  linkedErrorsIntegration,
+  requestDataIntegration,
+  extraErrorDataIntegration,
+  dedupeIntegration,
+  rewriteFramesIntegration,
+  captureConsoleIntegration,
+  moduleMetadataIntegration,
+  supabaseIntegration,
+  instrumentSupabaseClient,
+  zodErrorsIntegration,
+  consoleIntegration,
+  // oxlint-disable-next-line typescript/no-deprecated
+  SEMANTIC_ATTRIBUTE_SENTRY_OP,
+  // oxlint-disable-next-line typescript/no-deprecated
+  SEMANTIC_ATTRIBUTE_SENTRY_ORIGIN,
+  SEMANTIC_ATTRIBUTE_SENTRY_SAMPLE_RATE,
+  spanToStaticSpanJSON,
+  spanToJSON,
+  spanToTraceHeader,
+  spanToBaggageHeader,
+  updateSpanName,
+  consoleLoggingIntegration,
+  createConsolaReporter,
+  featureFlagsIntegration,
+  growthbookIntegration,
+  logger,
+  metrics,
+  withStaticSpan,
+  // oxlint-disable-next-line typescript/no-deprecated
+  withStreamedSpan,
+  spanStreamingIntegration,
+} from '@sentry/core';
+export {
+  handleTunnelRequestIfMatched,
+  isTunnelRequest,
+  serveTunnelIntegration,
+  trpcMiddleware,
+  wrapMcpServerWithSentry,
+} from '@sentry/core/server';
+export type { TunnelRequestLike } from '@sentry/core/server';
+export { getTunnelPath, handleTunnelRequest } from '@sentry/core';
+export type { HandleTunnelRequestOptions, ServerTunnelOptions } from '@sentry/core';
+export {
+  openTelemetryIntegration,
+  getOtlpTracesEndpoint,
+  instrumentMistralAiClient,
+  instrumentTypeSafeClient,
+  instrumentOpenAiClient,
+  instrumentAnthropicAiClient,
+  instrumentGoogleGenAIClient,
+  createLangChainCallbackHandler,
+  instrumentLangChainEmbeddings,
+  instrumentStateGraph,
+  instrumentCreateReactAgent,
+} from '@sentry/server-utils/no-diagnostic-channels';
+
+export { VercelEdgeClient } from './client';
+export { getDefaultIntegrations, init } from './sdk';
+
+export { winterCGFetchIntegration } from './integrations/wintercg-fetch';
+export type { FetchIntegrationOptions } from '@sentry/core';
+
+// vercelAIIntegration and prismaIntegration require diagnostics channels, unavailable on Vercel Edge.
+// Cloudflare's httpServerIntegration is consumed by its request wrapper, which Vercel Edge does not use.
+// The fetch-based spotlightIntegration lives in the Cloudflare package, not a shared entry point.

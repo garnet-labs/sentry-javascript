@@ -1,0 +1,45 @@
+{
+  "name": "nestjs-12",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "nest build",
+    "start": "node --import ./dist/instrument.js dist/main.js",
+    "start:dev": "nest start --watch",
+    "start:debug": "nest start --debug --watch",
+    "start:prod": "node dist/main",
+    "clean": "npx rimraf node_modules pnpm-lock.yaml",
+    "test": "playwright test",
+    "test:build": "pnpm install && pnpm build",
+    "test:build-latest": "pnpm install && pnpm add @nestjs/common@latest @nestjs/core@latest @nestjs/platform-express@latest @nestjs/microservices@latest && pnpm add -D @nestjs/cli@latest && pnpm build",
+    "test:assert": "pnpm test"
+  },
+  "dependencies": {
+    "@nestjs/common": "^12.0.0",
+    "@nestjs/core": "^12.0.0",
+    "@nestjs/microservices": "^12.0.0",
+    "@nestjs/schedule": "^12.0.0",
+    "@nestjs/platform-express": "^12.0.0",
+    "@sentry/nestjs": "file:../../packed/sentry-nestjs-packed.tgz",
+    "reflect-metadata": "^0.2.0",
+    "rxjs": "^7.8.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.64.1",
+    "@sentry-internal/test-utils": "file:../../packed/sentry-internal-test-utils-packed.tgz",
+    "@nestjs/cli": "^12.0.0",
+    "@nestjs/schematics": "^12.0.0",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.0.0",
+    "typescript": "~5.9.0"
+  },
+  "sentryTest": {
+    "optionalVariants": [
+      {
+        "build-command": "pnpm test:build-latest",
+        "label": "nestjs-12 (latest)"
+      }
+    ]
+  }
+}

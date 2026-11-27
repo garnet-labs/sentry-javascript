@@ -1,0 +1,124 @@
+import {
+  RPC_METHOD,
+  RPC_SYSTEM_NAME,
+  SENTRY_OP,
+  SENTRY_SEGMENT_NAME_SOURCE,
+  TRPC_PROCEDURE_PATH,
+  TRPC_PROCEDURE_TYPE,
+  SENTRY_ORIGIN,
+} from '@sentry/conventions/attributes';
+import { RPC } from '@sentry/conventions/op';
+import { getClient, withIsolationScope } from './currentScopes';
+import { captureException } from './exports';
+import { startSpanManual } from './tracing/trace';
+import { normalize } from './utils/normalize';
+import { setNormalizationDepthOverrideHint } from './utils/normalizationHints';
+
+interface SentryTrpcMiddlewareOptions {
+  /** Whether to include procedure inputs in reported events. Defaults to `false`. */
+  attachRpcInput?: boolean;
+  forceTransaction?: boolean;
+}
+
+export interface SentryTrpcMiddlewareArguments<T> {
+  path?: unknown;
+  type?: unknown;
+  next: () => T;
+  rawInput?: unknown;
+  getRawInput?: () => Promise<unknown>;
+}
+
+const trpcCaptureContext = { mechanism: { handled: false, type: 'auto.rpc.trpc.middleware' } };
+
+function captureIfError(nextResult: unknown): void {
+  // TODO: Set span status based on what TRPCError was encountered
+  if (
+    typeof nextResult === 'object' &&
+    nextResult !== null &&
+    'ok' in nextResult &&
+    !nextResult.ok &&
+    'error' in nextResult
+  ) {
+    captureException(nextResult.error, trpcCaptureContext);
+  }
+}
+
+type SentryTrpcMiddleware<T> = T extends Promise<unknown> ? T : Promise<T>;
+
+/**
+ * Sentry tRPC middleware that captures errors and creates spans for tRPC procedures.
+ */
+export function trpcMiddleware(options: SentryTrpcMiddlewareOptions = {}) {
+  // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+  // @ts-ignore
+  return async function <T>(opts: SentryTrpcMiddlewareArguments<T>): SentryTrpcMiddleware<T> {
+    const { path, type, next, rawInput, getRawInput } = opts;
+
+    const client = getClient();
+    const clientOptions = client?.getOptions();
+    const dataCollection = client?.getDataCollectionOptions();
+
+    const trpcContext: Record<string, unknown> = {
+      procedure_path: path,
+      procedure_type: type,
+    };
+
+    setNormalizationDepthOverrideHint(
+      trpcContext,
+      1 + // 1 for context.input + the normal normalization depth
+        (clientOptions?.normalizeDepth ?? 5), // 5 is a sane depth
+    );
+
+    if (
+      options.attachRpcInput !== undefined
+        ? options.attachRpcInput
+        : dataCollection?.httpBodies.includes('incomingRequest')
+    ) {
+      if (rawInput !== undefined) {
+        trpcContext.input = normalize(rawInput);
+      }
+
+      if (getRawInput !== undefined && typeof getRawInput === 'function') {
+        try {
+          const rawRes = await getRawInput();
+
+          trpcContext.input = normalize(rawRes);
+        } catch {
+          // noop
+        }
+      }
+    }
+
+    return withIsolationScope(scope => {
+      scope.setContext('trpc', trpcContext);
+      return startSpanManual(
+        {
+          name: `trpc/${path}`,
+          attributes: {
+            [SENTRY_OP]: RPC,
+            [SENTRY_SEGMENT_NAME_SOURCE]: 'route',
+            [SENTRY_ORIGIN]: 'auto.rpc.trpc',
+            [RPC_SYSTEM_NAME]: 'trpc',
+            [RPC_METHOD]: String(path),
+            [TRPC_PROCEDURE_PATH]: String(path),
+            [TRPC_PROCEDURE_TYPE]: String(type),
+          },
+          // oxlint-disable-next-line typescript/no-deprecated
+          forceTransaction: !!options.forceTransaction,
+        },
+        async span => {
+          try {
+            const nextResult = await next();
+            captureIfError(nextResult);
+            span.end();
+            return nextResult;
+          } catch (e) {
+            captureException(e, trpcCaptureContext);
+            span.end();
+            throw e;
+          }
+        },
+      ) as SentryTrpcMiddleware<T>;
+    });
+  };
+}

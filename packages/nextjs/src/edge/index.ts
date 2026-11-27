@@ -1,0 +1,246 @@
+// import/export got a false positive, and affects most of our index barrel files
+// can be removed once following issue is fixed: https://github.com/import-js/eslint-plugin-import/issues/703
+/* eslint-disable import/export */
+import {
+  applySdkMetadata,
+  debug,
+  getGlobalScope,
+  getIsolationScope,
+  getRootSpan,
+  GLOBAL_OBJ,
+  hasSpanStreamingEnabled,
+  HTTP_SPAN_NAME_FALLBACK,
+  registerSpanErrorInstrumentation,
+  spanToJSON,
+} from '@sentry/core';
+import type { VercelEdgeOptions } from '@sentry/vercel-edge';
+import { getDefaultIntegrations, init as vercelEdgeInit } from '@sentry/vercel-edge';
+import { DEBUG_BUILD } from '../common/debug-build';
+import { ATTR_NEXT_SPAN_NAME, ATTR_NEXT_SPAN_TYPE } from '../common/nextSpanAttributes';
+import {
+  ATTR_NEXT_PAGES_API_ROUTE_TYPE,
+  TRANSACTION_ATTR_SHOULD_DROP_TRANSACTION,
+} from '../common/span-attributes-with-logic-attached';
+import { addHeadersAsAttributes } from '../common/utils/addHeadersAsAttributes';
+import { backfillHttpResponseStatusCode } from '../common/utils/backfillHttpResponseStatusCode';
+import { backfillHttpServerStatus } from '../common/utils/backfillHttpServerStatus';
+import { createLiveRootSpanAdapter } from '../common/utils/liveRootSpanAdapter';
+import { dropMiddlewareTunnelRequests, getTunnelRouteIgnoreSpans } from '../common/utils/dropMiddlewareTunnelRequests';
+import { maybeForkIsolationScopeForRootSpan } from '../common/utils/forkIsolationScopeForRootSpan';
+import { getNormalizedRequestFromAttributes } from '../common/utils/getNormalizedRequestFromAttributes';
+import { isBuild } from '../common/utils/isBuild';
+import {
+  flushSafelyWithTimeout,
+  isAsyncContextOwnedByCloudflare,
+  isCloudflareWaitUntilAvailable,
+  setCloudflareWorkerRelease,
+  waitUntil,
+} from '../common/utils/responseEnd';
+import { setUrlProcessingMetadata } from '../common/utils/setUrlProcessingMetadata';
+import { distDirRewriteFramesIntegration } from './distDirRewriteFramesIntegration';
+import { enhanceMiddlewareRootSpan } from '../common/enhanceMiddlewareRootSpan';
+import { enhanceRunHandlerRootSpan } from './enhanceRunHandlerRootSpan';
+import {
+  HTTP_METHOD,
+  HTTP_REQUEST_METHOD,
+  SENTRY_KIND,
+  SENTRY_OP,
+  SENTRY_SEGMENT_NAME_SOURCE,
+  SENTRY_ORIGIN,
+} from '@sentry/conventions/attributes';
+import { HTTP_SERVER, MIDDLEWARE } from '@sentry/conventions/op';
+
+export * from '@sentry/vercel-edge';
+export * from '../common';
+export { captureUnderscoreErrorException } from '../common/pages-router-instrumentation/_error';
+
+export { pinoIntegration } from '../common/pinoIntegrationShim';
+export { vercelAIIntegration } from '../common/vercelAIIntegrationShim';
+
+// Override core span methods with Next.js-specific implementations that support Cache Components
+export { startSpan, startSpanManual, startInactiveSpan } from '../common/utils/nextSpan';
+export { wrapApiHandlerWithSentry } from './wrapApiHandlerWithSentry';
+
+export type EdgeOptions = VercelEdgeOptions;
+
+const globalWithInjectedValues = GLOBAL_OBJ as typeof GLOBAL_OBJ & {
+  _sentryRewriteFramesDistDir?: string;
+  _sentryRelease?: string;
+  _sentryRewritesTunnelPath?: string;
+};
+
+/** Inits the Sentry NextJS SDK on the Edge Runtime. */
+export function init(options: VercelEdgeOptions = {}): void {
+  registerSpanErrorInstrumentation();
+
+  if (isBuild()) {
+    return;
+  }
+
+  if (!DEBUG_BUILD && options.debug) {
+    // TODO(v12): Remove the `webpack.treeshake` mention together with that option
+    // eslint-disable-next-line no-console
+    console.warn(
+      '[@sentry/nextjs] You have enabled `debug: true`, but Sentry debug logging was removed from your bundle (likely via `bundleSizeOptimizations.excludeDebugStatements: true` or `webpack.treeshake.removeDebugLogging: true`). Set that option to `false` to see Sentry debug output.',
+    );
+  }
+
+  const customDefaultIntegrations = getDefaultIntegrations();
+
+  // This value is injected at build time, based on the output directory specified in the build config. Though a default
+  // is set there, we set it here as well, just in case something has gone wrong with the injection.
+  const distDirName = process.env._sentryRewriteFramesDistDir || globalWithInjectedValues._sentryRewriteFramesDistDir;
+
+  if (distDirName) {
+    customDefaultIntegrations.push(distDirRewriteFramesIntegration({ distDirName }));
+  }
+
+  // Detect if running on OpenNext/Cloudflare
+  const isRunningOnCloudflare = isCloudflareWaitUntilAvailable();
+
+  const opts: VercelEdgeOptions = {
+    defaultIntegrations: customDefaultIntegrations,
+    environment: options.environment || process.env.SENTRY_ENVIRONMENT,
+    release: process.env._sentryRelease || globalWithInjectedValues._sentryRelease,
+    ...options,
+    // Override runtime to 'cloudflare' when running on OpenNext/Cloudflare
+    ...(isRunningOnCloudflare && { runtime: { name: 'cloudflare' } }),
+  };
+
+  const nextjsIgnoreSpans: NonNullable<VercelEdgeOptions['ignoreSpans']> = [
+    // (set in `dropMiddlewareTunnelRequests` during `spanStart`)
+    { attributes: { [TRANSACTION_ATTR_SHOULD_DROP_TRANSACTION]: true } },
+    ...getTunnelRouteIgnoreSpans(),
+  ];
+  opts.ignoreSpans = [...(opts.ignoreSpans || []), ...nextjsIgnoreSpans];
+
+  // Before the Cloudflare check, so that the events of the client of `withSentry` get the tag too.
+  try {
+    // @ts-expect-error `process.turbopack` is a magic string that will be replaced by Next.js
+    if (process.turbopack) {
+      getGlobalScope().setTag('turbopack', true);
+      getGlobalScope().setAttribute('turbopack', true);
+    }
+  } catch {
+    // Noop
+    // The statement above can throw because process is not defined on the client
+  }
+
+  if (isAsyncContextOwnedByCloudflare()) {
+    setCloudflareWorkerRelease(opts.release);
+    DEBUG_BUILD &&
+      debug.log(
+        'The client of `withSentry` handles this Worker, so `init` creates no client and only applies `release`. Set the other options in `withSentry`.',
+      );
+    return;
+  }
+
+  // Use appropriate SDK metadata based on the runtime environment
+  if (isRunningOnCloudflare) {
+    applySdkMetadata(opts, 'nextjs', ['nextjs', 'cloudflare']);
+  } else {
+    applySdkMetadata(opts, 'nextjs', ['nextjs', 'vercel-edge']);
+  }
+
+  const client = vercelEdgeInit(opts);
+
+  // Next.js's OTel instrumentation samples root spans before the Sentry middleware wrapper can set
+  // `normalizedRequest` on the isolation scope. Seed it from span attributes so `tracesSampler` has access.
+  client.on('beforeSampling', ({ spanAttributes }) => {
+    const spanType = spanAttributes[ATTR_NEXT_SPAN_TYPE];
+    if (spanType !== 'Middleware.execute' && spanType !== 'BaseServer.handleRequest' && spanType !== 'Next.request') {
+      return;
+    }
+
+    // Clear the key before writing: `setSDKProcessingMetadata` merges into nested objects, so a partial request
+    // (or none at all) would otherwise keep stale fields (e.g. `query_string`) left on the (potentially shared)
+    // isolation scope by a previous request on a warm worker.
+    const isolationScope = getIsolationScope();
+    isolationScope.setSDKProcessingMetadata({ normalizedRequest: undefined });
+
+    const normalizedRequest = getNormalizedRequestFromAttributes(spanAttributes);
+    if (normalizedRequest) {
+      isolationScope.setSDKProcessingMetadata({ normalizedRequest });
+    }
+  });
+
+  client.on('spanStart', span => {
+    const spanAttributes = spanToJSON(span).attributes;
+    const rootSpan = getRootSpan(span);
+    const isRootSpan = span === rootSpan;
+
+    dropMiddlewareTunnelRequests(span, spanAttributes);
+
+    // Next.js names the incoming-request span after the raw URL. With span streaming, span names have to
+    // be low cardinality, so we replace it here at span start; the `next.route` hoisting below renames it
+    // to `${method} ${route}` once Next.js reports a route.
+    if (
+      isRootSpan &&
+      spanAttributes?.[ATTR_NEXT_SPAN_TYPE] === 'BaseServer.handleRequest' &&
+      hasSpanStreamingEnabled(client)
+    ) {
+      // oxlint-disable-next-line typescript/no-deprecated
+      const method = spanAttributes[HTTP_REQUEST_METHOD] ?? spanAttributes[HTTP_METHOD];
+      createLiveRootSpanAdapter(span).setName(
+        (typeof method === 'string' ? method.toUpperCase() : '') || HTTP_SPAN_NAME_FALLBACK,
+      );
+    }
+
+    // Mark all spans generated by Next.js as 'auto' & server
+    if (spanAttributes?.[ATTR_NEXT_SPAN_TYPE] !== undefined) {
+      span.setAttribute(SENTRY_ORIGIN, 'auto');
+      span.setAttribute(SENTRY_KIND, 'server');
+    }
+
+    // Make sure middleware spans get the right op
+    if (spanAttributes?.[ATTR_NEXT_SPAN_TYPE] === 'Middleware.execute') {
+      span.setAttribute(SENTRY_OP, MIDDLEWARE);
+      span.setAttribute(SENTRY_SEGMENT_NAME_SOURCE, 'url');
+    }
+
+    // Backfill op and source for pages-router API routes: we no longer create this span in the wrapper,
+    // so we rely on the Next.js `Node.runHandler` span becoming the transaction.
+    if (
+      spanAttributes?.[ATTR_NEXT_SPAN_TYPE] === 'Node.runHandler' &&
+      String(spanAttributes?.[ATTR_NEXT_SPAN_NAME]).startsWith(ATTR_NEXT_PAGES_API_ROUTE_TYPE)
+    ) {
+      span.setAttribute(SENTRY_OP, HTTP_SERVER);
+      span.setAttribute(SENTRY_SEGMENT_NAME_SOURCE, 'route');
+    }
+
+    // The `BaseServer.handleRequest` span is the incoming request root span (e.g. for app-router server
+    // components). Since we no longer infer the op from OTel semantic attributes, set it directly here.
+    if (spanAttributes?.[ATTR_NEXT_SPAN_TYPE] === 'BaseServer.handleRequest') {
+      span.setAttribute(SENTRY_OP, HTTP_SERVER);
+    }
+
+    // We want to fork the isolation scope for incoming requests
+    maybeForkIsolationScopeForRootSpan(span, spanAttributes);
+
+    if (isRootSpan) {
+      // todo: check if we can set request headers for edge on sdkProcessingMetadata
+      const headers = getIsolationScope().getScopeData().sdkProcessingMetadata?.normalizedRequest?.headers;
+      addHeadersAsAttributes(headers, rootSpan);
+    }
+  });
+
+  client.on('preprocessEvent', event => {
+    setUrlProcessingMetadata(event);
+  });
+
+  client.on('spanEnd', span => {
+    if (span !== getRootSpan(span)) {
+      return;
+    }
+
+    // Normalize name/op/source/status on the request root span at span end, before it is serialized into
+    // a transaction event (legacy) or streamed span JSON, so both lifecycles pick up the changes here.
+    const mutableRootSpan = createLiveRootSpanAdapter(span);
+    enhanceMiddlewareRootSpan(mutableRootSpan);
+    enhanceRunHandlerRootSpan(mutableRootSpan);
+    backfillHttpResponseStatusCode(mutableRootSpan.attributes);
+    backfillHttpServerStatus(span);
+
+    waitUntil(flushSafelyWithTimeout());
+  });
+}

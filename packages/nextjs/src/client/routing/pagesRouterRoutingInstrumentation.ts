@@ -1,0 +1,178 @@
+import type { Client } from '@sentry/core';
+import { debug, hasSpanStreamingEnabled, PAGELOAD_SPAN_NAME_FALLBACK, parseBaggageHeader } from '@sentry/core';
+import { startBrowserTracingPageLoadSpan, WINDOW } from '@sentry/react';
+import type { NEXT_DATA } from 'next/dist/shared/lib/utils';
+import type { ParsedUrlQuery } from 'querystring';
+import { DEBUG_BUILD } from '../../common/debug-build';
+import { SENTRY_OP, SENTRY_SEGMENT_NAME_SOURCE, URL_TEMPLATE, SENTRY_ORIGIN } from '@sentry/conventions/attributes';
+import { PAGELOAD } from '@sentry/conventions/op';
+
+const globalObject = WINDOW;
+
+/**
+ * Describes data located in the __NEXT_DATA__ script tag. This tag is present on every page of a Next.js app.
+ */
+interface SentryEnhancedNextData extends NEXT_DATA {
+  props: {
+    pageProps?: {
+      _sentryTraceData?: string; // trace parent info, if injected by a data-fetcher
+      _sentryBaggage?: string; // baggage, if injected by a data-fetcher
+      // These two values are only injected by `getStaticProps` in a very special case with the following conditions:
+      // 1. The page's `getStaticPaths` method must have returned `fallback: 'blocking'`.
+      // 2. The requested page must be a "miss" in terms of "Incremental Static Regeneration", meaning the requested page has not been generated before.
+      // In this case, a page is requested and only served when `getStaticProps` is done. There is not even a fallback page or similar.
+    };
+  };
+}
+
+interface NextDataTagInfo {
+  route?: string;
+  params?: ParsedUrlQuery;
+  sentryTrace?: string;
+  baggage?: string;
+}
+
+/**
+ * Every Next.js page (static and dynamic ones) comes with a script tag with the id "__NEXT_DATA__". This script tag
+ * contains a JSON object with data that was either generated at build time for static pages (`getStaticProps`), or at
+ * runtime with data fetchers like `getServerSideProps.`.
+ *
+ * We can use this information to:
+ * - Always get the parameterized route we're in when loading a page.
+ * - Send trace information (trace-id, baggage) from the server to the client.
+ *
+ * This function extracts this information.
+ */
+function extractNextDataTagInformation(): NextDataTagInfo {
+  let nextData: SentryEnhancedNextData | undefined;
+  // Let's be on the safe side and actually check first if there is really a __NEXT_DATA__ script tag on the page.
+  // Theoretically this should always be the case though.
+  const nextDataTag = globalObject.document.getElementById('__NEXT_DATA__');
+  if (nextDataTag?.innerHTML) {
+    try {
+      nextData = JSON.parse(nextDataTag.innerHTML);
+    } catch {
+      DEBUG_BUILD && debug.warn('Could not extract __NEXT_DATA__');
+    }
+  }
+
+  if (!nextData) {
+    return {};
+  }
+
+  const nextDataTagInfo: NextDataTagInfo = {};
+
+  const { page, query, props } = nextData;
+
+  // `nextData.page` always contains the parameterized route - except for when an error occurs in a data fetching
+  // function, then it is "/_error", but that isn't a problem since users know which route threw by looking at the
+  // parent transaction
+  // TODO: Actually this is a problem (even though it is not that big), because the DSC and the transaction payload will contain
+  // a different transaction name. Maybe we can fix this. Idea: Also send transaction name via pageProps when available.
+  nextDataTagInfo.route = page;
+  nextDataTagInfo.params = query;
+
+  if (props?.pageProps) {
+    nextDataTagInfo.sentryTrace = props.pageProps._sentryTraceData;
+    nextDataTagInfo.baggage = props.pageProps._sentryBaggage;
+  }
+
+  return nextDataTagInfo;
+}
+
+/**
+ * Instruments the Next.js pages router for pageloads.
+ * Only supported for client side routing. Works for Next >= 10.
+ *
+ * Leverages the SingletonRouter from the `next/router` to
+ * generate pageload/navigation transactions and parameterize
+ * transaction names.
+ */
+export function pagesRouterInstrumentPageLoad(client: Client): void {
+  const { route, params, sentryTrace, baggage } = extractNextDataTagInformation();
+  const parsedBaggage = parseBaggageHeader(baggage);
+  // With span streaming, span names have to be low cardinality, so we can't fall back to the URL.
+  let name = route || (hasSpanStreamingEnabled(client) ? PAGELOAD_SPAN_NAME_FALLBACK : globalObject.location.pathname);
+
+  // /_error is the fallback page for all errors. If there is a transaction name for /_error, use that instead
+  if (parsedBaggage?.['sentry-transaction'] && name === '/_error') {
+    name = parsedBaggage['sentry-transaction'];
+    // Strip any HTTP method from the span name
+    name = name.replace(/^(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|TRACE|CONNECT)\s+/i, '');
+  }
+
+  startBrowserTracingPageLoadSpan(
+    client,
+    {
+      name,
+      attributes: {
+        [SENTRY_OP]: PAGELOAD,
+        [SENTRY_ORIGIN]: 'auto.pageload.nextjs.pages_router_instrumentation',
+        [SENTRY_SEGMENT_NAME_SOURCE]: route ? 'route' : 'url',
+        [URL_TEMPLATE]: route,
+        ...(params && { ...params }),
+      },
+    },
+    { sentryTrace, baggage },
+  );
+}
+
+/**
+ * Matches a pathname against the Pages Router build manifest, e.g. `/users/1` -> `/users/[id]`.
+ *
+ * Expects a pathname without `basePath`, which is what Next reports internally.
+ */
+export function getNextRouteFromPathname(pathname: string): string | undefined {
+  const pageRoutes = globalObject.__BUILD_MANIFEST?.sortedPages;
+
+  // Page route should in 99.999% of the cases be defined by now but just to be sure we make a check here
+  if (!pageRoutes) {
+    return;
+  }
+
+  return pageRoutes.find(route => {
+    const routeRegExp = convertNextRouteToRegExp(route);
+    return pathname.match(routeRegExp);
+  });
+}
+
+/**
+ * Converts a Next.js style route to a regular expression that matches on pathnames (no query params or URL fragments).
+ *
+ * In general this involves replacing any instances of square brackets in a route with a wildcard:
+ * e.g. "/users/[id]/info" becomes /\/users\/([^/]+?)\/info/
+ *
+ * Some additional edgecases need to be considered:
+ * - All routes have an optional slash at the end, meaning users can navigate to "/users/[id]/info" or
+ *   "/users/[id]/info/" - both will be resolved to "/users/[id]/info".
+ * - Non-optional "catchall"s at the end of a route must be considered when matching (e.g. "/users/[...params]").
+ * - Optional "catchall"s at the end of a route must be considered when matching (e.g. "/users/[[...params]]").
+ *
+ * @param route A Next.js style route as it is found in `global.__BUILD_MANIFEST.sortedPages`
+ */
+function convertNextRouteToRegExp(route: string): RegExp {
+  // We can assume a route is at least "/".
+  const routeParts = route.split('/');
+
+  let optionalCatchallWildcardRegex = '';
+  if (routeParts[routeParts.length - 1]?.match(/^\[\[\.\.\..+\]\]$/)) {
+    // If last route part has pattern "[[...xyz]]" we pop the latest route part to get rid of the required trailing
+    // slash that would come before it if we didn't pop it.
+    routeParts.pop();
+    optionalCatchallWildcardRegex = '(?:/(.+?))?';
+  }
+
+  const rejoinedRouteParts = routeParts
+    .map(
+      routePart =>
+        routePart
+          .replace(/^\[\.\.\..+\]$/, '(.+?)') // Replace catch all wildcard with regex wildcard
+          .replace(/^\[.*\]$/, '([^/]+?)'), // Replace route wildcards with lazy regex wildcards
+    )
+    .join('/');
+
+  // oxlint-disable-next-line sdk/no-regexp-constructor -- routeParts are from the build manifest, so no raw user input
+  return new RegExp(
+    `^${rejoinedRouteParts}${optionalCatchallWildcardRegex}(?:/)?$`, // optional slash at the end
+  );
+}

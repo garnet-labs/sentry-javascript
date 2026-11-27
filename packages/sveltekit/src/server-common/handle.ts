@@ -1,0 +1,350 @@
+import type { Span } from '@sentry/core';
+import {
+  continueTrace,
+  debug,
+  getClient,
+  getCurrentScope,
+  getDefaultIsolationScope,
+  getIsolationScope,
+  getTraceMetaTags,
+  hasSpanStreamingEnabled,
+  httpHeadersToSpanAttributes,
+  HTTP_SPAN_NAME_FALLBACK,
+  setHttpStatus,
+  spanToJSON,
+  startSpan,
+  updateSpanName,
+  winterCGHeadersToDict,
+  winterCGRequestToRequestData,
+  withIsolationScope,
+  filterCollectedUrl,
+} from '@sentry/core';
+import {
+  flushIfServerless,
+  _INTERNAL_handleServedTunnelRequest as handleServedTunnelRequest,
+  _INTERNAL_setTunnelDefaults as setTunnelDefaults,
+} from '@sentry/core/server';
+import { getTunnelBasePath } from '../common/tunnel';
+import type { Handle, ResolveOptions } from './handleTypes';
+import { DEBUG_BUILD } from '../common/debug-build';
+import { getTracePropagationData, sendErrorToSentry } from './utils';
+import {
+  HTTP_REQUEST_METHOD,
+  HTTP_ROUTE,
+  SENTRY_OP,
+  SENTRY_SEGMENT_NAME_SOURCE,
+  URL_FULL,
+  URL_PATH,
+  SENTRY_ORIGIN,
+  SVELTEKIT_TRACING_ORIGINAL_NAME,
+} from '@sentry/conventions/attributes';
+import { HTTP_SERVER } from '@sentry/conventions/op';
+
+export type SentryHandleOptions = {
+  /**
+   * Controls whether the SDK should capture errors and traces in requests that don't belong to a
+   * route defined in your SvelteKit application.
+   *
+   * By default, this option is set to `false` to reduce noise (e.g. bots sending random requests to your server).
+   *
+   * Set this option to `true` if you want to monitor requests events without a route. This might be useful in certain
+   * scenarios, for instance if you registered other handlers that handle these requests.
+   * If you set this option, you might want adjust the the transaction name in the `beforeSendTransaction`
+   * callback of your server-side `Sentry.init` options. You can also use `beforeSendTransaction` to filter out
+   * transactions that you still don't want to be sent to Sentry.
+   *
+   * @default false
+   */
+  handleUnknownRoutes?: boolean;
+
+  /**
+   * Controls if `sentryHandle` should inject a script tag into the page that enables instrumentation
+   * of `fetch` calls in `load` functions.
+   *
+   * @default true
+   */
+  injectFetchProxyScript?: boolean;
+};
+
+export const FETCH_PROXY_SCRIPT = `
+    const f = window.fetch;
+    if(f){
+      window._sentryFetchProxy = function(...a){return f(...a)}
+      window.fetch = function(...a){return window._sentryFetchProxy(...a)}
+    }
+`;
+/**
+ * Adds Sentry tracing <meta> tags to the returned html page.
+ * Adds Sentry fetch proxy script to the returned html page if enabled in options.
+ *
+ * Exported only for testing
+ */
+export function addSentryCodeToPage(options: {
+  injectFetchProxyScript: boolean;
+}): NonNullable<ResolveOptions['transformPageChunk']> {
+  return ({ html }) => {
+    const metaTags = isSvelteKitBuilding() ? '' : getTraceMetaTags();
+    const headWithMetaTags = metaTags ? `<head>\n${metaTags}` : '<head>';
+
+    const headWithFetchScript = options.injectFetchProxyScript ? `\n<script>${FETCH_PROXY_SCRIPT}</script>` : '';
+
+    const modifiedHead = `${headWithMetaTags}${headWithFetchScript}`;
+
+    return html.replace('<head>', modifiedHead);
+  };
+}
+
+/**
+ * Prerendered pages would bake one trace id and sampling decision into the HTML for every visitor.
+ *
+ * `building` from `$app/environment` isn't available here (the SDK is loaded from node_modules at
+ * runtime), so we rely on `_SENTRY_SVELTEKIT_BUILDING`, which our Vite plugin sets during `vite build`
+ * and SvelteKit copies into the worker it prerenders in.
+ */
+function isSvelteKitBuilding(): boolean {
+  // `process` doesn't exist in every runtime (e.g. Cloudflare Workers without `nodejs_compat`)
+  const env = typeof process !== 'undefined' && typeof process.env === 'object' ? process.env : undefined;
+  return !!env?._SENTRY_SVELTEKIT_BUILDING;
+}
+
+/**
+ * We only need to inject the fetch proxy script for SvelteKit versions < 2.16.0.
+ * Exported only for testing.
+ */
+export function isFetchProxyRequired(version: string): boolean {
+  try {
+    const [major, minor] = version.trim().replace(/-.*/, '').split('.').map(Number);
+    if (major != null && minor != null && (major > 2 || (major === 2 && minor >= 16))) {
+      return false;
+    }
+  } catch {
+    // ignore
+  }
+  return true;
+}
+
+interface BackwardsForwardsCompatibleEvent {
+  /**
+   * For now taken from: https://github.com/sveltejs/kit/pull/13899
+   * Access to spans for tracing. If tracing is not enabled or the function is being run in the browser, these spans will do nothing.
+   * @since 2.31.0
+   */
+  tracing?: {
+    /** Whether tracing is enabled. */
+    enabled: boolean;
+    current: Span;
+    root: Span;
+  };
+}
+
+async function instrumentHandle(
+  {
+    event,
+    resolve,
+  }: {
+    event: Parameters<Handle>[0]['event'] & BackwardsForwardsCompatibleEvent;
+    resolve: Parameters<Handle>[0]['resolve'];
+  },
+  options: SentryHandleOptions,
+): Promise<Response> {
+  const routeId = event.route?.id;
+
+  if (!routeId && !options.handleUnknownRoutes) {
+    return resolve(event);
+  }
+
+  // caching the result of the version check in `options.injectFetchProxyScript`
+  // to avoid doing the dynamic import on every request
+  if (options.injectFetchProxyScript == null) {
+    try {
+      const { VERSION } = await import('@sveltejs/kit');
+      options.injectFetchProxyScript = isFetchProxyRequired(VERSION);
+    } catch {
+      options.injectFetchProxyScript = true;
+    }
+  }
+
+  const routeName = `${event.request.method} ${routeId || event.url.pathname}`;
+
+  if (getIsolationScope() !== getDefaultIsolationScope()) {
+    getIsolationScope().setTransactionName(routeName);
+  } else {
+    DEBUG_BUILD && debug.warn('Isolation scope is default isolation scope - skipping setting transactionName');
+  }
+
+  // We only start a span if SvelteKit's native tracing is not enabled. Two reasons:
+  // - Used Kit version doesn't yet support tracing
+  // - Users didn't enable tracing
+  const kitTracingEnabled = event.tracing?.enabled;
+  const client = getClient();
+  const dataCollectionOptions = client?.getDataCollectionOptions();
+
+  try {
+    const resolveWithSentry: (sentrySpan?: Span) => Promise<Response> = async (sentrySpan?: Span) => {
+      getCurrentScope().setSDKProcessingMetadata({
+        // We specifically avoid cloning the request here to avoid double read errors.
+        // We only read request headers so we're not consuming the body anyway.
+        // Note to future readers: This sounds counter-intuitive but please read
+        // https://github.com/getsentry/sentry-javascript/issues/14583
+        normalizedRequest: winterCGRequestToRequestData(event.request),
+      });
+      const kitRootSpan = event.tracing?.enabled ? event.tracing?.root : undefined;
+
+      if (kitRootSpan) {
+        // Update the root span emitted from SvelteKit to resemble a `http.server` span
+        // We're doing this here instead of an event processor to ensure we update the
+        // span name as early as possible (for dynamic sampling, et al.)
+        // Other spans are enhanced in the `processKitSpans` integration.
+        const spanJson = spanToJSON(kitRootSpan);
+        const kitRootSpanAttributes = spanJson.attributes;
+        const originalName = spanJson.name;
+
+        const kitRoute = kitRootSpanAttributes[HTTP_ROUTE] as string | undefined;
+        const routeName = typeof kitRoute === 'string' ? kitRoute : routeId;
+        if (routeName && typeof routeName === 'string') {
+          updateSpanName(kitRootSpan, `${event.request.method ?? 'GET'} ${routeName}`);
+        } else if (client && hasSpanStreamingEnabled(client)) {
+          // Without a route, SvelteKit's own span name holds the raw URL, which is too high
+          // cardinality to stream.
+          updateSpanName(kitRootSpan, event.request.method?.toUpperCase() || HTTP_SPAN_NAME_FALLBACK);
+        }
+
+        kitRootSpan.setAttributes({
+          [SENTRY_OP]: HTTP_SERVER,
+          [SENTRY_ORIGIN]: 'auto.http.sveltekit',
+          [SENTRY_SEGMENT_NAME_SOURCE]: routeName ? 'route' : 'url',
+          [SVELTEKIT_TRACING_ORIGINAL_NAME]: originalName,
+          [URL_FULL]: kitRootSpanAttributes[URL_FULL] ?? filterCollectedUrl(event.url.href),
+          [URL_PATH]: kitRootSpanAttributes[URL_PATH] ?? event.url.pathname,
+          ...(routeName && {
+            [HTTP_ROUTE]: routeName,
+          }),
+          ...(dataCollectionOptions
+            ? httpHeadersToSpanAttributes(winterCGHeadersToDict(event.request.headers), dataCollectionOptions)
+            : {}),
+        });
+      }
+
+      const res = await resolve(event, {
+        transformPageChunk: addSentryCodeToPage({
+          injectFetchProxyScript: options.injectFetchProxyScript ?? true,
+        }),
+      });
+
+      if (sentrySpan) {
+        setHttpStatus(sentrySpan, res.status);
+      }
+
+      return res;
+    };
+
+    const resolveResult = kitTracingEnabled
+      ? await resolveWithSentry()
+      : await startSpan(
+          {
+            attributes: {
+              [SENTRY_OP]: HTTP_SERVER,
+              [SENTRY_ORIGIN]: 'auto.http.sveltekit',
+              [SENTRY_SEGMENT_NAME_SOURCE]: routeId ? 'route' : 'url',
+              [HTTP_REQUEST_METHOD]: event.request.method,
+              [URL_FULL]: filterCollectedUrl(event.url.href),
+              [URL_PATH]: event.url.pathname,
+              ...(routeId && {
+                [HTTP_ROUTE]: routeId,
+              }),
+              ...(dataCollectionOptions
+                ? httpHeadersToSpanAttributes(winterCGHeadersToDict(event.request.headers), dataCollectionOptions)
+                : {}),
+            },
+            // With span streaming, span names have to be low cardinality, so we can't fall back to the URL path.
+            name:
+              routeId || !client || !hasSpanStreamingEnabled(client)
+                ? routeName
+                : event.request.method?.toUpperCase() || HTTP_SPAN_NAME_FALLBACK,
+          },
+          resolveWithSentry,
+        );
+
+    return resolveResult;
+  } catch (e: unknown) {
+    sendErrorToSentry(e, 'handle');
+    throw e;
+  } finally {
+    await flushIfServerless();
+  }
+}
+
+/**
+ * A SvelteKit handle function that wraps the request for Sentry error and
+ * performance monitoring.
+ *
+ * Usage:
+ * ```
+ * // src/hooks.server.ts
+ * import { sentryHandle } from '@sentry/sveltekit';
+ *
+ * export const handle = sentryHandle();
+ *
+ * // Optionally use the `sequence` function to add additional handlers.
+ * // export const handle = sequence(sentryHandle(), yourCustomHandler);
+ * ```
+ */
+export function sentryHandle(handlerOptions?: SentryHandleOptions): Handle {
+  // The hooks file creates this after the `sentrySvelteKit()` base path module ran, however the SDK was started
+  // (`--import`, a custom server), and later per-request clients (Cloudflare) start with it too.
+  setTunnelDefaults({ basePath: getTunnelBasePath() });
+
+  const { handleUnknownRoutes, ...rest } = handlerOptions ?? {};
+  const options = {
+    handleUnknownRoutes: handleUnknownRoutes ?? false,
+    ...rest,
+  };
+
+  const sentryRequestHandler: Handle = input => {
+    const tunnelResponse = handleServedTunnelRequest(input.event.request);
+    if (tunnelResponse) {
+      return tunnelResponse;
+    }
+
+    const backwardsForwardsCompatibleEvent = input.event as typeof input.event & BackwardsForwardsCompatibleEvent;
+
+    // Escape hatch to suppress request isolation and trace continuation (see initCloudflareSentryHandle)
+    const skipIsolation =
+      '_sentrySkipRequestIsolation' in backwardsForwardsCompatibleEvent.locals &&
+      backwardsForwardsCompatibleEvent.locals._sentrySkipRequestIsolation;
+
+    // In case of a same-origin `fetch` call within a server`load` function,
+    // SvelteKit will actually just re-enter the `handle` function and set `isSubRequest`
+    // to `true` so that no additional network call is made.
+    // We want the `http.server` span of that nested call to be a child span of the
+    // currently active span instead of a new root span to correctly reflect this
+    // behavior.
+    if (skipIsolation || input.event.isSubRequest) {
+      return instrumentHandle(input, {
+        ...options,
+      });
+    }
+
+    return withIsolationScope(isolationScope => {
+      // We only call continueTrace in the initial top level request to avoid
+      // creating a new root span for the sub request.
+      isolationScope.setSDKProcessingMetadata({
+        // We specifically avoid cloning the request here to avoid double read errors.
+        // We only read request headers so we're not consuming the body anyway.
+        // Note to future readers: This sounds counter-intuitive but please read
+        // https://github.com/getsentry/sentry-javascript/issues/14583
+        normalizedRequest: winterCGRequestToRequestData(input.event.request),
+      });
+
+      if (backwardsForwardsCompatibleEvent.tracing?.enabled) {
+        // if sveltekit tracing is enabled (since 2.31.0), trace continuation is handled by
+        // kit before our hook is executed. No noeed to call `continueTrace` from our end
+        return instrumentHandle(input, options);
+      }
+
+      return continueTrace(getTracePropagationData(input.event), () => instrumentHandle(input, options));
+    });
+  };
+
+  return sentryRequestHandler;
+}

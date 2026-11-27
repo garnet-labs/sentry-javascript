@@ -1,0 +1,139 @@
+import { isObjectLike } from '@sentry/core';
+import { instrumentWorkersAiClient } from '@sentry/server-utils';
+import type { CloudflareOptions } from '../../client';
+import {
+  isAiBinding,
+  isD1Database,
+  isDurableObjectNamespace,
+  isJSRPC,
+  isKVNamespace,
+  isQueue,
+  isR2Bucket,
+} from '../../utils/isBinding';
+import { instrumentD1 } from './instrumentD1';
+import { appendRpcMeta } from '../../utils/rpcMeta';
+import { createBindingPropagationResolver, createRpcPropagationResolver } from '../../utils/bindingPropagation';
+import { instrumentDurableObjectNamespace, STUB_NON_RPC_METHODS } from '../instrumentDurableObjectNamespace';
+import { instrumentFetcher } from './instrumentFetcher';
+import { instrumentKV } from './instrumentKV';
+import { instrumentQueueProducer } from './instrumentQueueProducer';
+import { instrumentR2Bucket } from './instrumentR2';
+
+function isProxyable(item: unknown): item is object {
+  return isObjectLike(item) || typeof item === 'function';
+}
+
+const instrumentedBindings = new WeakMap<object, unknown>();
+
+/**
+ * Wraps the Cloudflare `env` object in a Proxy that detects binding types
+ * on property access and returns instrumented versions.
+ *
+ * Currently detects:
+ * - DurableObjectNamespace (via `idFromName` duck-typing)
+ * - Service bindings / JSRPC proxies
+ * - Queue producers (via `send` + `sendBatch` duck-typing)
+ * - Workers KV namespaces (via `get` + `put` + `list` + `getWithMetadata` duck-typing)
+ * - R2 Buckets (via `head` + `put` + `createMultipartUpload` duck-typing)
+ * - Workers AI (via `run` + `gateway` + `toMarkdown` duck-typing)
+ *
+ * @param env - The Cloudflare env object to instrument
+ * @param options - Optional CloudflareOptions to control RPC and Queue trace propagation
+ */
+export function instrumentEnv<Env extends Record<string, unknown>>(env: Env, options?: CloudflareOptions): Env {
+  if (!env || typeof env !== 'object') {
+    return env;
+  }
+
+  const shouldPropagateRpcTrace = createRpcPropagationResolver(options);
+  const shouldPropagateQueueTrace = createBindingPropagationResolver(options?.queueTracePropagationBindings);
+
+  return new Proxy(env, {
+    get(target, prop, receiver) {
+      const item = Reflect.get(target, prop, receiver);
+
+      if (!isProxyable(item)) {
+        return item;
+      }
+
+      const cached = instrumentedBindings.get(item);
+
+      if (cached) {
+        return cached;
+      }
+
+      if (isD1Database(item)) {
+        const instrumented = instrumentD1(item);
+        instrumentedBindings.set(item, instrumented);
+        return instrumented;
+      }
+
+      if (isQueue(item)) {
+        const bindingName = typeof prop === 'string' ? prop : String(prop);
+        const instrumented = instrumentQueueProducer(item, bindingName, shouldPropagateQueueTrace(bindingName));
+        instrumentedBindings.set(item, instrumented);
+        return instrumented;
+      }
+
+      if (isKVNamespace(item)) {
+        const bindingName = typeof prop === 'string' ? prop : String(prop);
+        const instrumented = instrumentKV(item, bindingName);
+        instrumentedBindings.set(item, instrumented);
+        return instrumented;
+      }
+
+      if (isR2Bucket(item)) {
+        const bindingName = typeof prop === 'string' ? prop : String(prop);
+        const instrumented = instrumentR2Bucket(item, bindingName);
+        instrumentedBindings.set(item, instrumented);
+        return instrumented;
+      }
+
+      if (isAiBinding(item)) {
+        const instrumented = instrumentWorkersAiClient(item);
+        instrumentedBindings.set(item, instrumented);
+        return instrumented;
+      }
+
+      const propagateRpcTrace = shouldPropagateRpcTrace(String(prop));
+
+      if (isDurableObjectNamespace(item)) {
+        const instrumented = instrumentDurableObjectNamespace(item, propagateRpcTrace);
+        instrumentedBindings.set(item, instrumented);
+        return instrumented;
+      }
+
+      if (isJSRPC(item)) {
+        const instrumented = new Proxy(item, {
+          get(target, p) {
+            const value = Reflect.get(target, p);
+
+            if (p === 'fetch' && typeof value === 'function') {
+              return instrumentFetcher((...args) => Reflect.apply(value, target, args));
+            }
+
+            if (p === 'connect' && typeof value === 'function') {
+              return (...args: unknown[]) => Reflect.apply(value, target, args);
+            }
+
+            if (
+              propagateRpcTrace &&
+              typeof value === 'function' &&
+              typeof p === 'string' &&
+              !STUB_NON_RPC_METHODS.has(p)
+            ) {
+              return (...args: unknown[]) => Reflect.apply(value, target, appendRpcMeta(args));
+            }
+
+            return value;
+          },
+        });
+
+        instrumentedBindings.set(item, instrumented);
+        return instrumented;
+      }
+
+      return item;
+    },
+  });
+}

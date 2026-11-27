@@ -1,0 +1,114 @@
+export type {
+  Breadcrumb,
+  BreadcrumbHint,
+  Context,
+  Contexts,
+  RequestEventData,
+  SdkInfo,
+  Event,
+  EventHint,
+  ErrorEvent,
+  Exception,
+  SeverityLevel,
+  StackFrame,
+  Stacktrace,
+  Thread,
+  User,
+  Session,
+  ReportDialogOptions,
+  CaptureContext,
+  ExclusiveEventHintOrCaptureContext,
+  Log,
+  LogSeverityLevel,
+} from '@sentry/core';
+
+export type { BrowserOptions } from './client';
+export type { LoaderSentry } from './loader-types';
+
+export {
+  addEventProcessor,
+  addBreadcrumb,
+  addIntegration,
+  captureException,
+  captureEvent,
+  captureFeedback,
+  captureMessage,
+  close,
+  createTransport,
+  lastEventId,
+  flush,
+  getClient,
+  isInitialized,
+  isEnabled,
+  getCurrentScope,
+  getIsolationScope,
+  getGlobalScope,
+  setCurrentClient,
+  Scope,
+  continueTrace,
+  getTraceData,
+  suppressTracing,
+  SDK_VERSION,
+  setContext,
+  setExtra,
+  setExtras,
+  setTag,
+  setTags,
+  setAttribute,
+  setAttributes,
+  setUser,
+  setConversationId,
+  withScope,
+  withIsolationScope,
+  functionToStringIntegration,
+  eventFiltersIntegration,
+  dedupeIntegration,
+  consoleIntegration,
+  parameterize,
+  startSession,
+  captureSession,
+  endSession,
+  spanToStaticSpanJSON,
+  spanToJSON,
+  spanToTraceHeader,
+  spanToBaggageHeader,
+  updateSpanName,
+  withStaticSpan,
+  // oxlint-disable-next-line typescript/no-deprecated
+  withStreamedSpan,
+} from '@sentry/core';
+
+export {
+  // oxlint-disable-next-line typescript/no-deprecated
+  SEMANTIC_ATTRIBUTE_SENTRY_OP,
+  // oxlint-disable-next-line typescript/no-deprecated
+  SEMANTIC_ATTRIBUTE_SENTRY_ORIGIN,
+  SEMANTIC_ATTRIBUTE_SENTRY_SAMPLE_RATE,
+} from '@sentry/core';
+
+export { WINDOW } from './helpers';
+export { BrowserClient } from './client';
+export { makeFetchTransport } from './transports/fetch';
+export { uiProfiler } from './profiling';
+export {
+  defaultStackParser,
+  defaultStackLineParsers,
+  chromeStackLineParser,
+  geckoStackLineParser,
+  opera10StackLineParser,
+  opera11StackLineParser,
+  winjsStackLineParser,
+} from './stack-parsers';
+export { eventFromException, eventFromMessage, exceptionFromError } from './eventbuilder';
+export { createUserFeedbackEnvelope } from './userfeedback';
+export { getDefaultIntegrations, forceLoad, init, onLoad } from './sdk';
+export { showReportDialog } from './report-dialog';
+
+export { breadcrumbsIntegration } from './integrations/breadcrumbs';
+export { globalHandlersIntegration } from './integrations/globalhandlers';
+export { httpContextIntegration } from './integrations/httpcontext';
+export { linkedErrorsIntegration } from './integrations/linkederrors';
+export { browserApiErrorsIntegration } from './integrations/browserapierrors';
+export { browserSessionIntegration } from './integrations/browsersession';
+
+export { lazyLoadIntegration } from './utils/lazyLoadIntegration';
