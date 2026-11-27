@@ -1,0 +1,1859 @@
+import * as path from 'path';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { RouteManifest } from '../../../src/config/manifest/types';
+import {
+  constructTurbopackConfig,
+  safelyAddTurbopackRule,
+} from '../../../src/config/turbopack/constructTurbopackConfig';
+import type { NextConfigObject } from '../../../src/config/types';
+
+// Mock path.resolve to return a predictable loader path
+vi.mock('path', async () => {
+  const actual = await vi.importActual('path');
+  return {
+    ...actual,
+    resolve: vi.fn().mockImplementation((...args: string[]) => {
+      const lastArg = args[args.length - 1];
+      if (lastArg === 'moduleMetadataInjectionLoader.js') {
+        return '/mocked/path/to/moduleMetadataInjectionLoader.js';
+      }
+      if (lastArg === 'componentAnnotationLoader.js') {
+        return '/mocked/path/to/componentAnnotationLoader.js';
+      }
+      return '/mocked/path/to/valueInjectionLoader.js';
+    }),
+  };
+});
+
+describe('constructTurbopackConfig', () => {
+  const mockRouteManifest: RouteManifest = {
+    dynamicRoutes: [{ path: '/users/[id]', regex: '/users/([^/]+)', paramNames: ['id'] }],
+    staticRoutes: [
+      { path: '/users', regex: '/users' },
+      { path: '/api/health', regex: '/api/health' },
+    ],
+  };
+
+  const mockSentryOptions = {};
+
+  describe('without existing turbopack config', () => {
+    it('should create a basic turbopack config when no manifest is provided', () => {
+      const userNextConfig: NextConfigObject = {};
+
+      const result = constructTurbopackConfig({
+        userNextConfig,
+        userSentryOptions: mockSentryOptions,
+      });
+
+      expect(result).toEqual({
+        rules: {
+          '**/instrumentation.*': {
+            loaders: [
+              {
+                loader: '/mocked/path/to/valueInjectionLoader.js',
+                options: {
+                  values: {
+                    __SENTRY_SERVER_MODULES__: expect.any(Object),
+                  },
+                },
+              },
+            ],
+          },
+        },
+      });
+    });
+
+    it('should create turbopack config with instrumentation rule when manifest is provided', () => {
+      const userNextConfig: NextConfigObject = {};
+
+      const result = constructTurbopackConfig({
+        userNextConfig,
+        routeManifest: mockRouteManifest,
+      });
+
+      expect(result).toEqual({
+        rules: {
+          '**/instrumentation-client.*': {
+            loaders: [
+              {
+                loader: '/mocked/path/to/valueInjectionLoader.js',
+                options: {
+                  values: {
+                    _sentryRouteManifest: JSON.stringify(mockRouteManifest),
+                  },
+                },
+              },
+            ],
+          },
+          '**/instrumentation.*': {
+            loaders: [
+              {
+                loader: '/mocked/path/to/valueInjectionLoader.js',
+                options: {
+                  values: {
+                    __SENTRY_SERVER_MODULES__: expect.any(Object),
+                  },
+                },
+              },
+            ],
+          },
+        },
+      });
+    });
+
+    it('should call path.resolve with correct arguments', () => {
+      const userNextConfig: NextConfigObject = {};
+      const pathResolveSpy = vi.spyOn(path, 'resolve');
+
+      constructTurbopackConfig({
+        userNextConfig,
+        routeManifest: mockRouteManifest,
+      });
+
+      expect(pathResolveSpy).toHaveBeenCalledWith(expect.any(String), '..', 'loaders', 'valueInjectionLoader.js');
+    });
+
+    it('should handle Windows-style paths correctly', () => {
+      // Mock path.resolve to return a Windows-style path
+      const windowsLoaderPath = 'C:\\my\\project\\dist\\config\\loaders\\valueInjectionLoader.js';
+      const pathResolveSpy = vi.spyOn(path, 'resolve');
+      pathResolveSpy.mockReturnValue(windowsLoaderPath);
+
+      const userNextConfig: NextConfigObject = {};
+
+      const result = constructTurbopackConfig({
+        userNextConfig,
+        routeManifest: mockRouteManifest,
+      });
+
+      expect(result.rules).toBeDefined();
+      expect(result.rules!['**/instrumentation-client.*']).toBeDefined();
+
+      const rule = result.rules!['**/instrumentation-client.*'];
+      expect(rule).toHaveProperty('loaders');
+
+      const ruleWithLoaders = rule as { loaders: Array<{ loader: string; options: any }> };
+      expect(ruleWithLoaders.loaders).toBeDefined();
+      expect(ruleWithLoaders.loaders).toHaveLength(1);
+
+      const loader = ruleWithLoaders.loaders[0]!;
+      expect(loader).toHaveProperty('loader');
+      expect(loader).toHaveProperty('options');
+      expect(loader.options).toHaveProperty('values');
+      expect(loader.options.values).toHaveProperty('_sentryRouteManifest');
+      expect(loader.loader).toBe(windowsLoaderPath);
+      expect(pathResolveSpy).toHaveBeenCalledWith(expect.any(String), '..', 'loaders', 'valueInjectionLoader.js');
+
+      pathResolveSpy.mockReturnValue('/mocked/path/to/valueInjectionLoader.js');
+    });
+  });
+
+  describe('with existing turbopack config', () => {
+    it('should preserve existing turbopack config when no manifest is provided', () => {
+      const userNextConfig: NextConfigObject = {
+        turbopack: {
+          resolveAlias: {
+            '@': './src',
+          },
+          rules: {
+            '*.test.js': ['jest-loader'],
+          },
+        },
+      };
+
+      const result = constructTurbopackConfig({
+        userNextConfig,
+      });
+
+      expect(result).toEqual({
+        resolveAlias: {
+          '@': './src',
+        },
+        rules: {
+          '*.test.js': ['jest-loader'],
+          '**/instrumentation.*': {
+            loaders: [
+              {
+                loader: '/mocked/path/to/valueInjectionLoader.js',
+                options: {
+                  values: {
+                    __SENTRY_SERVER_MODULES__: expect.any(Object),
+                  },
+                },
+              },
+            ],
+          },
+        },
+      });
+    });
+
+    it('should merge manifest rule with existing turbopack config', () => {
+      const userNextConfig: NextConfigObject = {
+        turbopack: {
+          resolveAlias: {
+            '@': './src',
+          },
+          rules: {
+            '*.test.js': ['jest-loader'],
+          },
+        },
+      };
+
+      const result = constructTurbopackConfig({
+        userNextConfig,
+        routeManifest: mockRouteManifest,
+      });
+
+      expect(result).toEqual({
+        resolveAlias: {
+          '@': './src',
+        },
+        rules: {
+          '*.test.js': ['jest-loader'],
+          '**/instrumentation-client.*': {
+            loaders: [
+              {
+                loader: '/mocked/path/to/valueInjectionLoader.js',
+                options: {
+                  values: {
+                    _sentryRouteManifest: JSON.stringify(mockRouteManifest),
+                  },
+                },
+              },
+            ],
+          },
+          '**/instrumentation.*': {
+            loaders: [
+              {
+                loader: '/mocked/path/to/valueInjectionLoader.js',
+                options: {
+                  values: {
+                    __SENTRY_SERVER_MODULES__: expect.any(Object),
+                  },
+                },
+              },
+            ],
+          },
+        },
+      });
+    });
+
+    it('should not override existing instrumentation rule', () => {
+      const existingRule = {
+        loaders: [
+          {
+            loader: '/existing/loader.js',
+            options: { custom: 'value' },
+          },
+        ],
+      };
+
+      const userNextConfig: NextConfigObject = {
+        turbopack: {
+          rules: {
+            '**/instrumentation.*': existingRule,
+          },
+        },
+      };
+
+      const result = constructTurbopackConfig({
+        userNextConfig,
+        routeManifest: mockRouteManifest,
+      });
+
+      expect(result).toEqual({
+        rules: {
+          '**/instrumentation-client.*': {
+            loaders: [
+              {
+                loader: '/mocked/path/to/valueInjectionLoader.js',
+                options: {
+                  values: {
+                    _sentryRouteManifest: JSON.stringify(mockRouteManifest),
+                  },
+                },
+              },
+            ],
+          },
+          '**/instrumentation.*': existingRule,
+        },
+      });
+    });
+  });
+
+  describe('with edge cases', () => {
+    it('should handle empty route manifest', () => {
+      const userNextConfig: NextConfigObject = {};
+      const emptyManifest: RouteManifest = { dynamicRoutes: [], staticRoutes: [] };
+
+      const result = constructTurbopackConfig({
+        userNextConfig,
+        routeManifest: emptyManifest,
+      });
+
+      expect(result).toEqual({
+        rules: {
+          '**/instrumentation-client.*': {
+            loaders: [
+              {
+                loader: '/mocked/path/to/valueInjectionLoader.js',
+                options: {
+                  values: {
+                    _sentryRouteManifest: JSON.stringify(emptyManifest),
+                  },
+                },
+              },
+            ],
+          },
+          '**/instrumentation.*': {
+            loaders: [
+              {
+                loader: '/mocked/path/to/valueInjectionLoader.js',
+                options: {
+                  values: {
+                    __SENTRY_SERVER_MODULES__: expect.any(Object),
+                  },
+                },
+              },
+            ],
+          },
+        },
+      });
+    });
+
+    it('should handle complex route manifest', () => {
+      const userNextConfig: NextConfigObject = {};
+      const complexManifest: RouteManifest = {
+        dynamicRoutes: [
+          { path: '/users/[id]/posts/[postId]', regex: '/users/([^/]+)/posts/([^/]+)', paramNames: ['id', 'postId'] },
+          { path: '/api/[...params]', regex: '/api/(.+)', paramNames: ['params'] },
+        ],
+        staticRoutes: [],
+      };
+
+      const result = constructTurbopackConfig({
+        userNextConfig,
+        routeManifest: complexManifest,
+      });
+
+      expect(result).toEqual({
+        rules: {
+          '**/instrumentation-client.*': {
+            loaders: [
+              {
+                loader: '/mocked/path/to/valueInjectionLoader.js',
+                options: {
+                  values: {
+                    _sentryRouteManifest: JSON.stringify(complexManifest),
+                  },
+                },
+              },
+            ],
+          },
+          '**/instrumentation.*': {
+            loaders: [
+              {
+                loader: '/mocked/path/to/valueInjectionLoader.js',
+                options: {
+                  values: {
+                    __SENTRY_SERVER_MODULES__: expect.any(Object),
+                  },
+                },
+              },
+            ],
+          },
+        },
+      });
+    });
+  });
+
+  describe('additional edge cases', () => {
+    it('should handle undefined turbopack property', () => {
+      const userNextConfig: NextConfigObject = {
+        turbopack: undefined,
+      };
+
+      const result = constructTurbopackConfig({
+        userNextConfig,
+        routeManifest: mockRouteManifest,
+      });
+
+      expect(result).toEqual({
+        rules: {
+          '**/instrumentation-client.*': {
+            loaders: [
+              {
+                loader: '/mocked/path/to/valueInjectionLoader.js',
+                options: {
+                  values: {
+                    _sentryRouteManifest: JSON.stringify(mockRouteManifest),
+                  },
+                },
+              },
+            ],
+          },
+          '**/instrumentation.*': {
+            loaders: [
+              {
+                loader: '/mocked/path/to/valueInjectionLoader.js',
+                options: {
+                  values: {
+                    __SENTRY_SERVER_MODULES__: expect.any(Object),
+                  },
+                },
+              },
+            ],
+          },
+        },
+      });
+    });
+
+    it('should handle null turbopack property', () => {
+      const userNextConfig: NextConfigObject = {
+        turbopack: null as any,
+      };
+
+      const result = constructTurbopackConfig({
+        userNextConfig,
+        nextJsVersion: '15.0.0',
+      });
+
+      expect(result).toEqual({
+        rules: {
+          '**/instrumentation-client.*': {
+            loaders: [
+              {
+                loader: '/mocked/path/to/valueInjectionLoader.js',
+                options: {
+                  values: {
+                    _sentryNextJsVersion: '15.0.0',
+                  },
+                },
+              },
+            ],
+          },
+          '**/instrumentation.*': {
+            loaders: [
+              {
+                loader: '/mocked/path/to/valueInjectionLoader.js',
+                options: {
+                  values: {
+                    __SENTRY_SERVER_MODULES__: expect.any(Object),
+                    _sentryNextJsVersion: '15.0.0',
+                  },
+                },
+              },
+            ],
+          },
+        },
+      });
+    });
+
+    it('should preserve other turbopack properties when adding rules', () => {
+      const userNextConfig: NextConfigObject = {
+        turbopack: {
+          resolveAlias: {
+            '@': './src',
+            '@components': './src/components',
+          },
+          rules: {
+            '*.css': ['css-loader'],
+          },
+        },
+      };
+
+      const result = constructTurbopackConfig({
+        userNextConfig,
+        routeManifest: mockRouteManifest,
+        nextJsVersion: '14.0.0',
+      });
+
+      expect(result).toEqual({
+        resolveAlias: {
+          '@': './src',
+          '@components': './src/components',
+        },
+        rules: {
+          '*.css': ['css-loader'],
+          '**/instrumentation-client.*': {
+            loaders: [
+              {
+                loader: '/mocked/path/to/valueInjectionLoader.js',
+                options: {
+                  values: {
+                    _sentryNextJsVersion: '14.0.0',
+                    _sentryRouteManifest: JSON.stringify(mockRouteManifest),
+                  },
+                },
+              },
+            ],
+          },
+          '**/instrumentation.*': {
+            loaders: [
+              {
+                loader: '/mocked/path/to/valueInjectionLoader.js',
+                options: {
+                  values: {
+                    __SENTRY_SERVER_MODULES__: expect.any(Object),
+                    _sentryNextJsVersion: '14.0.0',
+                  },
+                },
+              },
+            ],
+          },
+        },
+      });
+    });
+
+    it('should handle empty rules object in existing turbopack config', () => {
+      const userNextConfig: NextConfigObject = {
+        turbopack: {
+          rules: {},
+        },
+      };
+
+      const result = constructTurbopackConfig({
+        userNextConfig,
+        routeManifest: mockRouteManifest,
+      });
+
+      expect(result).toEqual({
+        rules: {
+          '**/instrumentation-client.*': {
+            loaders: [
+              {
+                loader: '/mocked/path/to/valueInjectionLoader.js',
+                options: {
+                  values: {
+                    _sentryRouteManifest: JSON.stringify(mockRouteManifest),
+                  },
+                },
+              },
+            ],
+          },
+          '**/instrumentation.*': {
+            loaders: [
+              {
+                loader: '/mocked/path/to/valueInjectionLoader.js',
+                options: {
+                  values: {
+                    __SENTRY_SERVER_MODULES__: expect.any(Object),
+                  },
+                },
+              },
+            ],
+          },
+        },
+      });
+    });
+
+    it('should handle multiple colliding instrumentation rules', () => {
+      const userNextConfig: NextConfigObject = {
+        turbopack: {
+          rules: {
+            '**/instrumentation.*': ['existing-loader'],
+            '**/instrumentation-client.*': { loaders: ['client-loader'] },
+          },
+        },
+      };
+
+      const result = constructTurbopackConfig({
+        userNextConfig,
+        routeManifest: mockRouteManifest,
+        nextJsVersion: '14.0.0',
+      });
+
+      // Should preserve existing rules and not add new ones
+      expect(result).toEqual({
+        rules: {
+          '**/instrumentation.*': ['existing-loader'],
+          '**/instrumentation-client.*': { loaders: ['client-loader'] },
+        },
+      });
+    });
+  });
+
+  describe('Next.js version injection', () => {
+    it('should create turbopack config with Next.js version rule when nextJsVersion is provided', () => {
+      const userNextConfig: NextConfigObject = {};
+      const nextJsVersion = '15.1.0';
+
+      const result = constructTurbopackConfig({
+        userNextConfig,
+        nextJsVersion,
+      });
+
+      expect(result).toEqual({
+        rules: {
+          '**/instrumentation-client.*': {
+            loaders: [
+              {
+                loader: '/mocked/path/to/valueInjectionLoader.js',
+                options: {
+                  values: {
+                    _sentryNextJsVersion: nextJsVersion,
+                  },
+                },
+              },
+            ],
+          },
+          '**/instrumentation.*': {
+            loaders: [
+              {
+                loader: '/mocked/path/to/valueInjectionLoader.js',
+                options: {
+                  values: {
+                    __SENTRY_SERVER_MODULES__: expect.any(Object),
+                    _sentryNextJsVersion: nextJsVersion,
+                  },
+                },
+              },
+            ],
+          },
+        },
+      });
+    });
+
+    it('should create turbopack config with both manifest and Next.js version rules', () => {
+      const userNextConfig: NextConfigObject = {};
+      const nextJsVersion = '14.2.5';
+
+      const result = constructTurbopackConfig({
+        userNextConfig,
+        routeManifest: mockRouteManifest,
+        nextJsVersion,
+      });
+
+      expect(result).toEqual({
+        rules: {
+          '**/instrumentation-client.*': {
+            loaders: [
+              {
+                loader: '/mocked/path/to/valueInjectionLoader.js',
+                options: {
+                  values: {
+                    _sentryNextJsVersion: nextJsVersion,
+                    _sentryRouteManifest: JSON.stringify(mockRouteManifest),
+                  },
+                },
+              },
+            ],
+          },
+          '**/instrumentation.*': {
+            loaders: [
+              {
+                loader: '/mocked/path/to/valueInjectionLoader.js',
+                options: {
+                  values: {
+                    __SENTRY_SERVER_MODULES__: expect.any(Object),
+                    _sentryNextJsVersion: nextJsVersion,
+                  },
+                },
+              },
+            ],
+          },
+        },
+      });
+    });
+
+    it('should merge Next.js version rule with existing turbopack config', () => {
+      const userNextConfig: NextConfigObject = {
+        turbopack: {
+          resolveAlias: {
+            '@': './src',
+          },
+          rules: {
+            '*.test.js': ['jest-loader'],
+          },
+        },
+      };
+      const nextJsVersion = '15.0.0';
+
+      const result = constructTurbopackConfig({
+        userNextConfig,
+        nextJsVersion,
+      });
+
+      expect(result).toEqual({
+        resolveAlias: {
+          '@': './src',
+        },
+        rules: {
+          '*.test.js': ['jest-loader'],
+          '**/instrumentation-client.*': {
+            loaders: [
+              {
+                loader: '/mocked/path/to/valueInjectionLoader.js',
+                options: {
+                  values: {
+                    _sentryNextJsVersion: nextJsVersion,
+                  },
+                },
+              },
+            ],
+          },
+          '**/instrumentation.*': {
+            loaders: [
+              {
+                loader: '/mocked/path/to/valueInjectionLoader.js',
+                options: {
+                  values: {
+                    __SENTRY_SERVER_MODULES__: expect.any(Object),
+                    _sentryNextJsVersion: nextJsVersion,
+                  },
+                },
+              },
+            ],
+          },
+        },
+      });
+    });
+
+    it('should handle different Next.js version formats', () => {
+      const userNextConfig: NextConfigObject = {};
+      const testVersions = ['13.0.0', '14.1.2-canary.1', '15.0.0-rc.1', '16.0.0'];
+
+      testVersions.forEach(version => {
+        const result = constructTurbopackConfig({
+          userNextConfig,
+          userSentryOptions: mockSentryOptions,
+          nextJsVersion: version,
+        });
+
+        expect(result.rules).toBeDefined();
+        expect(result.rules!['**/instrumentation.*']).toBeDefined();
+
+        const rule = result.rules!['**/instrumentation.*'];
+        const ruleWithLoaders = rule as { loaders: Array<{ loader: string; options: any }> };
+        expect(ruleWithLoaders.loaders[0]!.options.values._sentryNextJsVersion).toBe(version);
+      });
+    });
+
+    it('should not create Next.js version rule when nextJsVersion is undefined', () => {
+      const userNextConfig: NextConfigObject = {};
+
+      const result = constructTurbopackConfig({
+        userNextConfig,
+        nextJsVersion: undefined,
+      });
+
+      expect(result).toEqual({
+        rules: {
+          '**/instrumentation.*': {
+            loaders: [
+              {
+                loader: '/mocked/path/to/valueInjectionLoader.js',
+                options: {
+                  values: {
+                    __SENTRY_SERVER_MODULES__: expect.any(Object),
+                  },
+                },
+              },
+            ],
+          },
+        },
+      });
+    });
+
+    it('should not create Next.js version rule when nextJsVersion is empty string', () => {
+      const userNextConfig: NextConfigObject = {};
+
+      const result = constructTurbopackConfig({
+        userNextConfig,
+        nextJsVersion: '',
+      });
+
+      expect(result).toEqual({
+        rules: {
+          '**/instrumentation.*': {
+            loaders: [
+              {
+                loader: '/mocked/path/to/valueInjectionLoader.js',
+                options: {
+                  values: {
+                    __SENTRY_SERVER_MODULES__: expect.any(Object),
+                  },
+                },
+              },
+            ],
+          },
+        },
+      });
+    });
+
+    it('should not override existing instrumentation rule when nextJsVersion is provided', () => {
+      const existingRule = {
+        loaders: [
+          {
+            loader: '/existing/loader.js',
+            options: { custom: 'value' },
+          },
+        ],
+      };
+
+      const userNextConfig: NextConfigObject = {
+        turbopack: {
+          rules: {
+            '**/instrumentation.*': existingRule,
+          },
+        },
+      };
+      const nextJsVersion = '15.1.0';
+
+      const result = constructTurbopackConfig({
+        userNextConfig,
+        nextJsVersion,
+      });
+
+      expect(result).toEqual({
+        rules: {
+          '**/instrumentation-client.*': {
+            loaders: [
+              {
+                loader: '/mocked/path/to/valueInjectionLoader.js',
+                options: {
+                  values: {
+                    _sentryNextJsVersion: nextJsVersion,
+                  },
+                },
+              },
+            ],
+          },
+          '**/instrumentation.*': existingRule,
+        },
+      });
+    });
+
+    it('should handle all parameters together with existing config', () => {
+      const userNextConfig: NextConfigObject = {
+        turbopack: {
+          resolveAlias: {
+            '@components': './src/components',
+          },
+          rules: {
+            '*.scss': ['sass-loader'],
+          },
+        },
+      };
+      const nextJsVersion = '14.0.0';
+
+      const result = constructTurbopackConfig({
+        userNextConfig,
+        routeManifest: mockRouteManifest,
+        nextJsVersion,
+      });
+
+      expect(result).toEqual({
+        resolveAlias: {
+          '@components': './src/components',
+        },
+        rules: {
+          '*.scss': ['sass-loader'],
+          '**/instrumentation-client.*': {
+            loaders: [
+              {
+                loader: '/mocked/path/to/valueInjectionLoader.js',
+                options: {
+                  values: {
+                    _sentryNextJsVersion: nextJsVersion,
+                    _sentryRouteManifest: JSON.stringify(mockRouteManifest),
+                  },
+                },
+              },
+            ],
+          },
+          '**/instrumentation.*': {
+            loaders: [
+              {
+                loader: '/mocked/path/to/valueInjectionLoader.js',
+                options: {
+                  values: {
+                    __SENTRY_SERVER_MODULES__: expect.any(Object),
+                    _sentryNextJsVersion: nextJsVersion,
+                  },
+                },
+              },
+            ],
+          },
+        },
+      });
+    });
+  });
+});
+
+describe('condition field version gating', () => {
+  it('should include condition field for Next.js 16+', () => {
+    const userNextConfig: NextConfigObject = {};
+
+    const result = constructTurbopackConfig({
+      userNextConfig,
+      nextJsVersion: '16.0.0',
+    });
+
+    const serverRule = result.rules!['**/instrumentation.*'] as { condition?: unknown; loaders: unknown[] };
+    expect(serverRule.condition).toEqual({ not: 'foreign' });
+  });
+
+  it('should include condition field for Next.js 17+', () => {
+    const userNextConfig: NextConfigObject = {};
+
+    const result = constructTurbopackConfig({
+      userNextConfig,
+      routeManifest: { dynamicRoutes: [], staticRoutes: [] },
+      nextJsVersion: '17.0.0',
+    });
+
+    const clientRule = result.rules!['**/instrumentation-client.*'] as { condition?: unknown; loaders: unknown[] };
+    const serverRule = result.rules!['**/instrumentation.*'] as { condition?: unknown; loaders: unknown[] };
+    expect(clientRule.condition).toEqual({ not: 'foreign' });
+    expect(serverRule.condition).toEqual({ not: 'foreign' });
+  });
+
+  it('should not include condition field for Next.js 15.x', () => {
+    const userNextConfig: NextConfigObject = {};
+
+    const result = constructTurbopackConfig({
+      userNextConfig,
+      nextJsVersion: '15.4.1',
+    });
+
+    const serverRule = result.rules!['**/instrumentation.*'] as { condition?: unknown; loaders: unknown[] };
+    expect(serverRule).not.toHaveProperty('condition');
+  });
+
+  it('should not include condition field for Next.js 14.x', () => {
+    const userNextConfig: NextConfigObject = {};
+
+    const result = constructTurbopackConfig({
+      userNextConfig,
+      nextJsVersion: '14.2.0',
+    });
+
+    const serverRule = result.rules!['**/instrumentation.*'] as { condition?: unknown; loaders: unknown[] };
+    expect(serverRule).not.toHaveProperty('condition');
+  });
+
+  it('should not include condition field when nextJsVersion is undefined', () => {
+    const userNextConfig: NextConfigObject = {};
+
+    const result = constructTurbopackConfig({ userNextConfig });
+
+    const serverRule = result.rules!['**/instrumentation.*'] as { condition?: unknown; loaders: unknown[] };
+    expect(serverRule).not.toHaveProperty('condition');
+  });
+});
+
+describe('moduleMetadataInjection with applicationKey', () => {
+  it('should add metadata loader rule when applicationKey is set and Next.js >= 16', () => {
+    const pathResolveSpy = vi.spyOn(path, 'resolve');
+    pathResolveSpy.mockImplementation((...args: string[]) => {
+      const lastArg = args[args.length - 1];
+      if (lastArg === 'moduleMetadataInjectionLoader.js') {
+        return '/mocked/path/to/moduleMetadataInjectionLoader.js';
+      }
+      return '/mocked/path/to/valueInjectionLoader.js';
+    });
+
+    const userNextConfig: NextConfigObject = {};
+
+    const result = constructTurbopackConfig({
+      userNextConfig,
+      userSentryOptions: { applicationKey: 'my-app' },
+      nextJsVersion: '16.0.0',
+    });
+
+    expect(result.rules!['*.{ts,tsx,js,jsx,mjs,cjs}']).toEqual({
+      condition: { all: ['browser', { not: { path: /next\/dist\/build\/polyfills/ } }] },
+      loaders: [
+        {
+          loader: '/mocked/path/to/moduleMetadataInjectionLoader.js',
+          options: {
+            applicationKey: 'my-app',
+          },
+        },
+      ],
+    });
+  });
+
+  it('should add metadata loader rule when top-level applicationKey is set and Next.js >= 16', () => {
+    const userNextConfig: NextConfigObject = {};
+
+    const result = constructTurbopackConfig({
+      userNextConfig,
+      userSentryOptions: { applicationKey: 'my-top-level-key' },
+      nextJsVersion: '16.0.0',
+    });
+
+    const rule = result.rules!['*.{ts,tsx,js,jsx,mjs,cjs}'] as {
+      loaders: Array<{ loader: string; options: { applicationKey: string } }>;
+    };
+    expect(rule.loaders[0]!.options.applicationKey).toBe('my-top-level-key');
+  });
+
+  it.each([undefined, false])(
+    'includes dependencies when applicationKeyExcludeDependencies is %s',
+    applicationKeyExcludeDependencies => {
+      const userNextConfig: NextConfigObject = {};
+
+      const result = constructTurbopackConfig({
+        userNextConfig,
+        userSentryOptions: { applicationKey: 'my-app', applicationKeyExcludeDependencies },
+        nextJsVersion: '16.0.0',
+      });
+
+      const rule = result.rules!['*.{ts,tsx,js,jsx,mjs,cjs}'] as { condition?: unknown; loaders: unknown[] };
+      expect(rule.condition).toEqual({ all: ['browser', { not: { path: /next\/dist\/build\/polyfills/ } }] });
+    },
+  );
+
+  it('excludes dependencies from browser metadata injection when opted in', () => {
+    const result = constructTurbopackConfig({
+      userNextConfig: {},
+      userSentryOptions: { applicationKey: 'my-app', applicationKeyExcludeDependencies: true },
+      nextJsVersion: '16.0.0',
+    });
+
+    expect(result.rules!['*.{ts,tsx,js,jsx,mjs,cjs}']).toEqual({
+      condition: {
+        all: ['browser', { not: { path: /next\/dist\/build\/polyfills/ } }, { not: 'foreign' }],
+      },
+      loaders: [
+        {
+          loader: '/mocked/path/to/moduleMetadataInjectionLoader.js',
+          options: { applicationKey: 'my-app' },
+        },
+      ],
+    });
+  });
+
+  it('should NOT add metadata loader rule when Next.js < 16', () => {
+    const userNextConfig: NextConfigObject = {};
+
+    const result = constructTurbopackConfig({
+      userNextConfig,
+      userSentryOptions: { applicationKey: 'my-app' },
+      nextJsVersion: '15.4.1',
+    });
+
+    expect(result.rules!['*.{ts,tsx,js,jsx,mjs,cjs}']).toBeUndefined();
+  });
+
+  it.each([undefined, true])(
+    'does not inject metadata without applicationKey when exclusion is %s',
+    applicationKeyExcludeDependencies => {
+      const userNextConfig: NextConfigObject = {};
+
+      const result = constructTurbopackConfig({
+        userNextConfig,
+        userSentryOptions: { applicationKeyExcludeDependencies },
+        nextJsVersion: '16.0.0',
+      });
+
+      expect(result.rules!['*.{ts,tsx,js,jsx,mjs,cjs}']).toBeUndefined();
+    },
+  );
+
+  it('should NOT add metadata loader rule when nextJsVersion is undefined', () => {
+    const userNextConfig: NextConfigObject = {};
+
+    const result = constructTurbopackConfig({
+      userNextConfig,
+      userSentryOptions: { applicationKey: 'my-app' },
+      nextJsVersion: undefined,
+    });
+
+    expect(result.rules!['*.{ts,tsx,js,jsx,mjs,cjs}']).toBeUndefined();
+  });
+
+  it('should pass applicationKey through to loader options correctly', () => {
+    const userNextConfig: NextConfigObject = {};
+
+    const result = constructTurbopackConfig({
+      userNextConfig,
+      userSentryOptions: { applicationKey: 'custom-key-123' },
+      nextJsVersion: '16.0.0',
+    });
+
+    const rule = result.rules!['*.{ts,tsx,js,jsx,mjs,cjs}'] as {
+      loaders: Array<{ loader: string; options: { applicationKey: string } }>;
+    };
+    expect(rule.loaders[0]!.options.applicationKey).toBe('custom-key-123');
+  });
+
+  it('should coexist with existing value injection rules', () => {
+    const userNextConfig: NextConfigObject = {};
+    const mockRouteManifest: RouteManifest = {
+      dynamicRoutes: [],
+      staticRoutes: [{ path: '/', regex: '/' }],
+    };
+
+    const result = constructTurbopackConfig({
+      userNextConfig,
+      userSentryOptions: { applicationKey: 'my-app' },
+      routeManifest: mockRouteManifest,
+      nextJsVersion: '16.0.0',
+    });
+
+    // Value injection rules should still be present
+    expect(result.rules!['**/instrumentation-client.*']).toBeDefined();
+    expect(result.rules!['**/instrumentation.*']).toBeDefined();
+    // Metadata loader rule should also be present
+    expect(result.rules!['*.{ts,tsx,js,jsx,mjs,cjs}']).toBeDefined();
+  });
+
+  it('should add metadata loader rule for Next.js 17+', () => {
+    const pathResolveSpy = vi.spyOn(path, 'resolve');
+    pathResolveSpy.mockImplementation((...args: string[]) => {
+      const lastArg = args[args.length - 1];
+      if (lastArg === 'moduleMetadataInjectionLoader.js') {
+        return '/mocked/path/to/moduleMetadataInjectionLoader.js';
+      }
+      return '/mocked/path/to/valueInjectionLoader.js';
+    });
+
+    const userNextConfig: NextConfigObject = {};
+
+    const result = constructTurbopackConfig({
+      userNextConfig,
+      userSentryOptions: { applicationKey: 'my-app' },
+      nextJsVersion: '17.0.0',
+    });
+
+    expect(result.rules!['*.{ts,tsx,js,jsx,mjs,cjs}']).toEqual({
+      condition: { all: ['browser', { not: { path: /next\/dist\/build\/polyfills/ } }] },
+      loaders: [
+        {
+          loader: '/mocked/path/to/moduleMetadataInjectionLoader.js',
+          options: {
+            applicationKey: 'my-app',
+          },
+        },
+      ],
+    });
+  });
+});
+
+describe('componentAnnotation with turbopackReactComponentAnnotation', () => {
+  it('should add component annotation loader rule when enabled and Next.js >= 16', () => {
+    const pathResolveSpy = vi.spyOn(path, 'resolve');
+    pathResolveSpy.mockImplementation((...args: string[]) => {
+      const lastArg = args[args.length - 1];
+      if (lastArg === 'componentAnnotationLoader.js') {
+        return '/mocked/path/to/componentAnnotationLoader.js';
+      }
+      if (lastArg === 'moduleMetadataInjectionLoader.js') {
+        return '/mocked/path/to/moduleMetadataInjectionLoader.js';
+      }
+      return '/mocked/path/to/valueInjectionLoader.js';
+    });
+
+    const userNextConfig: NextConfigObject = {};
+
+    const result = constructTurbopackConfig({
+      userNextConfig,
+      userSentryOptions: {
+        _experimental: {
+          turbopackReactComponentAnnotation: { enabled: true },
+        },
+      },
+      nextJsVersion: '16.0.0',
+    });
+
+    expect(result.rules!['*.{tsx,jsx}']).toEqual({
+      condition: { not: 'foreign' },
+      loaders: [
+        {
+          loader: '/mocked/path/to/componentAnnotationLoader.js',
+          options: {
+            ignoredComponents: [],
+          },
+        },
+      ],
+    });
+  });
+
+  it('should NOT add component annotation rule when enabled is false', () => {
+    const userNextConfig: NextConfigObject = {};
+
+    const result = constructTurbopackConfig({
+      userNextConfig,
+      userSentryOptions: {
+        _experimental: {
+          turbopackReactComponentAnnotation: { enabled: false },
+        },
+      },
+      nextJsVersion: '16.0.0',
+    });
+
+    expect(result.rules!['*.{tsx,jsx}']).toBeUndefined();
+  });
+
+  it('should NOT add component annotation rule when not set', () => {
+    const userNextConfig: NextConfigObject = {};
+
+    const result = constructTurbopackConfig({
+      userNextConfig,
+      userSentryOptions: {},
+      nextJsVersion: '16.0.0',
+    });
+
+    expect(result.rules!['*.{tsx,jsx}']).toBeUndefined();
+  });
+
+  it('should NOT add component annotation rule when Next.js < 16', () => {
+    const userNextConfig: NextConfigObject = {};
+
+    const result = constructTurbopackConfig({
+      userNextConfig,
+      userSentryOptions: {
+        _experimental: {
+          turbopackReactComponentAnnotation: { enabled: true },
+        },
+      },
+      nextJsVersion: '15.4.1',
+    });
+
+    expect(result.rules!['*.{tsx,jsx}']).toBeUndefined();
+  });
+
+  it('should NOT add component annotation rule when nextJsVersion is undefined', () => {
+    const userNextConfig: NextConfigObject = {};
+
+    const result = constructTurbopackConfig({
+      userNextConfig,
+      userSentryOptions: {
+        _experimental: {
+          turbopackReactComponentAnnotation: { enabled: true },
+        },
+      },
+      nextJsVersion: undefined,
+    });
+
+    expect(result.rules!['*.{tsx,jsx}']).toBeUndefined();
+  });
+
+  it('should pass ignoredComponents to loader options', () => {
+    const pathResolveSpy = vi.spyOn(path, 'resolve');
+    pathResolveSpy.mockImplementation((...args: string[]) => {
+      const lastArg = args[args.length - 1];
+      if (lastArg === 'componentAnnotationLoader.js') {
+        return '/mocked/path/to/componentAnnotationLoader.js';
+      }
+      if (lastArg === 'moduleMetadataInjectionLoader.js') {
+        return '/mocked/path/to/moduleMetadataInjectionLoader.js';
+      }
+      return '/mocked/path/to/valueInjectionLoader.js';
+    });
+
+    const userNextConfig: NextConfigObject = {};
+
+    const result = constructTurbopackConfig({
+      userNextConfig,
+      userSentryOptions: {
+        _experimental: {
+          turbopackReactComponentAnnotation: {
+            enabled: true,
+            ignoredComponents: ['Header', 'Footer'],
+          },
+        },
+      },
+      nextJsVersion: '16.0.0',
+    });
+
+    const rule = result.rules!['*.{tsx,jsx}'] as {
+      condition: unknown;
+      loaders: Array<{ loader: string; options: { ignoredComponents: string[] } }>;
+    };
+    expect(rule.loaders[0]!.options.ignoredComponents).toEqual(['Header', 'Footer']);
+  });
+
+  it('should coexist with value injection and module metadata rules', () => {
+    const pathResolveSpy = vi.spyOn(path, 'resolve');
+    pathResolveSpy.mockImplementation((...args: string[]) => {
+      const lastArg = args[args.length - 1];
+      if (lastArg === 'componentAnnotationLoader.js') {
+        return '/mocked/path/to/componentAnnotationLoader.js';
+      }
+      if (lastArg === 'moduleMetadataInjectionLoader.js') {
+        return '/mocked/path/to/moduleMetadataInjectionLoader.js';
+      }
+      return '/mocked/path/to/valueInjectionLoader.js';
+    });
+
+    const userNextConfig: NextConfigObject = {};
+    const mockRouteManifest: RouteManifest = {
+      dynamicRoutes: [],
+      staticRoutes: [{ path: '/', regex: '/' }],
+    };
+
+    const result = constructTurbopackConfig({
+      userNextConfig,
+      userSentryOptions: {
+        applicationKey: 'my-app',
+        _experimental: {
+          turbopackReactComponentAnnotation: { enabled: true },
+        },
+      },
+      routeManifest: mockRouteManifest,
+      nextJsVersion: '16.0.0',
+    });
+
+    // Value injection rules should be present
+    expect(result.rules!['**/instrumentation-client.*']).toBeDefined();
+    expect(result.rules!['**/instrumentation.*']).toBeDefined();
+    // Module metadata loader should be present
+    expect(result.rules!['*.{ts,tsx,js,jsx,mjs,cjs}']).toBeDefined();
+    // Component annotation loader should be present
+    expect(result.rules!['*.{tsx,jsx}']).toBeDefined();
+  });
+});
+
+describe('componentAnnotation with top-level reactComponentAnnotation', () => {
+  function mockLoaderPaths(): void {
+    const pathResolveSpy = vi.spyOn(path, 'resolve');
+    pathResolveSpy.mockImplementation((...args: string[]) => {
+      const lastArg = args[args.length - 1];
+      if (lastArg === 'componentAnnotationLoader.js') {
+        return '/mocked/path/to/componentAnnotationLoader.js';
+      }
+      if (lastArg === 'moduleMetadataInjectionLoader.js') {
+        return '/mocked/path/to/moduleMetadataInjectionLoader.js';
+      }
+      return '/mocked/path/to/valueInjectionLoader.js';
+    });
+  }
+
+  function getIgnoredComponents(result: ReturnType<typeof constructTurbopackConfig>): string[] {
+    const rule = result.rules!['*.{tsx,jsx}'] as {
+      loaders: Array<{ loader: string; options: { ignoredComponents: string[] } }>;
+    };
+    return rule.loaders[0]!.options.ignoredComponents;
+  }
+
+  it('adds the component annotation loader rule when enabled and Next.js >= 16', () => {
+    mockLoaderPaths();
+
+    const result = constructTurbopackConfig({
+      userNextConfig: {},
+      userSentryOptions: { reactComponentAnnotation: { enabled: true, ignoredComponents: ['Header'] } },
+      nextJsVersion: '16.0.0',
+    });
+
+    expect(result.rules!['*.{tsx,jsx}']).toEqual({
+      condition: { not: 'foreign' },
+      loaders: [
+        {
+          loader: '/mocked/path/to/componentAnnotationLoader.js',
+          options: {
+            ignoredComponents: ['Header'],
+          },
+        },
+      ],
+    });
+  });
+
+  it('does not add the rule when enabled is false', () => {
+    const result = constructTurbopackConfig({
+      userNextConfig: {},
+      userSentryOptions: { reactComponentAnnotation: { enabled: false } },
+      nextJsVersion: '16.0.0',
+    });
+
+    expect(result.rules!['*.{tsx,jsx}']).toBeUndefined();
+  });
+
+  it('lets the deprecated experimental option override the top-level one', () => {
+    mockLoaderPaths();
+
+    const result = constructTurbopackConfig({
+      userNextConfig: {},
+      userSentryOptions: {
+        reactComponentAnnotation: { enabled: true, ignoredComponents: ['TopLevel'] },
+        _experimental: {
+          turbopackReactComponentAnnotation: { enabled: true, ignoredComponents: ['Experimental'] },
+        },
+      },
+      nextJsVersion: '16.0.0',
+    });
+
+    expect(getIgnoredComponents(result)).toEqual(['Experimental']);
+  });
+
+  it('merges field-wise so the top-level option fills gaps the experimental one leaves', () => {
+    mockLoaderPaths();
+
+    const result = constructTurbopackConfig({
+      userNextConfig: {},
+      userSentryOptions: {
+        reactComponentAnnotation: { enabled: true, ignoredComponents: ['TopLevel'] },
+        _experimental: {
+          turbopackReactComponentAnnotation: { enabled: true },
+        },
+      },
+      nextJsVersion: '16.0.0',
+    });
+
+    expect(getIgnoredComponents(result)).toEqual(['TopLevel']);
+  });
+
+  it('lets the deprecated experimental option disable annotation enabled at the top level', () => {
+    const result = constructTurbopackConfig({
+      userNextConfig: {},
+      userSentryOptions: {
+        reactComponentAnnotation: { enabled: true },
+        _experimental: {
+          turbopackReactComponentAnnotation: { enabled: false },
+        },
+      },
+      nextJsVersion: '16.0.0',
+    });
+
+    expect(result.rules!['*.{tsx,jsx}']).toBeUndefined();
+  });
+
+  describe('Next.js < 16 warning', () => {
+    let consoleWarnSpy: ReturnType<typeof vi.spyOn>;
+
+    beforeEach(() => {
+      consoleWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      consoleWarnSpy.mockRestore();
+    });
+
+    it('warns and skips the rule when the Next.js version is too old', () => {
+      const result = constructTurbopackConfig({
+        userNextConfig: {},
+        userSentryOptions: { reactComponentAnnotation: { enabled: true } },
+        nextJsVersion: '15.4.1',
+      });
+
+      expect(result.rules!['*.{tsx,jsx}']).toBeUndefined();
+      expect(consoleWarnSpy).toHaveBeenCalledWith(expect.stringContaining('requires Next.js 16+'));
+      expect(consoleWarnSpy).toHaveBeenCalledWith(expect.stringContaining('detected 15.4.1'));
+    });
+
+    it('warns without a version when the Next.js version could not be detected', () => {
+      const result = constructTurbopackConfig({
+        userNextConfig: {},
+        userSentryOptions: { reactComponentAnnotation: { enabled: true } },
+        nextJsVersion: undefined,
+      });
+
+      expect(result.rules!['*.{tsx,jsx}']).toBeUndefined();
+      expect(consoleWarnSpy).toHaveBeenCalledWith(expect.stringContaining('requires Next.js 16+'));
+      expect(consoleWarnSpy).not.toHaveBeenCalledWith(expect.stringContaining('detected'));
+    });
+
+    it('does not warn when annotation is not enabled', () => {
+      constructTurbopackConfig({
+        userNextConfig: {},
+        userSentryOptions: { reactComponentAnnotation: { enabled: false } },
+        nextJsVersion: '15.4.1',
+      });
+
+      expect(consoleWarnSpy).not.toHaveBeenCalled();
+    });
+
+    it('does not warn on a supported Next.js version', () => {
+      mockLoaderPaths();
+
+      constructTurbopackConfig({
+        userNextConfig: {},
+        userSentryOptions: { reactComponentAnnotation: { enabled: true } },
+        nextJsVersion: '16.0.0',
+      });
+
+      expect(consoleWarnSpy).not.toHaveBeenCalled();
+    });
+  });
+});
+
+describe('orchestrion build-time instrumentation', () => {
+  function getOrchestrionOptions(result: ReturnType<typeof constructTurbopackConfig>): {
+    instrumentations: Array<{ module: { name: string; filePath: unknown } }>;
+  } {
+    const rule = result.rules!['*.{js,mjs,cjs}'] as unknown as {
+      loaders: Array<{ options: { instrumentations: Array<{ module: { name: string; filePath: unknown } }> } }>;
+    };
+    return rule.loaders[0]!.options;
+  }
+
+  it('serializes a RegExp filePath so it survives Turbopack JSON loader options', () => {
+    const result = constructTurbopackConfig({
+      userNextConfig: {},
+      userSentryOptions: {},
+      nextJsVersion: '16.0.0',
+    });
+
+    const firestore = getOrchestrionOptions(result).instrumentations.find(i => i.module.name === '@firebase/firestore');
+
+    expect(firestore).toBeDefined();
+    expect(firestore!.module.filePath).toEqual({
+      type: 'RegExp',
+      source: expect.any(String),
+      flags: expect.any(String),
+    });
+    expect(firestore!.module.filePath).not.toBeInstanceOf(RegExp);
+    // A raw RegExp would `JSON.stringify` to `{}`, dropping the match entirely.
+    expect(JSON.parse(JSON.stringify(firestore!.module.filePath))).not.toEqual({});
+  });
+
+  it('passes the snippet module as an absolute importHelperPath', () => {
+    const result = constructTurbopackConfig({
+      userNextConfig: {},
+      userSentryOptions: {},
+      nextJsVersion: '16.0.0',
+    });
+
+    const rule = result.rules!['*.{js,mjs,cjs}'] as {
+      loaders: Array<{ options: { importHelperPath?: string } }>;
+    };
+    const importHelperPath = rule.loaders[0]!.options.importHelperPath;
+
+    // The loader derives a per-file RELATIVE specifier from this path —
+    // Turbopack rejects absolute-path imports, and a bare specifier doesn't
+    // resolve from inside a transformed package under isolated installs (pnpm).
+    // The snippet imports the helper and the subscriber factory from
+    // `@sentry/server-utils` (the main entry), not the orchestrion subpath.
+    expect(importHelperPath).toBeDefined();
+    expect(path.isAbsolute(importHelperPath!)).toBe(true);
+    expect(importHelperPath).toContain('server-utils');
+    expect(importHelperPath).not.toContain('orchestrion');
+  });
+
+  function getOrchestrionCondition(result: ReturnType<typeof constructTurbopackConfig>): {
+    all: [string, { path: RegExp }];
+  } {
+    const rule = result.rules!['*.{js,mjs,cjs}'] as unknown as { condition: { all: [string, { path: RegExp }] } };
+    return rule.condition;
+  }
+
+  it('restricts the orchestrion rule to the node environment', () => {
+    const result = constructTurbopackConfig({
+      userNextConfig: {},
+      userSentryOptions: {},
+      nextJsVersion: '16.0.0',
+    });
+
+    // `'node'` is what keeps the transform off client code — orchestrion
+    // splices `node:diagnostics_channel` calls that throw `X is not a function` in the browser.
+    expect(getOrchestrionCondition(result)).toEqual({ all: ['node', { path: expect.any(RegExp) }] });
+  });
+
+  it('only sends files of instrumented packages through the loader', () => {
+    const result = constructTurbopackConfig({
+      userNextConfig: {},
+      userSentryOptions: {},
+      nextJsVersion: '16.0.0',
+    });
+
+    // Turbopack runs webpack loaders out of process, per file. Without a path filter every
+    // server-side JS file — all of node_modules included — pays that cost (see #24764).
+    const { path: pathCondition } = getOrchestrionCondition(result).all[1];
+
+    expect(pathCondition.test('node_modules/openai/resources/chat/completions/completions.js')).toBe(true);
+    expect(pathCondition.test('node_modules/@anthropic-ai/sdk/resources/messages/messages.mjs')).toBe(true);
+    expect(
+      pathCondition.test(
+        'node_modules/.pnpm/@anthropic-ai+sdk@0.50.0/node_modules/@anthropic-ai/sdk/resources/messages/messages.js',
+      ),
+    ).toBe(true);
+    expect(pathCondition.test('apps/web/node_modules/pg/lib/client.js')).toBe(true);
+
+    expect(pathCondition.test('node_modules/next/dist/server/app-render/app-render.js')).toBe(false);
+    expect(pathCondition.test('node_modules/openai-agents/dist/index.js')).toBe(false);
+    expect(pathCondition.test('node_modules/lodash/lodash.js')).toBe(false);
+    expect(pathCondition.test('app/api/chat/route.js')).toBe(false);
+  });
+
+  it('does not add the orchestrion rule when build-time instrumentation is turned off', () => {
+    const result = constructTurbopackConfig({
+      userNextConfig: {},
+      userSentryOptions: { buildTimeInstrumentation: false },
+      nextJsVersion: '16.0.0',
+    });
+
+    expect(result.rules!['*.{js,mjs,cjs}']).toBeUndefined();
+  });
+
+  it('does not add the orchestrion rule below Next.js 16, where rule conditions are unsupported', () => {
+    const result = constructTurbopackConfig({
+      userNextConfig: {},
+      userSentryOptions: {},
+      nextJsVersion: '15.4.1',
+    });
+
+    expect(result.rules?.['*.{js,mjs,cjs}']).toBeUndefined();
+  });
+});
+
+describe('safelyAddTurbopackRule', () => {
+  const mockRule = {
+    loaders: [
+      {
+        loader: '/test/loader.js',
+        options: { test: 'value' },
+      },
+    ],
+  };
+
+  describe('with undefined/null existingRules', () => {
+    it('should create new rules object when existingRules is undefined', () => {
+      const result = safelyAddTurbopackRule(undefined, {
+        matcher: '*.test.js',
+        rule: mockRule,
+      });
+
+      expect(result).toEqual({
+        '*.test.js': mockRule,
+      });
+    });
+
+    it('should create new rules object when existingRules is null', () => {
+      const result = safelyAddTurbopackRule(null as any, {
+        matcher: '*.test.js',
+        rule: mockRule,
+      });
+
+      expect(result).toEqual({
+        '*.test.js': mockRule,
+      });
+    });
+  });
+
+  describe('with existing rules', () => {
+    it('should add new rule to existing rules object', () => {
+      const existingRules = {
+        '*.css': ['css-loader'],
+        '*.scss': ['sass-loader'],
+      };
+
+      const result = safelyAddTurbopackRule(existingRules, {
+        matcher: '*.test.js',
+        rule: mockRule,
+      });
+
+      expect(result).toEqual({
+        '*.css': ['css-loader'],
+        '*.scss': ['sass-loader'],
+        '*.test.js': mockRule,
+      });
+    });
+
+    it('should not override existing rule with same matcher', () => {
+      const existingRule = {
+        loaders: [
+          {
+            loader: '/existing/loader.js',
+            options: { existing: 'option' },
+          },
+        ],
+      };
+
+      const existingRules = {
+        '*.css': ['css-loader'],
+        '*.test.js': existingRule,
+      };
+
+      const result = safelyAddTurbopackRule(existingRules, {
+        matcher: '*.test.js',
+        rule: mockRule,
+      });
+
+      expect(result).toEqual({
+        '*.css': ['css-loader'],
+        '*.test.js': existingRule,
+      });
+    });
+
+    it('should handle empty rules object', () => {
+      const existingRules = {};
+
+      const result = safelyAddTurbopackRule(existingRules, {
+        matcher: '*.test.js',
+        rule: mockRule,
+      });
+
+      expect(result).toEqual({
+        '*.test.js': mockRule,
+      });
+    });
+  });
+
+  describe('with different rule formats', () => {
+    it('should handle string array rule (shortcut format)', () => {
+      const existingRules = {
+        '*.css': ['css-loader'],
+      };
+
+      const result = safelyAddTurbopackRule(existingRules, {
+        matcher: '*.test.js',
+        rule: ['jest-loader', 'babel-loader'],
+      });
+
+      expect(result).toEqual({
+        '*.css': ['css-loader'],
+        '*.test.js': ['jest-loader', 'babel-loader'],
+      });
+    });
+
+    it('should handle complex rule with conditions', () => {
+      const existingRules = {
+        '*.css': ['css-loader'],
+      };
+
+      const complexRule = {
+        loaders: [
+          {
+            loader: '/test/loader.js',
+            options: { test: 'value' },
+          },
+        ],
+        as: 'javascript/auto',
+      };
+
+      const result = safelyAddTurbopackRule(existingRules, {
+        matcher: '*.test.js',
+        rule: complexRule,
+      });
+
+      expect(result).toEqual({
+        '*.css': ['css-loader'],
+        '*.test.js': complexRule,
+      });
+    });
+
+    it('should handle disabled rule (false)', () => {
+      const existingRules = {
+        '*.css': ['css-loader'],
+      };
+
+      const result = safelyAddTurbopackRule(existingRules, {
+        matcher: '*.test.js',
+        rule: false,
+      });
+
+      expect(result).toEqual({
+        '*.css': ['css-loader'],
+        '*.test.js': false,
+      });
+    });
+  });
+
+  describe('immutable', () => {
+    it('should not mutate original existingRules object', () => {
+      const existingRules = {
+        '*.css': ['css-loader'],
+      };
+
+      const result = safelyAddTurbopackRule(existingRules, {
+        matcher: '*.test.js',
+        rule: mockRule,
+      });
+
+      expect(result).toEqual({
+        '*.css': ['css-loader'],
+        '*.test.js': mockRule,
+      });
+    });
+  });
+
+  describe('additional edge cases for safelyAddTurbopackRule', () => {
+    it('should handle falsy values in rules', () => {
+      const existingRules = {
+        '*.css': ['css-loader'],
+        '*.disabled': false as any,
+        '*.null': null as any,
+      } as any;
+
+      const result = safelyAddTurbopackRule(existingRules, {
+        matcher: '*.test.js',
+        rule: mockRule,
+      });
+
+      expect(result).toEqual({
+        '*.css': ['css-loader'],
+        '*.disabled': false,
+        '*.null': null,
+        '*.test.js': mockRule,
+      } as any);
+    });
+
+    it('should handle undefined rule value', () => {
+      const existingRules = {
+        '*.css': ['css-loader'],
+      };
+
+      const result = safelyAddTurbopackRule(existingRules, {
+        matcher: '*.test.js',
+        rule: undefined as any,
+      });
+
+      expect(result).toEqual({
+        '*.css': ['css-loader'],
+        '*.test.js': undefined,
+      });
+    });
+
+    it('should handle complex matchers with special characters', () => {
+      const existingRules = {};
+      const complexMatcher = '**/node_modules/**/*.{js,ts}';
+
+      const result = safelyAddTurbopackRule(existingRules, {
+        matcher: complexMatcher,
+        rule: mockRule,
+      });
+
+      expect(result).toEqual({
+        [complexMatcher]: mockRule,
+      });
+    });
+
+    it('should preserve nested rule objects', () => {
+      const complexRule = {
+        loaders: [
+          {
+            loader: '/test/loader.js',
+            options: {
+              nested: {
+                deep: 'value',
+                array: [1, 2, 3],
+              },
+            },
+          },
+        ],
+        as: 'javascript/auto',
+        condition: 'test-condition',
+      };
+
+      const result = safelyAddTurbopackRule(undefined, {
+        matcher: '*.complex.js',
+        rule: complexRule,
+      });
+
+      expect(result).toEqual({
+        '*.complex.js': complexRule,
+      });
+    });
+
+    it('should handle matcher that matches an object property key pattern', () => {
+      const existingRules = {
+        '*.test': ['test-loader'],
+        'test.*': ['pattern-loader'],
+      };
+
+      const result = safelyAddTurbopackRule(existingRules, {
+        matcher: '*.test',
+        rule: mockRule,
+      });
+
+      // Should not override the existing rule
+      expect(result).toEqual({
+        '*.test': ['test-loader'],
+        'test.*': ['pattern-loader'],
+      });
+    });
+  });
+});

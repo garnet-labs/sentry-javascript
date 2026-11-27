@@ -1,0 +1,402 @@
+/* eslint-disable max-lines */
+import {
+  HTTP_REQUEST_METHOD,
+  HTTP_RESPONSE_BODY_SIZE,
+  SENTRY_OP,
+  SERVER_ADDRESS,
+  SERVER_PORT,
+  URL_DOMAIN,
+  URL_FRAGMENT,
+  URL_FULL,
+  URL_QUERY,
+  SENTRY_ORIGIN,
+} from '@sentry/conventions/attributes';
+import { HTTP_CLIENT } from '@sentry/conventions/op';
+import type { Client } from './client';
+import { getClient } from './currentScopes';
+import { setHttpStatus, SPAN_STATUS_ERROR, spanIsIgnored } from './tracing';
+import { startInactiveSpan } from './tracing/trace';
+import { SentryNonRecordingSpan } from './tracing/sentryNonRecordingSpan';
+import { hasSpanStreamingEnabled } from './tracing/spans/hasSpanStreamingEnabled';
+import type { FetchBreadcrumbHint } from './types/breadcrumb';
+import type { HandlerDataFetch } from './types/instrument';
+import type { ResponseHookInfo } from './types/request';
+import type { Span, SpanAttributes, SpanOrigin } from './types/span';
+import { SENTRY_BAGGAGE_KEY_PREFIX } from './utils/baggage';
+import { filterCollectedUrl, filterCollectedUrlQuery } from './utils/data-collection/filterCollectedUrl';
+import { hasSpansEnabled } from './utils/hasSpansEnabled';
+import { isInstanceOf, isRequest } from './utils/is';
+import { getActiveSpan } from './utils/spanUtils';
+import { getTraceData } from './utils/traceData';
+import {
+  getSanitizedUrlStringFromUrlObject,
+  getUrlDomain,
+  getUrlFragment,
+  getUrlQuery,
+  isURLObjectRelative,
+  parseStringToURLObject,
+  stripDataUrlContent,
+} from './utils/url';
+
+type PolymorphicRequestHeaders =
+  | Record<string, unknown>
+  | Array<[string, unknown]>
+  | Iterable<Iterable<unknown>>
+  // the below is not precisely the Header type used in Request, but it'll pass duck-typing
+  | {
+      append: (key: string, value: string) => void;
+      get: (key: string) => string | null | undefined;
+    };
+
+interface InstrumentFetchRequestOptions {
+  spanOrigin?: SpanOrigin;
+  propagateTraceparent?: boolean;
+  onRequestSpanEnd?: (span: Span, responseInformation: ResponseHookInfo) => void;
+  /** Base URL for relative request URLs. Browsers pass the page URL; server runtimes have none. */
+  urlBase?: string;
+}
+
+/**
+ * Create and track fetch request spans for usage in combination with `addFetchInstrumentationHandler`.
+ *
+ * @returns Span if a span was created, otherwise void.
+ */
+export function instrumentFetchRequest(
+  handlerData: HandlerDataFetch,
+  shouldCreateSpan: (url: string) => boolean,
+  shouldAttachHeaders: (url: string) => boolean,
+  spans: Record<string, Span>,
+  instrumentFetchRequestOptions?: InstrumentFetchRequestOptions,
+): Span | undefined {
+  if (!handlerData.fetchData) {
+    return undefined;
+  }
+
+  const { method, url } = handlerData.fetchData;
+
+  const shouldCreateSpanResult = hasSpansEnabled() && shouldCreateSpan(url);
+
+  if (handlerData.endTimestamp) {
+    const spanId = handlerData.fetchData.__span;
+    if (!spanId) return;
+
+    const span = spans[spanId];
+
+    if (span) {
+      // Only end the span and call hooks if we're actually recording
+      if (shouldCreateSpanResult) {
+        endSpan(span, handlerData);
+        _callOnRequestSpanEnd(span, handlerData, instrumentFetchRequestOptions);
+      }
+
+      // eslint-disable-next-line @typescript-eslint/no-dynamic-delete
+      delete spans[spanId];
+    }
+
+    return undefined;
+  }
+
+  const {
+    spanOrigin = 'auto.http.browser',
+    propagateTraceparent = false,
+    urlBase,
+  } = instrumentFetchRequestOptions ?? {};
+
+  const client = getClient();
+  const hasParent = !!getActiveSpan();
+  // With span streaming, we always emit http.client spans, even without a parent span
+  const shouldEmitSpan = hasParent || (!!client && hasSpanStreamingEnabled(client));
+
+  const span =
+    shouldCreateSpanResult && shouldEmitSpan
+      ? startInactiveSpan(getSpanStartOptions(url, method, spanOrigin, client, urlBase))
+      : new SentryNonRecordingSpan();
+  const spanForTraceHeaders = spanIsIgnored(span) && hasParent ? undefined : span;
+
+  if (shouldCreateSpanResult && !shouldEmitSpan) {
+    client?.recordDroppedEvent('no_parent_span', 'span');
+  }
+
+  handlerData.fetchData.__span = span.spanContext().spanId;
+  spans[span.spanContext().spanId] = span;
+
+  if (shouldAttachHeaders(handlerData.fetchData.url)) {
+    const request: string | Request = handlerData.args[0];
+
+    // Shallow clone the options object to avoid mutating the original user-provided object
+    // Examples: users re-using same options object for multiple fetch calls, frozen objects
+    const options: { [key: string]: unknown } = { ...(handlerData.args[1] || {}) };
+
+    const headers = _INTERNAL_getTracingHeadersForFetchRequest(
+      request,
+      options,
+      // If performance is disabled (TWP) or there's no active root span (pageload/navigation/interaction),
+      // we do not want to use the span as base for the trace headers,
+      // which means that the headers will be generated from the scope and the sampling decision is deferred
+      hasSpansEnabled() && shouldEmitSpan ? spanForTraceHeaders : undefined,
+      propagateTraceparent,
+    );
+    if (headers) {
+      // Ensure this is actually set, if no options have been passed previously
+      handlerData.args[1] = options;
+      options.headers = headers;
+    }
+  }
+
+  if (client) {
+    const fetchHint = {
+      input: handlerData.args,
+      response: handlerData.response,
+      startTimestamp: handlerData.startTimestamp,
+      endTimestamp: handlerData.endTimestamp,
+    } satisfies FetchBreadcrumbHint;
+
+    client.emit('beforeOutgoingRequestSpan', span, fetchHint);
+  }
+
+  return span;
+}
+
+/**
+ * Calls the onRequestSpanEnd callback if it is defined.
+ */
+export function _callOnRequestSpanEnd(
+  span: Span,
+  handlerData: HandlerDataFetch,
+  instrumentFetchRequestOptions?: InstrumentFetchRequestOptions,
+): void {
+  instrumentFetchRequestOptions?.onRequestSpanEnd?.(span, {
+    headers: handlerData.response?.headers,
+    error: handlerData.error,
+  });
+}
+
+/**
+ * Builds merged fetch headers that include `sentry-trace` and `baggage` (and optionally `traceparent`)
+ * for the given request and init, without mutating the original request or options.
+ * Returns `undefined` when there is no `sentry-trace` value to attach.
+ *
+ * @internal Exported for cross-package instrumentation (for example Cloudflare Workers fetcher bindings)
+ * and unit tests
+ *
+ * Baggage handling:
+ * 1. No previous baggage header → include Sentry baggage
+ * 2. Previous baggage has no Sentry entries → merge Sentry baggage in
+ * 3. Previous baggage already has Sentry entries → leave as-is (may be user-defined)
+ */
+// eslint-disable-next-line complexity -- yup it's this complicated :(
+export function _INTERNAL_getTracingHeadersForFetchRequest(
+  request: string | URL | Request,
+  fetchOptionsObj: {
+    headers?:
+      | {
+          [key: string]: string[] | string | undefined;
+        }
+      | PolymorphicRequestHeaders;
+  },
+  span?: Span,
+  propagateTraceparent?: boolean,
+): PolymorphicRequestHeaders | undefined {
+  const traceHeaders = getTraceData({ span, propagateTraceparent });
+  const sentryTrace = traceHeaders['sentry-trace'];
+  const baggage = traceHeaders.baggage;
+  const traceparent = traceHeaders.traceparent;
+
+  // Nothing to do, when we return undefined here, the original headers will be used
+  if (!sentryTrace) {
+    return undefined;
+  }
+
+  const originalHeaders = fetchOptionsObj.headers || (isRequest(request) ? request.headers : undefined);
+
+  if (!originalHeaders) {
+    return {
+      'sentry-trace': sentryTrace,
+      ...(baggage && { baggage }),
+      ...(traceparent && { traceparent }),
+    };
+  } else if (isHeaders(originalHeaders)) {
+    const newHeaders = new Headers(originalHeaders);
+
+    // We don't want to override manually added sentry headers
+    if (!newHeaders.get('sentry-trace')) {
+      newHeaders.set('sentry-trace', sentryTrace);
+    }
+
+    if (propagateTraceparent && traceparent && !newHeaders.get('traceparent')) {
+      newHeaders.set('traceparent', traceparent);
+    }
+
+    if (baggage) {
+      const prevBaggageHeader = newHeaders.get('baggage');
+
+      if (!prevBaggageHeader) {
+        newHeaders.set('baggage', baggage);
+      } else if (!baggageHeaderHasSentryBaggageValues(prevBaggageHeader)) {
+        newHeaders.set('baggage', `${prevBaggageHeader},${baggage}`);
+      }
+    }
+
+    return newHeaders;
+  } else if (isHeadersInitTupleArray(originalHeaders)) {
+    const newHeaders = [...originalHeaders];
+
+    if (!newHeaders.find(header => header[0] === 'sentry-trace')) {
+      newHeaders.push(['sentry-trace', sentryTrace]);
+    }
+
+    if (propagateTraceparent && traceparent && !newHeaders.find(header => header[0] === 'traceparent')) {
+      newHeaders.push(['traceparent', traceparent]);
+    }
+
+    const prevBaggageHeaderWithSentryValues = originalHeaders.find(
+      header =>
+        header[0] === 'baggage' && typeof header[1] === 'string' && baggageHeaderHasSentryBaggageValues(header[1]),
+    );
+
+    if (baggage && !prevBaggageHeaderWithSentryValues) {
+      // If there are multiple entries with the same key, the browser will merge the values into a single request header.
+      // Its therefore safe to simply push a "baggage" entry, even though there might already be another baggage header.
+      newHeaders.push(['baggage', baggage]);
+    }
+
+    return newHeaders;
+  } else {
+    const existingSentryTraceHeader = 'sentry-trace' in originalHeaders ? originalHeaders['sentry-trace'] : undefined;
+    const existingTraceparentHeader = 'traceparent' in originalHeaders ? originalHeaders.traceparent : undefined;
+    const existingBaggageHeader = 'baggage' in originalHeaders ? originalHeaders.baggage : undefined;
+
+    const newBaggageHeaders: string[] = existingBaggageHeader
+      ? Array.isArray(existingBaggageHeader)
+        ? [...existingBaggageHeader]
+        : [existingBaggageHeader]
+      : [];
+
+    const prevBaggageHeaderWithSentryValues =
+      existingBaggageHeader &&
+      (Array.isArray(existingBaggageHeader)
+        ? existingBaggageHeader.find(headerItem => baggageHeaderHasSentryBaggageValues(headerItem))
+        : baggageHeaderHasSentryBaggageValues(existingBaggageHeader));
+
+    if (baggage && !prevBaggageHeaderWithSentryValues) {
+      newBaggageHeaders.push(baggage);
+    }
+
+    const newHeaders: {
+      'sentry-trace': string;
+      baggage?: string;
+      traceparent?: string;
+    } = Object.assign({}, originalHeaders, {
+      'sentry-trace': (existingSentryTraceHeader as string | undefined) ?? sentryTrace,
+      ...(newBaggageHeaders.length > 0 && { baggage: newBaggageHeaders.join(',') }),
+    });
+
+    if (propagateTraceparent && traceparent && !existingTraceparentHeader) {
+      newHeaders.traceparent = traceparent;
+    }
+
+    return newHeaders;
+  }
+}
+
+function endSpan(span: Span, handlerData: HandlerDataFetch): void {
+  if (handlerData.response) {
+    setHttpStatus(span, handlerData.response.status);
+
+    const contentLength = handlerData.response?.headers?.get('content-length');
+
+    if (contentLength) {
+      const contentLengthNum = parseInt(contentLength);
+      if (contentLengthNum > 0) {
+        span.setAttribute(HTTP_RESPONSE_BODY_SIZE, contentLengthNum);
+      }
+    }
+  } else if (handlerData.error) {
+    span.setStatus({ code: SPAN_STATUS_ERROR, message: 'internal_error' });
+  }
+  span.end();
+}
+
+function baggageHeaderHasSentryBaggageValues(baggageHeader: unknown): boolean {
+  if (typeof baggageHeader !== 'string') {
+    return false;
+  }
+
+  return baggageHeader.split(',').some(baggageEntry => baggageEntry.trim().startsWith(SENTRY_BAGGAGE_KEY_PREFIX));
+}
+
+function isHeaders(headers: unknown): headers is Headers {
+  return typeof Headers !== 'undefined' && isInstanceOf(headers, Headers);
+}
+
+/** `HeadersInit` array form: each entry is a [name, value] pair of strings. */
+function isHeadersInitTupleArray(headers: unknown): headers is [string, unknown][] {
+  if (!Array.isArray(headers)) {
+    return false;
+  }
+
+  return headers.every(
+    (item): item is [string, unknown] => Array.isArray(item) && item.length === 2 && typeof item[0] === 'string',
+  );
+}
+
+function getSpanStartOptions(
+  url: string,
+  method: string,
+  spanOrigin: SpanOrigin,
+  client: Client | undefined,
+  urlBase: string | undefined,
+): Parameters<typeof startInactiveSpan>[0] {
+  // With span streaming, span names have to be low cardinality, so only the domain is kept. Outgoing
+  // requests have no route to fall back on, so one without a domain is named after the method alone.
+  const isStreamed = !!client && hasSpanStreamingEnabled(client);
+  const domain = getUrlDomain(url, urlBase);
+
+  // Data URLs need special handling because parseStringToURLObject treats them as "relative"
+  // (no "://"), causing getSanitizedUrlStringFromUrlObject to return just the pathname
+  // without the "data:" prefix, making later stripDataUrlContent calls ineffective.
+  // So for data URLs, we strip the content first and use that directly.
+  if (url.startsWith('data:')) {
+    const sanitizedUrl = stripDataUrlContent(url);
+    return {
+      name: isStreamed ? method : `${method} ${sanitizedUrl}`,
+      attributes: getFetchSpanAttributes(url, undefined, method, spanOrigin, client, domain),
+    };
+  }
+
+  const parsedUrl = parseStringToURLObject(url);
+  const sanitizedUrl = parsedUrl ? getSanitizedUrlStringFromUrlObject(parsedUrl) : url;
+  return {
+    name: isStreamed ? (domain ? `${method} ${domain}` : method) : `${method} ${sanitizedUrl}`,
+    attributes: getFetchSpanAttributes(url, parsedUrl, method, spanOrigin, client, domain),
+  };
+}
+
+function getFetchSpanAttributes(
+  url: string,
+  parsedUrl: ReturnType<typeof parseStringToURLObject>,
+  method: string,
+  spanOrigin: SpanOrigin,
+  client: Client | undefined,
+  domain: string | undefined,
+): SpanAttributes {
+  const attributes: SpanAttributes = {
+    [URL_FULL]: filterCollectedUrl(stripDataUrlContent(url), client),
+    type: 'fetch',
+    // oxlint-disable-next-line typescript/no-deprecated
+    [HTTP_REQUEST_METHOD]: method,
+    [SENTRY_ORIGIN]: spanOrigin,
+    [SENTRY_OP]: HTTP_CLIENT,
+    [URL_DOMAIN]: domain,
+  };
+  if (parsedUrl) {
+    if (!isURLObjectRelative(parsedUrl)) {
+      attributes[URL_FULL] = filterCollectedUrl(stripDataUrlContent(parsedUrl.href), client);
+      attributes[SERVER_ADDRESS] = parsedUrl.hostname;
+      attributes[SERVER_PORT] = parsedUrl.port ? Number(parsedUrl.port) : undefined;
+    }
+    attributes[URL_QUERY] = filterCollectedUrlQuery(getUrlQuery(parsedUrl.search), client);
+    attributes[URL_FRAGMENT] = getUrlFragment(parsedUrl.hash);
+  }
+  return attributes;
+}

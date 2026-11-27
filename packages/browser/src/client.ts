@@ -1,0 +1,252 @@
+import type {
+  BrowserTunnelOptions,
+  ClientOptions,
+  Event,
+  EventHint,
+  Options as CoreOptions,
+  ParameterizedString,
+  Scope,
+  SeverityLevel,
+  TunnelInit,
+} from '@sentry/core';
+import type { BrowserClientReplayOptions } from '@sentry/core/browser';
+import type { RouteProvider } from '@sentry/browser-utils';
+import { setRouteProvider } from '@sentry/browser-utils';
+import { addAutoIpAddressToSession, applySdkMetadata, Client, getSDKSource, timestampInSeconds } from '@sentry/core';
+import { eventFromException, eventFromMessage } from './eventbuilder';
+import { WINDOW } from './helpers';
+import type { BrowserTransportOptions } from './transports/types';
+
+/**
+ * A magic string that build tooling can leverage in order to inject a release value into the SDK.
+ */
+declare const __SENTRY_RELEASE__: string | undefined;
+
+export type BrowserClientProfilingOptions = {
+  /**
+   * Sets profiling session sample rate for the entire profiling session.
+   *
+   * A profiling session corresponds to a user session, meaning it is set once at integration initialization and
+   * persisted until the next page reload. This rate determines what percentage of user sessions will have profiling enabled.
+   * @default 0
+   */
+  profileSessionSampleRate?: number;
+
+  /**
+   * Set the lifecycle mode of the profiler.
+   * - **manual**: The profiler will be manually started and stopped via `startProfiler`/`stopProfiler`.
+   *    If a session is sampled, is dependent on the `profileSessionSampleRate`.
+   * - **trace**: The profiler will be automatically started when a root span exists and stopped when there are no
+   *    more sampled root spans. Whether a session is sampled, is dependent on the `profileSessionSampleRate` and the
+   *    existing sampling configuration for tracing (`tracesSampleRate`/`tracesSampler`).
+   *
+   * @default 'manual'
+   */
+  profileLifecycle?: 'manual' | 'trace';
+};
+
+type BrowserSpecificOptions = BrowserClientReplayOptions &
+  BrowserClientProfilingOptions & {
+    /** If configured, this URL will be used as base URL for lazy loading integration. */
+    cdnBaseUrl?: string;
+
+    /**
+     * Important: Only set this option if you know what you are doing!
+     *
+     * By default, the SDK will check if `Sentry.init` is called in a browser extension.
+     * In case it is, it will stop initialization and log a warning
+     * because browser extensions require a different Sentry initialization process:
+     * https://docs.sentry.io/platforms/javascript/best-practices/shared-environments/
+     *
+     * Setting up the SDK in a browser extension with global error monitoring is not recommended
+     * and will likely flood you with errors from other web sites or extensions. This can heavily
+     * impact your quota and cause interference with your and other Sentry SDKs in shared environments.
+     *
+     * If this check wrongfully flags your setup as a browser extension, you can set this
+     * option to `true` to skip the check.
+     *
+     * @default false
+     */
+    skipBrowserExtensionCheck?: boolean;
+
+    /**
+     * If you use Spotlight by Sentry during development, use
+     * this option to forward captured Sentry events to Spotlight.
+     *
+     * Either set it to true, or provide a specific Spotlight Sidecar URL.
+     *
+     * More details: https://spotlightjs.com/
+     *
+     * IMPORTANT: Only set this option to `true` while developing, not in production!
+     */
+    spotlight?: boolean | string;
+
+    /**
+     * Resolves URLs to low-cardinality route names, e.g. `/users/42` -> `/users/:id`.
+     *
+     * Framework SDKs set this for you. Set it yourself to name routes for a router the SDK has no
+     * integration for. `setRouteProvider` replaces it at runtime.
+     */
+    routeProvider?: RouteProvider;
+  };
+/**
+ * Configuration options for the Sentry Browser SDK.
+ * @see @sentry/core Options for more information.
+ */
+export type BrowserOptions = CoreOptions<BrowserTransportOptions> &
+  BrowserSpecificOptions & {
+    /**
+     * Where to send envelopes instead of the Sentry ingest URL, see {@link TunnelInit}.
+     *
+     * @default undefined
+     */
+    tunnel?: TunnelInit<BrowserTunnelOptions>;
+  };
+
+/**
+ * Configuration options for the Sentry Browser SDK Client class
+ * @see BrowserClient for more information.
+ */
+export type BrowserClientOptions = ClientOptions<BrowserTransportOptions> & BrowserSpecificOptions;
+
+/**
+ * The Sentry Browser SDK Client.
+ *
+ * @see BrowserOptions for documentation on configuration options.
+ * @see SentryClient for usage documentation.
+ */
+export class BrowserClient extends Client<BrowserClientOptions> {
+  /**
+   * Creates a new Browser SDK instance.
+   *
+   * @param options Configuration options for this SDK.
+   */
+  public constructor(options: BrowserClientOptions) {
+    const opts = applyDefaultOptions(options);
+    const sdkSource = WINDOW.SENTRY_SDK_SOURCE || getSDKSource();
+    applySdkMetadata(opts, 'browser', ['browser'], sdkSource);
+
+    super(opts);
+
+    if (opts.routeProvider) {
+      setRouteProvider(opts.routeProvider, this);
+    }
+
+    // Unhandled errors don't actually crash the browser, so we report `unhandled` rather than `crashed`.
+    this._unhandledSessionStatus = 'unhandled';
+
+    const { userInfo } = this.getDataCollectionOptions();
+
+    if (opts._metadata?.sdk) {
+      opts._metadata.sdk.settings = {
+        // Only allow IP inferral by Relay if the user opted in via dataCollection
+        infer_ip: userInfo ? 'auto' : 'never',
+        // purposefully allowing already passed settings to override the default
+        ...opts._metadata.sdk.settings,
+      };
+    }
+
+    const { sendClientReports } = this._options;
+
+    // Devices usually hide the page before they sleep and show it again after they wake up. Checking for drift
+    // at both points makes the time origin correction happen at the sleep, rather than at the next regular timestamp call.
+    const checkDrift = (): void => {
+      timestampInSeconds();
+    };
+
+    // Most bundle-size-efficient way to add and remove listeners: Create a table to avoid repeated
+    // addeventlistener and removeeventlistener calls. The alternative, using an AbortController, can
+    // lead to app breakage on old Angular<>Zone.js < 0.14.3 versions.
+    const listeners: [EventTarget | undefined, string, () => void][] = [
+      // Flush buffered data when the page becomes hidden (e.g. tab switch, navigation, or the page
+      // being discarded). `flush()` emits the `flush` hook, which drains the span (streaming), log and
+      // metric buffers and hands the resulting envelopes to the transport (which uses `keepalive`).
+      // Client report outcomes don't listen to the `flush` hook, so we flush them separately.
+      [
+        WINDOW.document,
+        'visibilitychange',
+        () => {
+          // Devices usually hide the page before they sleep and show it again after they wake up. Checking for drift
+          // at both points makes the time origin correction happen at the sleep, rather than at the next regular timestamp call.
+          checkDrift();
+
+          if (WINDOW.document.visibilityState === 'hidden') {
+            if (sendClientReports) {
+              this._flushOutcomes();
+            }
+            // Defer the flush to a microtask so that visibilitychange listeners registered after this
+            // one have already run. In particular, browser tracing's background-tab detection ends the
+            // active pageload/navigation (segment) span when the page is hidden. Deferring ensures that
+            // segment span has been added to the streaming buffer before we flush, so it is sent
+            // together with its child spans instead of being orphaned.
+            queueMicrotask(() => {
+              void this.flush();
+            });
+          }
+        },
+      ],
+      // `freeze` and `resume` are only fired by Chromium browsers. Other browsers never fire them, so these listeners
+      // are no-ops there.
+      [WINDOW.document, 'freeze', checkDrift],
+      [WINDOW.document, 'resume', checkDrift],
+      // Pages restored from the back/forward cache were paused while they were cached.
+      [WINDOW, 'pagehide', checkDrift],
+      [WINDOW, 'pageshow', checkDrift],
+    ];
+
+    listeners.forEach(([target, name, listener]) => target?.addEventListener?.(name, listener));
+    this.on('close', () =>
+      listeners.forEach(([target, name, listener]) => target?.removeEventListener?.(name, listener)),
+    );
+
+    if (userInfo) {
+      this.on('beforeSendSession', addAutoIpAddressToSession);
+    }
+  }
+
+  /**
+   * @inheritDoc
+   */
+  public eventFromException(exception: unknown, hint?: EventHint): PromiseLike<Event> {
+    return eventFromException(this._options.stackParser, exception, hint, this._options.attachStacktrace);
+  }
+
+  /**
+   * @inheritDoc
+   */
+  public eventFromMessage(
+    message: ParameterizedString,
+    level: SeverityLevel = 'info',
+    hint?: EventHint,
+  ): PromiseLike<Event> {
+    return eventFromMessage(this._options.stackParser, message, level, hint, this._options.attachStacktrace);
+  }
+
+  /**
+   * @inheritDoc
+   */
+  protected _prepareEvent(
+    event: Event,
+    hint: EventHint,
+    currentScope: Scope,
+    isolationScope: Scope,
+  ): PromiseLike<Event | null> {
+    event.platform = event.platform || 'javascript';
+
+    return super._prepareEvent(event, hint, currentScope, isolationScope);
+  }
+}
+
+/** Exported only for tests. */
+export function applyDefaultOptions<T extends Partial<BrowserClientOptions>>(optionsArg: T): T {
+  return {
+    release:
+      typeof __SENTRY_RELEASE__ === 'string' // This allows build tooling to find-and-replace __SENTRY_RELEASE__ to inject a release value
+        ? __SENTRY_RELEASE__
+        : WINDOW.SENTRY_RELEASE?.id, // This supports the variable that sentry-webpack-plugin injects
+    sendClientReports: true,
+    // We default this to true, as it is the safer scenario
+    parentSpanIsAlwaysRootSpan: true,
+    ...optionsArg,
+  };
+}

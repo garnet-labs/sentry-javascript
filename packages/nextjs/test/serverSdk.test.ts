@@ -1,0 +1,521 @@
+import type { Integration } from '@sentry/core';
+import { GLOBAL_OBJ, getMainCarrier, withIsolationScope } from '@sentry/core';
+import { setAsyncLocalStorageAsyncContextStrategy } from '@sentry/server-utils';
+import { close, getCurrentScope, getGlobalScope } from '@sentry/node';
+import * as SentryNode from '@sentry/node';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { TRANSACTION_ATTR_SHOULD_DROP_TRANSACTION } from '../src/common/span-attributes-with-logic-attached';
+import { init } from '../src/server';
+import type * as NextSentryPropagatorModule from '../src/server/nextSentryPropagator';
+import { registerNextSentryPropagator } from '../src/server/nextSentryPropagator';
+
+vi.mock('../src/server/nextSentryPropagator', async importOriginal => ({
+  ...(await importOriginal<typeof NextSentryPropagatorModule>()),
+  registerNextSentryPropagator: vi.fn(),
+}));
+
+// normally this is set as part of the build process, so mock it here
+(GLOBAL_OBJ as typeof GLOBAL_OBJ & { _sentryRewriteFramesDistDir: string })._sentryRewriteFramesDistDir = '.next';
+
+const nodeInit = vi.spyOn(SentryNode, 'init');
+
+function findIntegrationByName(integrations: Integration[] = [], name: string): Integration | undefined {
+  return integrations.find(integration => integration.name === name);
+}
+
+describe('Server init()', () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+    vi.unstubAllGlobals();
+
+    getMainCarrier().__SENTRY__ = undefined;
+
+    delete process.env.VERCEL;
+    delete (process as { turbopack?: boolean }).turbopack;
+    delete (GLOBAL_OBJ as typeof GLOBAL_OBJ & { _sentryRelease?: string })._sentryRelease;
+  });
+
+  it('inits the Node SDK', () => {
+    expect(nodeInit).toHaveBeenCalledTimes(0);
+    init({});
+    expect(nodeInit).toHaveBeenCalledTimes(1);
+    expect(nodeInit).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        _metadata: {
+          sdk: {
+            name: 'sentry.javascript.nextjs',
+            version: expect.any(String),
+            packages: [
+              {
+                name: 'npm:@sentry/nextjs',
+                version: expect.any(String),
+              },
+              {
+                name: 'npm:@sentry/node',
+                version: expect.any(String),
+              },
+            ],
+          },
+        },
+        environment: 'test',
+
+        // Integrations are tested separately, and we can't be more specific here without depending on the order in
+        // which integrations appear in the array, which we can't guarantee.
+        //
+        // TODO: If we upgrade to Jest 28+, we can follow Jest's example matcher and create an
+        // `expect.ArrayContainingInAnyOrder`. See
+        // https://github.com/facebook/jest/blob/main/examples/expect-extend/toBeWithinRange.ts.
+        defaultIntegrations: expect.any(Array),
+      }),
+    );
+  });
+
+  describe('trace propagator', () => {
+    it('replaces the propagator when the Node SDK set up OpenTelemetry itself', () => {
+      const traceProvider = {};
+      nodeInit.mockReturnValueOnce({
+        on: vi.fn(),
+        addEventProcessor: vi.fn(),
+        traceProvider,
+      } as unknown as ReturnType<typeof SentryNode.init>);
+
+      init({});
+
+      expect(registerNextSentryPropagator).toHaveBeenCalledWith(traceProvider);
+    });
+
+    it('leaves a foreign OpenTelemetry setup alone', () => {
+      nodeInit.mockReturnValueOnce({
+        on: vi.fn(),
+        addEventProcessor: vi.fn(),
+        traceProvider: undefined,
+      } as unknown as ReturnType<typeof SentryNode.init>);
+
+      init({});
+
+      expect(registerNextSentryPropagator).not.toHaveBeenCalled();
+    });
+  });
+
+  it("doesn't reinitialize the node SDK if already initialized", () => {
+    expect(nodeInit).toHaveBeenCalledTimes(0);
+    init({});
+    expect(nodeInit).toHaveBeenCalledTimes(1);
+    init({});
+    expect(nodeInit).toHaveBeenCalledTimes(1);
+  });
+
+  it('registers its event processors on the client', () => {
+    const client = init({});
+
+    expect(client?.getEventProcessors().map(processor => processor.id)).toContain('DropReactControlFlowErrors');
+  });
+
+  it('does not add event processors to the global scope after close()', async () => {
+    const globalProcessorCount = getGlobalScope().getScopeData().eventProcessors.length;
+
+    init({});
+    await close();
+    init({});
+
+    expect(getGlobalScope().getScopeData().eventProcessors.length).toBe(globalProcessorCount);
+  });
+
+  it('returns the existing client if already initialized', () => {
+    const first = init({});
+    const second = init({});
+
+    expect(first).toBeDefined();
+    expect(second).toBe(first);
+  });
+
+  it('skips init on Cloudflare Workers in a request of `withSentry` from `@sentry/cloudflare`', () => {
+    vi.stubGlobal('navigator', { userAgent: 'Cloudflare-Workers' });
+    setAsyncLocalStorageAsyncContextStrategy();
+
+    withIsolationScope(() => init({}));
+
+    expect(nodeInit).not.toHaveBeenCalled();
+  });
+
+  it('sets the `turbopack` tag on Cloudflare Workers in a request of `withSentry` from `@sentry/cloudflare`', () => {
+    vi.stubGlobal('navigator', { userAgent: 'Cloudflare-Workers' });
+    setAsyncLocalStorageAsyncContextStrategy();
+    (process as { turbopack?: boolean }).turbopack = true;
+
+    withIsolationScope(() => init({}));
+
+    expect(getGlobalScope().getScopeData().tags.turbopack).toBe(true);
+  });
+
+  it('adds its event processors to the global scope once on Cloudflare Workers in a request of `withSentry` from `@sentry/cloudflare`', () => {
+    vi.stubGlobal('navigator', { userAgent: 'Cloudflare-Workers' });
+    setAsyncLocalStorageAsyncContextStrategy();
+
+    withIsolationScope(() => {
+      init({});
+      init({});
+    });
+
+    expect(
+      getGlobalScope()
+        .getScopeData()
+        .eventProcessors.filter(processor => processor.id === 'DropReactControlFlowErrors'),
+    ).toHaveLength(1);
+  });
+
+  it('inits on Cloudflare Workers outside of a request of `withSentry` from `@sentry/cloudflare`', () => {
+    vi.stubGlobal('navigator', { userAgent: 'Cloudflare-Workers' });
+    setAsyncLocalStorageAsyncContextStrategy();
+
+    init({});
+
+    expect(nodeInit).toHaveBeenCalledTimes(1);
+  });
+
+  it('inits outside of Cloudflare Workers when an AsyncLocalStorage strategy is installed', () => {
+    setAsyncLocalStorageAsyncContextStrategy();
+
+    withIsolationScope(() => init({}));
+
+    expect(nodeInit).toHaveBeenCalledTimes(1);
+  });
+
+  it('sets the release on the client of `@sentry/cloudflare` when it has none', () => {
+    vi.stubGlobal('navigator', { userAgent: 'Cloudflare-Workers' });
+    const client = SentryNode.init({
+      dsn: 'https://public@dsn.ingest.sentry.io/1337',
+      enableOpenTelemetrySetup: false,
+    });
+    // `init` of `@sentry/node` takes a release from CI env vars like `GITHUB_SHA`.
+    client!.getOptions().release = undefined;
+
+    withIsolationScope(() => init({ release: '1.2.3' }));
+
+    expect(client!.getOptions().release).toBe('1.2.3');
+    expect((GLOBAL_OBJ as typeof GLOBAL_OBJ & { _sentryRelease?: string })._sentryRelease).toBe('1.2.3');
+  });
+
+  it('keeps the release of the client of `@sentry/cloudflare`', () => {
+    vi.stubGlobal('navigator', { userAgent: 'Cloudflare-Workers' });
+    const client = SentryNode.init({
+      dsn: 'https://public@dsn.ingest.sentry.io/1337',
+      enableOpenTelemetrySetup: false,
+      release: 'worker@2.0.0',
+    });
+
+    withIsolationScope(() => init({ release: '1.2.3' }));
+
+    expect(client!.getOptions().release).toBe('worker@2.0.0');
+  });
+
+  it('adds its event processors to the global scope when the client of `@sentry/cloudflare` exists', () => {
+    vi.stubGlobal('navigator', { userAgent: 'Cloudflare-Workers' });
+    SentryNode.init({ dsn: 'https://public@dsn.ingest.sentry.io/1337', enableOpenTelemetrySetup: false });
+
+    withIsolationScope(() => init({}));
+
+    // With `cacheClient: false`, each request has a new client, so only the global scope reaches all of them.
+    expect(
+      getGlobalScope()
+        .getScopeData()
+        .eventProcessors.filter(processor => processor.id === 'DropReactControlFlowErrors'),
+    ).toHaveLength(1);
+  });
+
+  // TODO: test `vercel` tag when running on Vercel
+  // Can't just add the test and set env variables, since the value in `index.server.ts`
+  // is resolved when importing.
+
+  it('does not apply `vercel` tag when not running on vercel', () => {
+    const currentScope = getCurrentScope();
+
+    expect(process.env.VERCEL).toBeUndefined();
+
+    init({});
+
+    // @ts-expect-error need access to protected _tags attribute
+    expect(currentScope._tags.vercel).toBeUndefined();
+  });
+
+  describe('integrations', () => {
+    // Options passed by `@sentry/nextjs`'s `init` to `@sentry/node`'s `init` after modifying them
+    type ModifiedInitOptions = { integrations: Integration[]; defaultIntegrations: Integration[] };
+
+    it('adds default integrations', () => {
+      init({});
+
+      const nodeInitOptions = nodeInit.mock.calls[0]?.[0] as ModifiedInitOptions;
+      const integrationNames = nodeInitOptions.defaultIntegrations.map(integration => integration.name);
+      const onUncaughtExceptionIntegration = findIntegrationByName(
+        nodeInitOptions.defaultIntegrations,
+        'OnUncaughtException',
+      );
+
+      expect(integrationNames).toContain('DistDirRewriteFrames');
+      expect(onUncaughtExceptionIntegration).toBeDefined();
+    });
+
+    describe('`use cache` integration', () => {
+      const CACHE_HANDLERS_INSTRUMENTED = Symbol.for('sentry.nextjs.cacheHandlersInstrumented');
+      const DSN = 'https://public@dsn.ingest.sentry.io/1337';
+
+      function isUseCacheInstrumented(): boolean {
+        return (globalThis as Record<symbol, unknown>)[CACHE_HANDLERS_INSTRUMENTED] === true;
+      }
+
+      afterEach(() => {
+        vi.unstubAllEnvs();
+        Reflect.deleteProperty(globalThis, CACHE_HANDLERS_INSTRUMENTED);
+      });
+
+      it('adds the integration to the default integrations', () => {
+        init({});
+
+        expect(nodeInit).toHaveBeenLastCalledWith(
+          expect.objectContaining({
+            defaultIntegrations: expect.arrayContaining([expect.objectContaining({ name: 'NextjsUseCache' })]),
+          }),
+        );
+      });
+
+      it('instruments the cache handlers when tracing is enabled', () => {
+        init({ dsn: DSN, tracesSampleRate: 1 });
+
+        expect(isUseCacheInstrumented()).toBe(true);
+      });
+
+      it('instruments the cache handlers when tracing is enabled via `SENTRY_TRACES_SAMPLE_RATE`', () => {
+        vi.stubEnv('SENTRY_TRACES_SAMPLE_RATE', '1');
+
+        init({ dsn: DSN });
+
+        expect(isUseCacheInstrumented()).toBe(true);
+      });
+
+      it('does not instrument the cache handlers when tracing is disabled', () => {
+        init({ dsn: DSN });
+
+        expect(isUseCacheInstrumented()).toBe(false);
+      });
+    });
+
+    it('supports passing unrelated integrations through options', () => {
+      init({ integrations: [SentryNode.consoleIntegration()] });
+
+      const nodeInitOptions = nodeInit.mock.calls[0]?.[0] as ModifiedInitOptions;
+      const consoleIntegration = findIntegrationByName(nodeInitOptions.integrations, 'Console');
+
+      expect(consoleIntegration).toBeDefined();
+    });
+  });
+
+  it('initializes again after the existing client is closed', async () => {
+    const first = init({});
+    await first?.close();
+    const second = init({});
+
+    expect(nodeInit).toHaveBeenCalledTimes(2);
+    expect(second).toBeDefined();
+    expect(second).not.toBe(first);
+  });
+
+  it('returns client from init', () => {
+    expect(init({})).not.toBeUndefined();
+  });
+
+  describe('ignoreSpans', () => {
+    function getIgnoreSpans(): NonNullable<SentryNode.NodeOptions['ignoreSpans']> {
+      const callArgs = nodeInit.mock.calls[0]?.[0] as SentryNode.NodeOptions;
+      return callArgs.ignoreSpans ?? [];
+    }
+
+    function regexSources(patterns: NonNullable<SentryNode.NodeOptions['ignoreSpans']>): string[] {
+      return patterns.filter((p): p is RegExp => p instanceof RegExp).map(p => p.source);
+    }
+
+    it('appends the Next.js name patterns and attribute filter', () => {
+      init({});
+      const patterns = getIgnoreSpans();
+      const sources = regexSources(patterns);
+
+      expect(sources).toContain('^GET (\\/.*)?\\/_next\\/static\\/');
+      expect(sources).toContain('\\/__nextjs_original-stack-frame');
+      expect(sources).toContain('^\\/404$');
+      expect(sources).toContain('^(GET|HEAD|POST|PUT|DELETE|CONNECT|OPTIONS|TRACE|PATCH) \\/(404|_not-found)$');
+      expect(sources).toContain('^NextServer\\.getRequestHandler$');
+      expect(patterns).toContainEqual({
+        attributes: { [TRANSACTION_ATTR_SHOULD_DROP_TRANSACTION]: true },
+      });
+    });
+
+    it('preserves user-provided ignoreSpans entries', () => {
+      init({ ignoreSpans: ['user-pattern', /custom-regex/] });
+      const patterns = getIgnoreSpans();
+
+      expect(patterns).toContain('user-pattern');
+      expect(regexSources(patterns)).toContain('custom-regex');
+    });
+  });
+
+  describe('OpenNext/Cloudflare runtime detection', () => {
+    const cloudflareContextSymbol = Symbol.for('__cloudflare-context__');
+
+    beforeEach(() => {
+      // Reset the global scope to allow re-initialization
+      getMainCarrier().__SENTRY__ = undefined;
+    });
+
+    afterEach(() => {
+      // Clean up the cloudflare context
+      // eslint-disable-next-line @typescript-eslint/no-dynamic-delete
+      delete (GLOBAL_OBJ as unknown as Record<symbol, unknown>)[cloudflareContextSymbol];
+    });
+
+    it('sets cloudflare runtime when OpenNext context is available', () => {
+      // Mock the OpenNext Cloudflare context
+      (GLOBAL_OBJ as unknown as Record<symbol, unknown>)[cloudflareContextSymbol] = {
+        ctx: {
+          waitUntil: vi.fn(),
+        },
+      };
+
+      init({});
+
+      expect(nodeInit).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          runtime: { name: 'cloudflare' },
+        }),
+      );
+    });
+
+    it('sets cloudflare in SDK metadata when OpenNext context is available', () => {
+      // Mock the OpenNext Cloudflare context
+      (GLOBAL_OBJ as unknown as Record<symbol, unknown>)[cloudflareContextSymbol] = {
+        ctx: {
+          waitUntil: vi.fn(),
+        },
+      };
+
+      init({});
+
+      expect(nodeInit).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          _metadata: expect.objectContaining({
+            sdk: expect.objectContaining({
+              name: 'sentry.javascript.nextjs',
+              packages: expect.arrayContaining([
+                expect.objectContaining({
+                  name: 'npm:@sentry/nextjs',
+                }),
+                expect.objectContaining({
+                  name: 'npm:@sentry/cloudflare',
+                }),
+              ]),
+            }),
+          }),
+        }),
+      );
+    });
+
+    it('does not set cloudflare runtime when OpenNext context is not available', () => {
+      init({});
+
+      expect(nodeInit).toHaveBeenLastCalledWith(
+        expect.not.objectContaining({
+          runtime: { name: 'cloudflare' },
+        }),
+      );
+    });
+  });
+
+  describe('environment option', () => {
+    const originalEnv = process.env.SENTRY_ENVIRONMENT;
+    const originalNodeEnv = process.env.NODE_ENV;
+
+    beforeEach(() => {
+      // Reset the global scope to allow re-initialization
+      getMainCarrier().__SENTRY__ = undefined;
+    });
+
+    afterEach(() => {
+      if (originalEnv !== undefined) {
+        process.env.SENTRY_ENVIRONMENT = originalEnv;
+      } else {
+        delete process.env.SENTRY_ENVIRONMENT;
+      }
+      if (originalNodeEnv !== undefined) {
+        process.env.NODE_ENV = originalNodeEnv;
+      } else {
+        delete process.env.NODE_ENV;
+      }
+    });
+
+    it('uses environment from options when provided', () => {
+      delete process.env.SENTRY_ENVIRONMENT;
+      process.env.NODE_ENV = 'development';
+
+      init({
+        dsn: 'https://public@dsn.ingest.sentry.io/1337',
+        environment: 'custom-env',
+      });
+
+      expect(nodeInit).toHaveBeenCalledTimes(1);
+      const callArgs = nodeInit.mock.calls[0]?.[0];
+      expect(callArgs?.environment).toBe('custom-env');
+    });
+
+    it('uses SENTRY_ENVIRONMENT env var when options.environment is not provided', () => {
+      process.env.SENTRY_ENVIRONMENT = 'env-from-variable';
+      process.env.NODE_ENV = 'development';
+
+      init({
+        dsn: 'https://public@dsn.ingest.sentry.io/1337',
+      });
+
+      expect(nodeInit).toHaveBeenCalledTimes(1);
+      const callArgs = nodeInit.mock.calls[0]?.[0];
+      expect(callArgs?.environment).toBe('env-from-variable');
+    });
+
+    it('uses NODE_ENV as fallback when neither options.environment nor SENTRY_ENVIRONMENT is provided', () => {
+      delete process.env.SENTRY_ENVIRONMENT;
+      process.env.NODE_ENV = 'production';
+
+      init({
+        dsn: 'https://public@dsn.ingest.sentry.io/1337',
+      });
+
+      expect(nodeInit).toHaveBeenCalledTimes(1);
+      const callArgs = nodeInit.mock.calls[0]?.[0];
+      expect(callArgs?.environment).toBe('production');
+    });
+
+    it('prioritizes options.environment over SENTRY_ENVIRONMENT env var', () => {
+      process.env.SENTRY_ENVIRONMENT = 'env-from-variable';
+      process.env.NODE_ENV = 'development';
+
+      init({
+        dsn: 'https://public@dsn.ingest.sentry.io/1337',
+        environment: 'options-env',
+      });
+
+      expect(nodeInit).toHaveBeenCalledTimes(1);
+      const callArgs = nodeInit.mock.calls[0]?.[0];
+      expect(callArgs?.environment).toBe('options-env');
+    });
+
+    it('prioritizes SENTRY_ENVIRONMENT over NODE_ENV', () => {
+      process.env.SENTRY_ENVIRONMENT = 'sentry-env';
+      process.env.NODE_ENV = 'development';
+
+      init({
+        dsn: 'https://public@dsn.ingest.sentry.io/1337',
+      });
+
+      expect(nodeInit).toHaveBeenCalledTimes(1);
+      const callArgs = nodeInit.mock.calls[0]?.[0];
+      expect(callArgs?.environment).toBe('sentry-env');
+    });
+  });
+});

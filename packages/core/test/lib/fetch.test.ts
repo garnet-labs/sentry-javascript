@@ -1,0 +1,749 @@
+import { URL_FULL } from '@sentry/conventions/attributes';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { Client, HandlerDataFetch } from '../../src';
+import { _INTERNAL_getTracingHeadersForFetchRequest, instrumentFetchRequest } from '../../src/fetch';
+import { SentryNonRecordingSpan } from '../../src/tracing/sentryNonRecordingSpan';
+import type { Span } from '../../src/types/span';
+import * as tracing from '../../src/tracing/trace';
+import * as currentScopes from '../../src/currentScopes';
+import * as spanUtils from '../../src/utils/spanUtils';
+import * as traceData from '../../src/utils/traceData';
+
+const { DEFAULT_SENTRY_TRACE, DEFAULT_BAGGAGE, hasSpansEnabled } = vi.hoisted(() => ({
+  DEFAULT_SENTRY_TRACE: 'defaultTraceId-defaultSpanId-1',
+  DEFAULT_BAGGAGE: 'sentry-trace_id=defaultTraceId,sentry-sampled=true,sentry-sample_rate=0.5,sentry-sample_rand=0.232',
+  hasSpansEnabled: vi.fn(),
+}));
+
+const CUSTOM_SENTRY_TRACE = '123-abc-1';
+// adding in random spaces here to ensure they are trimmed and our sentry baggage item detection logic works.
+// Spaces between items are allowed by the baggage spec.
+const CUSTOM_BAGGAGE = ' sentry-trace_id=123 , sentry-sampled=true';
+
+vi.mock('../../src/utils/traceData', () => {
+  return {
+    getTraceData: vi.fn(() => {
+      return {
+        'sentry-trace': DEFAULT_SENTRY_TRACE,
+        baggage: DEFAULT_BAGGAGE,
+      };
+    }),
+  };
+});
+
+vi.mock('../../src/utils/hasSpansEnabled', () => {
+  return {
+    hasSpansEnabled,
+  };
+});
+
+describe('_INTERNAL_getTracingHeadersForFetchRequest', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    hasSpansEnabled.mockReturnValue(false);
+  });
+
+  describe('when request is a string', () => {
+    describe('and no request headers are set', () => {
+      it.each([
+        {
+          options: {},
+        },
+        {
+          options: { headers: {} },
+        },
+      ])('attaches sentry headers (options: $options)', ({ options }) => {
+        expect(_INTERNAL_getTracingHeadersForFetchRequest('/api/test', options)).toEqual({
+          'sentry-trace': DEFAULT_SENTRY_TRACE,
+          baggage: DEFAULT_BAGGAGE,
+        });
+      });
+    });
+
+    describe('and request headers are set in options', () => {
+      it('attaches sentry headers to headers object', () => {
+        expect(
+          _INTERNAL_getTracingHeadersForFetchRequest('/api/test', { headers: { 'custom-header': 'custom-value' } }),
+        ).toEqual({
+          'sentry-trace': DEFAULT_SENTRY_TRACE,
+          baggage: DEFAULT_BAGGAGE,
+          'custom-header': 'custom-value',
+        });
+      });
+
+      it('omits baggage from headers object when no baggage is available', () => {
+        vi.mocked(traceData.getTraceData).mockReturnValueOnce({
+          'sentry-trace': DEFAULT_SENTRY_TRACE,
+        });
+
+        const returnedHeaders = _INTERNAL_getTracingHeadersForFetchRequest('/api/test', {
+          headers: { 'custom-header': 'custom-value' },
+        });
+
+        expect(returnedHeaders).toStrictEqual({
+          'sentry-trace': DEFAULT_SENTRY_TRACE,
+          'custom-header': 'custom-value',
+        });
+      });
+
+      it('attaches sentry headers to a Headers instance', () => {
+        const returnedHeaders = _INTERNAL_getTracingHeadersForFetchRequest('/api/test', {
+          headers: new Headers({ 'custom-header': 'custom-value' }),
+        });
+
+        expect(returnedHeaders).toBeInstanceOf(Headers);
+
+        // @ts-expect-error -- we know it's a Headers instance and entries() exists
+        expect(Object.fromEntries(returnedHeaders!.entries())).toEqual({
+          'sentry-trace': DEFAULT_SENTRY_TRACE,
+          baggage: DEFAULT_BAGGAGE,
+          'custom-header': 'custom-value',
+        });
+      });
+
+      it('attaches sentry headers to headers array', () => {
+        const returnedHeaders = _INTERNAL_getTracingHeadersForFetchRequest('/api/test', {
+          headers: [['custom-header', 'custom-value']],
+        });
+
+        expect(Array.isArray(returnedHeaders)).toBe(true);
+        expect(returnedHeaders).toEqual([
+          ['custom-header', 'custom-value'],
+          ['sentry-trace', DEFAULT_SENTRY_TRACE],
+          ['baggage', DEFAULT_BAGGAGE],
+        ]);
+      });
+
+      it('treats array with non-tuple items as headers object', () => {
+        const returnedHeaders = _INTERNAL_getTracingHeadersForFetchRequest('/api/test', {
+          headers: ['not-a-tuple', 'also-not-a-tuple'],
+        });
+
+        // Falls through to the else branch (headers object handling)
+        // since the array items are not [string, string] tuples
+        expect(returnedHeaders).toEqual({
+          '0': 'not-a-tuple',
+          '1': 'also-not-a-tuple',
+          'sentry-trace': DEFAULT_SENTRY_TRACE,
+          baggage: DEFAULT_BAGGAGE,
+        });
+      });
+    });
+
+    describe('and 3rd party baggage header is set', () => {
+      it('adds additional sentry baggage values to Headers instance', () => {
+        const returnedHeaders = _INTERNAL_getTracingHeadersForFetchRequest('/api/test', {
+          headers: new Headers({
+            baggage: 'custom-baggage=1,someVal=bar',
+          }),
+        });
+
+        expect(returnedHeaders).toBeInstanceOf(Headers);
+
+        // @ts-expect-error -- we know it's a Headers instance and entries() exists
+        expect(Object.fromEntries(returnedHeaders!.entries())).toEqual({
+          'sentry-trace': DEFAULT_SENTRY_TRACE,
+          baggage: `custom-baggage=1,someVal=bar,${DEFAULT_BAGGAGE}`,
+        });
+      });
+
+      it('adds additional sentry baggage values to headers array', () => {
+        const returnedHeaders = _INTERNAL_getTracingHeadersForFetchRequest('/api/test', {
+          headers: [['baggage', 'custom-baggage=1,someVal=bar']],
+        });
+
+        expect(Array.isArray(returnedHeaders)).toBe(true);
+
+        expect(returnedHeaders).toEqual([
+          ['baggage', 'custom-baggage=1,someVal=bar'],
+          ['sentry-trace', DEFAULT_SENTRY_TRACE],
+          ['baggage', DEFAULT_BAGGAGE],
+        ]);
+      });
+
+      it('adds additional sentry baggage values to headers object', () => {
+        const returnedHeaders = _INTERNAL_getTracingHeadersForFetchRequest('/api/test', {
+          headers: {
+            baggage: 'custom-baggage=1,someVal=bar',
+          },
+        });
+
+        expect(typeof returnedHeaders).toBe('object');
+
+        expect(returnedHeaders).toEqual({
+          'sentry-trace': DEFAULT_SENTRY_TRACE,
+          baggage: `custom-baggage=1,someVal=bar,${DEFAULT_BAGGAGE}`,
+        });
+      });
+
+      it('adds additional sentry baggage values to headers object with arrays', () => {
+        const returnedHeaders = _INTERNAL_getTracingHeadersForFetchRequest('/api/test', {
+          headers: {
+            baggage: ['custom-baggage=1,someVal=bar', 'other-vendor-key=value'],
+          },
+        });
+
+        expect(typeof returnedHeaders).toBe('object');
+
+        expect(returnedHeaders).toEqual({
+          'sentry-trace': DEFAULT_SENTRY_TRACE,
+          baggage: `custom-baggage=1,someVal=bar,other-vendor-key=value,${DEFAULT_BAGGAGE}`,
+        });
+      });
+    });
+
+    describe('and Sentry values are already set', () => {
+      it('does not override them (Headers instance)', () => {
+        const returnedHeaders = _INTERNAL_getTracingHeadersForFetchRequest('/api/test', {
+          headers: new Headers({
+            'sentry-trace': CUSTOM_SENTRY_TRACE,
+            baggage: CUSTOM_BAGGAGE,
+            'custom-header': 'custom-value',
+          }),
+        });
+
+        expect(returnedHeaders).toBeInstanceOf(Headers);
+
+        // @ts-expect-error -- we know it's a Headers instance and entries() exists
+        expect(Object.fromEntries(returnedHeaders!.entries())).toEqual({
+          'custom-header': 'custom-value',
+          'sentry-trace': CUSTOM_SENTRY_TRACE,
+          baggage: CUSTOM_BAGGAGE.trim(),
+        });
+      });
+
+      it('does not override them (headers array)', () => {
+        const returnedHeaders = _INTERNAL_getTracingHeadersForFetchRequest('/api/test', {
+          headers: [
+            ['sentry-trace', CUSTOM_SENTRY_TRACE],
+            ['baggage', CUSTOM_BAGGAGE],
+            ['custom-header', 'custom-value'],
+          ],
+        });
+
+        expect(Array.isArray(returnedHeaders)).toBe(true);
+
+        expect(returnedHeaders).toEqual([
+          ['sentry-trace', CUSTOM_SENTRY_TRACE],
+          ['baggage', CUSTOM_BAGGAGE],
+          ['custom-header', 'custom-value'],
+        ]);
+      });
+
+      it('does not override them (headers object)', () => {
+        const returnedHeaders = _INTERNAL_getTracingHeadersForFetchRequest('/api/test', {
+          headers: {
+            'sentry-trace': CUSTOM_SENTRY_TRACE,
+            baggage: CUSTOM_BAGGAGE,
+            'custom-header': 'custom-value',
+          },
+        });
+
+        expect(typeof returnedHeaders).toBe('object');
+
+        expect(returnedHeaders).toEqual({
+          'sentry-trace': CUSTOM_SENTRY_TRACE,
+          baggage: CUSTOM_BAGGAGE,
+          'custom-header': 'custom-value',
+        });
+      });
+    });
+  });
+
+  describe('when request is a Request instance', () => {
+    describe('and no request headers are set', () => {
+      it('attaches sentry headers', () => {
+        const request = new Request('http://locahlost:3000/api/test');
+        const returnedHeaders = _INTERNAL_getTracingHeadersForFetchRequest(request, {});
+
+        expect(returnedHeaders).toBeInstanceOf(Headers);
+
+        // @ts-expect-error -- we know it's a Headers instance and entries() exists
+        expect(Object.fromEntries(returnedHeaders!.entries())).toEqual({
+          'sentry-trace': DEFAULT_SENTRY_TRACE,
+          baggage: DEFAULT_BAGGAGE,
+        });
+      });
+    });
+
+    describe('and request headers are set in options', () => {
+      it('attaches sentry headers to headers instance', () => {
+        const request = new Request('http://locahlost:3000/api/test', {
+          headers: new Headers({ 'custom-header': 'custom-value' }),
+        });
+
+        const returnedHeaders = _INTERNAL_getTracingHeadersForFetchRequest(request, {});
+
+        expect(returnedHeaders).toBeInstanceOf(Headers);
+
+        // @ts-expect-error -- we know it's a Headers instance and entries() exists
+        expect(Object.fromEntries(returnedHeaders!.entries())).toEqual({
+          'sentry-trace': DEFAULT_SENTRY_TRACE,
+          baggage: DEFAULT_BAGGAGE,
+          'custom-header': 'custom-value',
+        });
+      });
+
+      it('attaches sentry headers to headers object', () => {
+        const request = new Request('http://locahlost:3000/api/test', {
+          headers: { 'custom-header': 'custom-value' },
+        });
+
+        const returnedHeaders = _INTERNAL_getTracingHeadersForFetchRequest(request, {});
+
+        expect(returnedHeaders).toBeInstanceOf(Headers);
+
+        // @ts-expect-error -- we know it's a Headers instance and entries() exists
+        expect(Object.fromEntries(returnedHeaders!.entries())).toEqual({
+          'sentry-trace': DEFAULT_SENTRY_TRACE,
+          baggage: DEFAULT_BAGGAGE,
+          'custom-header': 'custom-value',
+        });
+      });
+
+      it('attaches sentry headers to headers array', () => {
+        const request = new Request('http://locahlost:3000/api/test', {
+          headers: [['custom-header', 'custom-value']],
+        });
+
+        const returnedHeaders = _INTERNAL_getTracingHeadersForFetchRequest(request, {});
+
+        expect(returnedHeaders).toBeInstanceOf(Headers);
+
+        // @ts-expect-error -- we know it's a Headers instance and entries() exists
+        expect(Object.fromEntries(returnedHeaders!.entries())).toEqual({
+          'sentry-trace': DEFAULT_SENTRY_TRACE,
+          baggage: DEFAULT_BAGGAGE,
+          'custom-header': 'custom-value',
+        });
+      });
+    });
+
+    describe('and 3rd party baggage header is set', () => {
+      it('adds additional sentry baggage values to Headers instance', () => {
+        const request = new Request('http://locahlost:3000/api/test', {
+          headers: new Headers({
+            baggage: 'custom-baggage=1,someVal=bar',
+            'custom-header': 'custom-value',
+          }),
+        });
+
+        const returnedHeaders = _INTERNAL_getTracingHeadersForFetchRequest(request, {});
+
+        expect(returnedHeaders).toBeInstanceOf(Headers);
+
+        // @ts-expect-error -- we know it's a Headers instance and entries() exists
+        expect(Object.fromEntries(returnedHeaders!.entries())).toEqual({
+          'custom-header': 'custom-value',
+          'sentry-trace': DEFAULT_SENTRY_TRACE,
+          baggage: `custom-baggage=1,someVal=bar,${DEFAULT_BAGGAGE}`,
+        });
+      });
+
+      it('adds additional sentry baggage values to headers array', () => {
+        const request = new Request('http://locahlost:3000/api/test', {
+          headers: [['baggage', 'custom-baggage=1,someVal=bar']],
+        });
+
+        const returnedHeaders = _INTERNAL_getTracingHeadersForFetchRequest(request, {});
+
+        expect(returnedHeaders).toBeInstanceOf(Headers);
+
+        // @ts-expect-error -- we know it's a Headers instance and entries() exists
+        expect(Object.fromEntries(returnedHeaders!.entries())).toEqual({
+          'sentry-trace': DEFAULT_SENTRY_TRACE,
+          baggage: `custom-baggage=1,someVal=bar,${DEFAULT_BAGGAGE}`,
+        });
+      });
+
+      it('adds additional sentry baggage values to headers object', () => {
+        const request = new Request('http://locahlost:3000/api/test', {
+          headers: {
+            baggage: 'custom-baggage=1,someVal=bar',
+          },
+        });
+
+        const returnedHeaders = _INTERNAL_getTracingHeadersForFetchRequest(request, {});
+
+        expect(returnedHeaders).toBeInstanceOf(Headers);
+
+        // @ts-expect-error -- we know it's a Headers instance and entries() exists
+        expect(Object.fromEntries(returnedHeaders!.entries())).toEqual({
+          'sentry-trace': DEFAULT_SENTRY_TRACE,
+          baggage: `custom-baggage=1,someVal=bar,${DEFAULT_BAGGAGE}`,
+        });
+      });
+
+      it('adds additional sentry baggage values to headers object with arrays', () => {
+        const request = new Request('http://locahlost:3000/api/test', {
+          headers: {
+            baggage: ['custom-baggage=1,someVal=bar', 'other-vendor-key=value'],
+          },
+        });
+
+        const returnedHeaders = _INTERNAL_getTracingHeadersForFetchRequest(request, {});
+
+        expect(returnedHeaders).toBeInstanceOf(Headers);
+
+        // @ts-expect-error -- we know it's a Headers instance and entries() exists
+        expect(Object.fromEntries(returnedHeaders!.entries())).toEqual({
+          'sentry-trace': DEFAULT_SENTRY_TRACE,
+          baggage: `custom-baggage=1,someVal=bar,other-vendor-key=value,${DEFAULT_BAGGAGE}`,
+        });
+      });
+    });
+
+    describe('and Sentry values are already set', () => {
+      it('does not override them (Headers instance)', () => {
+        const request = new Request('http://locahlost:3000/api/test', {
+          headers: new Headers({
+            'sentry-trace': CUSTOM_SENTRY_TRACE,
+            baggage: CUSTOM_BAGGAGE,
+            'custom-header': 'custom-value',
+          }),
+        });
+
+        const returnedHeaders = _INTERNAL_getTracingHeadersForFetchRequest(request, {});
+
+        expect(returnedHeaders).toBeInstanceOf(Headers);
+
+        // @ts-expect-error -- we know it's a Headers instance and entries() exists
+        expect(Object.fromEntries(returnedHeaders!.entries())).toEqual({
+          'custom-header': 'custom-value',
+          'sentry-trace': CUSTOM_SENTRY_TRACE,
+          baggage: CUSTOM_BAGGAGE.trim(),
+        });
+      });
+
+      it('does not override them (headers array)', () => {
+        const request = new Request('http://locahlost:3000/api/test', {
+          headers: [
+            ['sentry-trace', CUSTOM_SENTRY_TRACE],
+            ['baggage', CUSTOM_BAGGAGE],
+            ['custom-header', 'custom-value'],
+          ],
+        });
+
+        const returnedHeaders = _INTERNAL_getTracingHeadersForFetchRequest(request, {});
+
+        expect(returnedHeaders).toBeInstanceOf(Headers);
+
+        // @ts-expect-error -- we know it's a Headers instance and entries() exists
+        expect(Object.fromEntries(returnedHeaders!.entries())).toEqual({
+          'custom-header': 'custom-value',
+          'sentry-trace': CUSTOM_SENTRY_TRACE,
+          baggage: CUSTOM_BAGGAGE.trim(),
+        });
+      });
+
+      it('does not override them (headers object)', () => {
+        const request = new Request('http://locahlost:3000/api/test', {
+          headers: {
+            'sentry-trace': CUSTOM_SENTRY_TRACE,
+            baggage: CUSTOM_BAGGAGE,
+            'custom-header': 'custom-value',
+          },
+        });
+
+        const returnedHeaders = _INTERNAL_getTracingHeadersForFetchRequest(request, {});
+
+        expect(returnedHeaders).toBeInstanceOf(Headers);
+
+        // @ts-expect-error -- we know it's a Headers instance and entries() exists
+        expect(Object.fromEntries(returnedHeaders!.entries())).toEqual({
+          'custom-header': 'custom-value',
+          'sentry-trace': CUSTOM_SENTRY_TRACE,
+          baggage: CUSTOM_BAGGAGE.trim(),
+        });
+      });
+    });
+  });
+});
+
+describe('instrumentFetchRequest', () => {
+  describe('span attributes', () => {
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it('sets url.full for absolute URLs', () => {
+      const url = 'https://api.example.com/users/42?include=profile#bio';
+      const activeSpan = new SentryNonRecordingSpan();
+      const fetchSpan = new SentryNonRecordingSpan();
+      hasSpansEnabled.mockReturnValue(true);
+      vi.spyOn(spanUtils, 'getActiveSpan').mockReturnValue(activeSpan);
+      const startInactiveSpanSpy = vi.spyOn(tracing, 'startInactiveSpan').mockReturnValue(fetchSpan);
+
+      instrumentFetchRequest(
+        {
+          fetchData: { url, method: 'GET' },
+          args: [url],
+          startTimestamp: Date.now(),
+        },
+        () => true,
+        () => false,
+        {},
+        { spanOrigin: 'auto.http.fetch' },
+      );
+
+      expect(startInactiveSpanSpy).toHaveBeenCalledWith({
+        name: 'GET https://api.example.com/users/42',
+        attributes: {
+          type: 'fetch',
+          'http.request.method': 'GET',
+          'sentry.origin': 'auto.http.fetch',
+          'sentry.op': 'http.client',
+          [URL_FULL]: url,
+          'server.address': 'api.example.com',
+          'url.domain': 'api.example.com',
+          'url.query': 'include=profile',
+          'url.fragment': 'bio',
+        },
+      });
+    });
+  });
+
+  describe('span name', () => {
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    function startFetchSpan(
+      traceLifecycle: 'static' | 'stream',
+      url = 'https://api.example.com/users/42?include=profile',
+      urlBase?: string,
+    ): ReturnType<typeof vi.spyOn> {
+      hasSpansEnabled.mockReturnValue(true);
+      vi.spyOn(spanUtils, 'getActiveSpan').mockReturnValue(new SentryNonRecordingSpan());
+      vi.spyOn(currentScopes, 'getClient').mockReturnValue({
+        getOptions: () => ({ traceLifecycle }),
+        getDataCollectionOptions: () => ({ urlQueryParams: true }),
+        emit: () => {},
+      } as unknown as Client);
+      const startInactiveSpanSpy = vi.spyOn(tracing, 'startInactiveSpan').mockReturnValue(new SentryNonRecordingSpan());
+
+      instrumentFetchRequest(
+        { fetchData: { url, method: 'GET' }, args: [url], startTimestamp: Date.now() },
+        () => true,
+        () => false,
+        {},
+        { spanOrigin: 'auto.http.fetch', urlBase },
+      );
+
+      return startInactiveSpanSpy;
+    }
+
+    it('drops the URL path but keeps the domain with span streaming enabled', () => {
+      expect(startFetchSpan('stream')).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: 'GET api.example.com',
+          attributes: expect.objectContaining({ 'url.domain': 'api.example.com' }),
+        }),
+      );
+    });
+
+    it('falls back to the request method for a relative URL when there is no base to resolve it against', () => {
+      expect(startFetchSpan('stream', '/users/42')).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: 'GET',
+          attributes: expect.objectContaining({ 'url.domain': undefined }),
+        }),
+      );
+    });
+
+    it('resolves a relative URL against `urlBase`', () => {
+      expect(startFetchSpan('stream', '/users/42', 'https://app.example.com')).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: 'GET app.example.com',
+          attributes: expect.objectContaining({ 'url.domain': 'app.example.com' }),
+        }),
+      );
+    });
+
+    it('falls back to the request method for a data URL, which has no domain', () => {
+      expect(startFetchSpan('stream', 'data:text/plain,hello', 'https://app.example.com')).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: 'GET',
+          attributes: expect.objectContaining({ 'url.domain': undefined }),
+        }),
+      );
+    });
+
+    it('keeps the sanitized URL with `traceLifecycle: "static"`', () => {
+      expect(startFetchSpan('static')).toHaveBeenCalledWith(
+        expect.objectContaining({ name: 'GET https://api.example.com/users/42' }),
+      );
+    });
+  });
+
+  describe('trace header span', () => {
+    beforeEach(() => {
+      vi.clearAllMocks();
+    });
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it('uses the active propagation context for an ignored child span', () => {
+      const activeSpan = new SentryNonRecordingSpan();
+      hasSpansEnabled.mockReturnValue(true);
+      const ignoredSpan = new SentryNonRecordingSpan({ dropReason: 'ignored' });
+      vi.spyOn(spanUtils, 'getActiveSpan').mockReturnValue(activeSpan);
+      vi.spyOn(tracing, 'startInactiveSpan').mockReturnValue(ignoredSpan);
+
+      instrumentFetchRequest(
+        {
+          fetchData: { url: '/api/test', method: 'GET' },
+          args: ['/api/test'],
+          startTimestamp: Date.now(),
+        },
+        () => true,
+        () => true,
+        {},
+        { spanOrigin: 'auto.http.fetch' },
+      );
+
+      expect(traceData.getTraceData).toHaveBeenCalledWith({
+        span: undefined,
+        propagateTraceparent: false,
+      });
+    });
+  });
+
+  describe('span cleanup', () => {
+    it.each([
+      { name: 'non-recording', hasTracingEnabled: false },
+      { name: 'recording', hasTracingEnabled: true },
+    ])('cleans up $name spans from the spans record when fetch completes', ({ hasTracingEnabled }) => {
+      hasSpansEnabled.mockReturnValue(hasTracingEnabled);
+
+      const spans: Record<string, Span> = {};
+
+      const handlerData = {
+        fetchData: { url: '/api/test', method: 'GET' },
+        args: ['/api/test'] as unknown[],
+        startTimestamp: Date.now(),
+      };
+
+      instrumentFetchRequest(
+        handlerData,
+        () => true,
+        () => false,
+        spans,
+        { spanOrigin: 'auto.http.fetch' },
+      );
+
+      // @ts-expect-error -- we know it exists
+      const spanId = handlerData.fetchData.__span;
+
+      expect(spanId).toBeDefined();
+      expect(spans[spanId]).toBeDefined();
+
+      const completedHandlerData: HandlerDataFetch = {
+        ...handlerData,
+        endTimestamp: Date.now() + 100,
+        response: { status: 200, headers: new Headers() } as Response,
+      };
+
+      instrumentFetchRequest(
+        completedHandlerData,
+        () => true,
+        () => false,
+        spans,
+        { spanOrigin: 'auto.http.fetch' },
+      );
+
+      expect(spans[spanId]).toBeUndefined();
+    });
+  });
+
+  describe('options object mutation', () => {
+    it('does not mutate the original options object', () => {
+      const originalOptions = { method: 'POST', body: JSON.stringify({ data: 'test' }) };
+      const originalOptionsSnapshot = { ...originalOptions };
+
+      const handlerData = {
+        fetchData: { url: '/api/test', method: 'POST' },
+        args: ['/api/test', originalOptions] as unknown[],
+        startTimestamp: Date.now(),
+      };
+
+      const spans: Record<string, Span> = {};
+
+      instrumentFetchRequest(
+        handlerData,
+        () => true,
+        () => true,
+        spans,
+        { spanOrigin: 'auto.http.browser' },
+      );
+
+      // original options object was not mutated
+      expect(originalOptions).toEqual(originalOptionsSnapshot);
+      expect(originalOptions).not.toHaveProperty('headers');
+    });
+
+    it('does not throw with a frozen options object', () => {
+      const frozenOptions = Object.freeze({ method: 'POST', body: JSON.stringify({ data: 'test' }) });
+
+      const handlerData = {
+        fetchData: { url: '/api/test', method: 'POST' },
+        args: ['/api/test', frozenOptions] as unknown[],
+        startTimestamp: Date.now(),
+      };
+
+      const spans: Record<string, Span> = {};
+
+      // This should not throw, even though the original object is frozen
+      expect(() => {
+        instrumentFetchRequest(
+          handlerData,
+          () => true,
+          () => true,
+          spans,
+          { spanOrigin: 'auto.http.browser' },
+        );
+      }).not.toThrow();
+
+      // args[1] is a new object with headers (not the frozen one)
+      const resultOptions = handlerData.args[1] as { headers?: unknown };
+      expect(resultOptions).toHaveProperty('headers');
+      expect(resultOptions).not.toBe(frozenOptions);
+    });
+
+    it('preserves existing properties when cloning options', () => {
+      const originalOptions = {
+        method: 'POST',
+        body: JSON.stringify({ data: 'test' }),
+        credentials: 'include' as const,
+        mode: 'cors' as const,
+      };
+
+      const handlerData = {
+        fetchData: { url: '/api/test', method: 'POST' },
+        args: ['/api/test', originalOptions] as unknown[],
+        startTimestamp: Date.now(),
+      };
+
+      const spans: Record<string, Span> = {};
+
+      instrumentFetchRequest(
+        handlerData,
+        () => true,
+        () => true,
+        spans,
+        { spanOrigin: 'auto.http.browser' },
+      );
+
+      const resultOptions = handlerData.args[1] as Record<string, unknown>;
+
+      // all original properties are preserved in the new object
+      expect(resultOptions.method).toBe('POST');
+      expect(resultOptions.body).toBe(originalOptions.body);
+      expect(resultOptions.credentials).toBe('include');
+      expect(resultOptions.mode).toBe('cors');
+      expect(resultOptions).toHaveProperty('headers');
+    });
+  });
+});

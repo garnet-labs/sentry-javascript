@@ -1,0 +1,525 @@
+/* eslint-disable max-lines */
+import {
+  SENTRY_SEGMENT_NAME_SOURCE,
+  HTTP_ROUTE,
+  HTTP_REQUEST_METHOD,
+  SENTRY_OP,
+  URL_FRAGMENT,
+  URL_FULL,
+  URL_PATH,
+  URL_QUERY,
+  SENTRY_ORIGIN,
+} from '@sentry/conventions/attributes';
+import { HTTP_SERVER } from '@sentry/conventions/op';
+import type { Span, SpanAttributes } from '@sentry/core';
+import {
+  addNonEnumerableProperty,
+  getIsolationScope,
+  getRootSpan,
+  getUrlFragment,
+  getUrlQuery,
+  hasSpanStreamingEnabled,
+  HTTP_SPAN_NAME_FALLBACK,
+  objectify,
+  spanToJSON,
+  winterCGRequestToRequestData,
+  filterCollectedUrl,
+  filterCollectedUrlQuery,
+} from '@sentry/core';
+import {
+  flushIfServerless,
+  _INTERNAL_handleServedTunnelRequest as handleServedTunnelRequest,
+} from '@sentry/core/server';
+import {
+  captureException,
+  continueTrace,
+  getActiveSpan,
+  getClient,
+  getCurrentScope,
+  getTraceMetaTags,
+  httpHeadersToSpanAttributes,
+  setHttpStatus,
+  startSpan,
+  winterCGHeadersToDict,
+  withIsolationScope,
+} from '@sentry/node';
+import { setHttpServerSpanRouteAttribute } from '@sentry/server-utils';
+import type { APIContext, MiddlewareHandler, MiddlewareNext, RoutePart } from 'astro';
+
+type MiddlewareOptions = {
+  /**
+   * If true, the client IP will be attached to the event by calling `setUser`.
+   *
+   * Important: Only enable this option if your Astro app is configured for (hybrid) SSR
+   * via the `output: 'server' | 'hybrid'` option in your `astro.config.mjs` file.
+   * Otherwise, Astro will throw an error when starting the server.
+   *
+   * Only set this to `true` if you're fine with collecting potentially personally identifiable information (PII).
+   *
+   * @default `dataCollection.userInfo` (`true` unless disabled)
+   */
+  trackClientIp?: boolean;
+};
+
+function sendErrorToSentry(e: unknown): unknown {
+  // In case we have a primitive, wrap it in the equivalent wrapper class (string -> String, etc.) so that we can
+  // store a seen flag on it.
+  const objectifiedErr = objectify(e);
+
+  captureException(objectifiedErr, {
+    mechanism: {
+      type: 'auto.middleware.astro',
+      handled: false,
+    },
+  });
+
+  return objectifiedErr;
+}
+
+type AstroLocalsWithSentry = Record<string, unknown> & {
+  __sentry_wrapped__?: boolean;
+};
+
+export const handleRequest: (options?: MiddlewareOptions) => MiddlewareHandler = options => {
+  const handlerOptions = { ...options };
+
+  return async (ctx, next) => {
+    // The middleware the integration adds runs the server init first, so this only bails without a server init, or when
+    // this middleware was added by hand and the request comes before any SSR page, which still runs the init.
+    if (!getClient()) {
+      return next();
+    }
+
+    const tunnelResponse = handleServedTunnelRequest(ctx.request);
+    if (tunnelResponse) {
+      return tunnelResponse;
+    }
+
+    const isDynamicPageRequest = checkIsDynamicPageRequest(ctx);
+
+    // For static (prerendered) routes, we only want to inject the parametrized route meta tags
+    if (!isDynamicPageRequest) {
+      return handleStaticRoute(ctx, next);
+    }
+
+    const activeSpan = getActiveSpan();
+    const rootSpan = activeSpan ? getRootSpan(activeSpan) : undefined;
+
+    // if there is an active span, we just want to enhance it with routing data etc.
+    if (rootSpan && spanToJSON(rootSpan).attributes[SENTRY_OP] === 'http.server') {
+      return enhanceHttpServerSpan(ctx, next, rootSpan);
+    }
+
+    return instrumentRequestStartHttpServerSpan(ctx, next, handlerOptions);
+  };
+};
+
+async function handleStaticRoute(ctx: APIContext, next: MiddlewareNext): Promise<Response> {
+  const parametrizedRoute = getParametrizedRoute(ctx);
+  try {
+    const originalResponse = await next();
+
+    // We never want to continue a trace here, so we do not inject trace data
+    // But we do want to inject the parametrized route, as this is used for client-side route parametrization
+    const metaTagsStr = getMetaTagsStr({ injectTraceData: false, parametrizedRoute });
+    return injectMetaTagsInResponse(originalResponse, metaTagsStr);
+  } catch (e) {
+    sendErrorToSentry(e);
+    throw e;
+  }
+}
+
+async function enhanceHttpServerSpan(ctx: APIContext, next: MiddlewareNext, rootSpan: Span): Promise<Response> {
+  // Make sure we don't accidentally double wrap (e.g. user added middleware and integration auto added it)
+  const locals = ctx.locals as AstroLocalsWithSentry | undefined;
+  if (locals?.__sentry_wrapped__) {
+    return next();
+  }
+  if (locals) {
+    addNonEnumerableProperty(locals, '__sentry_wrapped__', true);
+  }
+
+  const request = ctx.request;
+  const isolationScope = getIsolationScope();
+  const method = request.method;
+
+  try {
+    const parametrizedRoute = getParametrizedRoute(ctx);
+
+    rootSpan.setAttributes({
+      // This is here for backwards compatibility, we used to set this here before
+      method,
+      [SENTRY_ORIGIN]: 'auto.http.astro',
+    });
+
+    if (parametrizedRoute) {
+      setHttpServerSpanRouteAttribute(parametrizedRoute);
+      isolationScope.setTransactionName(`${method} ${parametrizedRoute}`);
+    }
+
+    try {
+      const originalResponse = await next();
+      const metaTagsStr = getMetaTagsStr({ injectTraceData: true, parametrizedRoute });
+      return injectMetaTagsInResponse(originalResponse, metaTagsStr);
+    } catch (e) {
+      sendErrorToSentry(e);
+      throw e;
+    }
+  } finally {
+    await flushIfServerless();
+  }
+}
+
+async function instrumentRequestStartHttpServerSpan(
+  ctx: APIContext,
+  next: MiddlewareNext,
+  options: MiddlewareOptions,
+): Promise<Response> {
+  // Make sure we don't accidentally double wrap (e.g. user added middleware and integration auto added it)
+  const locals = ctx.locals as AstroLocalsWithSentry | undefined;
+  if (locals?.__sentry_wrapped__) {
+    return next();
+  }
+  if (locals) {
+    addNonEnumerableProperty(locals, '__sentry_wrapped__', true);
+  }
+
+  const request = ctx.request;
+  const client = getClient();
+  if (!client) {
+    return next();
+  }
+
+  // Note: We guard outside of this function call that the request is dynamic
+  // accessing headers on a static route would throw
+  const { method, headers } = request;
+
+  return withIsolationScope(isolationScope => {
+    return continueTrace(
+      {
+        sentryTrace: headers?.get('sentry-trace') || undefined,
+        baggage: headers?.get('baggage'),
+      },
+      async () => {
+        getCurrentScope().setSDKProcessingMetadata({
+          // We store the request on the current scope, not isolation scope,
+          // because we may have multiple requests nested inside each other
+          normalizedRequest: winterCGRequestToRequestData(request),
+        });
+
+        // The integration option wins when set; otherwise `dataCollection.userInfo` decides.
+        if (options.trackClientIp ?? client.getDataCollectionOptions().userInfo) {
+          isolationScope.setUser({ ip_address: ctx.clientAddress });
+        }
+
+        try {
+          const parametrizedRoute = getParametrizedRoute(ctx);
+
+          const source = parametrizedRoute ? 'route' : 'url';
+          // storing res in a variable instead of directly returning is necessary to
+          // invoke the catch block if next() throws
+
+          const attributes: SpanAttributes = {
+            [SENTRY_OP]: HTTP_SERVER,
+            [SENTRY_ORIGIN]: 'auto.http.astro',
+            [SENTRY_SEGMENT_NAME_SOURCE]: source,
+            [HTTP_REQUEST_METHOD]: method,
+            // This is here for backwards compatibility, we used to set this here before
+            method,
+            [URL_FULL]: filterCollectedUrl(ctx.url.href),
+            [URL_PATH]: ctx.url.pathname,
+            ...httpHeadersToSpanAttributes(winterCGHeadersToDict(request.headers), client.getDataCollectionOptions()),
+          };
+
+          if (parametrizedRoute) {
+            attributes[HTTP_ROUTE] = parametrizedRoute;
+          }
+
+          attributes[URL_QUERY] = filterCollectedUrlQuery(getUrlQuery(ctx.url.search));
+          attributes[URL_FRAGMENT] = getUrlFragment(ctx.url.hash);
+
+          const transactionName = `${method} ${parametrizedRoute || ctx.url.pathname}`;
+
+          // The scope's transaction name is what error events are grouped by, so it keeps the URL path.
+          isolationScope.setTransactionName(transactionName);
+
+          // With span streaming, span names have to be low cardinality, so we can't fall back to the URL path.
+          const name =
+            parametrizedRoute || !hasSpanStreamingEnabled(client)
+              ? transactionName
+              : method?.toUpperCase() || HTTP_SPAN_NAME_FALLBACK;
+
+          const res = await startSpan(
+            {
+              attributes,
+              name,
+            },
+            async span => {
+              try {
+                const originalResponse = await next();
+                if (originalResponse.status) {
+                  setHttpStatus(span, originalResponse.status);
+                }
+
+                const metaTagsStr = getMetaTagsStr({ injectTraceData: true, parametrizedRoute });
+                return injectMetaTagsInResponse(originalResponse, metaTagsStr);
+              } catch (e) {
+                sendErrorToSentry(e);
+                throw e;
+              }
+            },
+          );
+          return res;
+        } finally {
+          await flushIfServerless();
+        }
+        // TODO: flush if serverless (first extract function)
+      },
+    );
+  });
+}
+
+/**
+ * This function optimistically assumes that the HTML coming in chunks will not be split
+ * within the <head> tag. If this still happens, we simply won't replace anything.
+ */
+function addMetaTagToHead(htmlChunk: string, metaTagsStr: string): string {
+  if (typeof htmlChunk !== 'string' || !metaTagsStr) {
+    return htmlChunk;
+  }
+
+  // Skip quoted attribute values so we don't match <head> inside e.g. data-code="...<head>..."
+  let replaced = false;
+  return htmlChunk.replace(/"[^"]*"|'[^']*'|(<head>)/g, (match, headTag) => {
+    if (headTag && !replaced) {
+      replaced = true;
+      return `<head>${metaTagsStr}`;
+    }
+    return match;
+  });
+}
+
+function getMetaTagsStr({
+  injectTraceData,
+  parametrizedRoute,
+}: {
+  injectTraceData: boolean;
+  parametrizedRoute: string | undefined;
+}): string {
+  const parts = [];
+  if (injectTraceData) {
+    parts.push(getTraceMetaTags());
+  }
+  if (parametrizedRoute) {
+    parts.push(`<meta name="sentry-route-name" content="${encodeURIComponent(parametrizedRoute)}"/>`);
+  }
+  return parts.join('\n');
+}
+
+/**
+ * Interpolates the route from the URL and the passed params.
+ * Best we can do to get a route name instead of a raw URL.
+ *
+ * exported for testing
+ *
+ * @param rawUrlPathname - The raw URL pathname, e.g. '/users/123/details'
+ * @param params - The params object, e.g. `{ userId: '123' }`
+ *
+ * @returns The interpolated route, e.g. '/users/[userId]/details'
+ */
+export function interpolateRouteFromUrlAndParams(
+  rawUrlPathname: string,
+  params: APIContext['params'],
+): string | undefined {
+  const decodedUrlPathname = tryDecodeUrl(rawUrlPathname);
+  if (!decodedUrlPathname) {
+    return undefined;
+  }
+
+  // Invert params map so that the param values are the keys
+  // differentiate between rest params spanning multiple url segments
+  // and normal, single-segment params.
+  const valuesToMultiSegmentParams: Record<string, string> = {};
+  const valuesToParams: Record<string, string> = {};
+  Object.entries(params).forEach(([key, value]) => {
+    if (!value) {
+      return;
+    }
+    if (value.includes('/')) {
+      valuesToMultiSegmentParams[value] = key;
+      return;
+    }
+    valuesToParams[value] = key;
+  });
+
+  function replaceWithParamName(segment: string): string {
+    const param = valuesToParams[segment];
+    if (param) {
+      return `[${param}]`;
+    }
+    return segment;
+  }
+
+  // before we match single-segment params, we first replace multi-segment params
+  const urlWithReplacedMultiSegmentParams = Object.keys(valuesToMultiSegmentParams).reduce((acc, key) => {
+    return acc.replace(key, `[${valuesToMultiSegmentParams[key]}]`);
+  }, decodedUrlPathname);
+
+  return (
+    urlWithReplacedMultiSegmentParams
+      .split('/')
+      .map(segment => {
+        if (!segment) {
+          return '';
+        }
+
+        if (valuesToParams[segment]) {
+          return replaceWithParamName(segment);
+        }
+
+        // astro permits multiple params in a single path segment, e.g. /[foo]-[bar]/
+        const segmentParts = segment.split('-');
+        if (segmentParts.length > 1) {
+          return segmentParts.map(part => replaceWithParamName(part)).join('-');
+        }
+
+        return segment;
+      })
+      .join('/')
+      // Remove trailing slash (only if it's not the only segment)
+      .replace(/^(.+?)\/$/, '$1')
+  );
+}
+
+function tryDecodeUrl(url: string): string | undefined {
+  try {
+    return decodeURI(url);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Checks if the incoming request is a request for a dynamic (server-side rendered) page.
+ * We can check this by looking at the middleware's `clientAddress` context property because accessing
+ * this prop in a static route will throw an error which we can conveniently catch.
+ */
+function checkIsDynamicPageRequest(context: APIContext): boolean {
+  try {
+    return context.clientAddress != null;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Join Astro route segments into a case-sensitive single path string.
+ *
+ * Astro v5 and v6 lowercase the parametrized route. Joining segments manually
+ * is recommended to get the correct casing of the routes.
+ * Recommendation in comment: https://github.com/withastro/astro/issues/13885#issuecomment-2934203029
+ * Function Reference: https://github.com/joanrieu/astro-typed-links/blob/b3dc12c6fe8d672a2bc2ae2ccc57c8071bbd09fa/package/src/integration.ts#L16
+ */
+function joinRouteSegments(segments: RoutePart[][]): string {
+  const parthArray = segments.map(segment =>
+    segment.map(routePart => (routePart.dynamic ? `[${routePart.content}]` : routePart.content)).join(''),
+  );
+
+  return `/${parthArray.join('/')}`;
+}
+
+function getParametrizedRoute(ctx: APIContext & { routePattern?: string }): string | undefined {
+  try {
+    // `routePattern` is available from Astro 5 on.
+    const contextWithRoutePattern = ctx;
+    const rawRoutePattern = contextWithRoutePattern.routePattern;
+
+    const routesFromManifest =
+      // @ts-expect-error Implicit any on Symbol.for (This is available in Astro 5)
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+      ctx?.[Symbol.for('context.routes')]?.manifest?.routes ??
+      // @ts-expect-error Implicit any on Symbol.for (This is available in Astro 6)
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+      ctx?.[Symbol.for('astro.pipeline')]?.manifest?.routes;
+
+    // oxlint-disable-next-line typescript/no-unsafe-member-access
+    const matchedRouteSegmentsFromManifest = routesFromManifest?.find(
+      (route: { routeData?: { route?: string } }) => route?.routeData?.route === rawRoutePattern,
+      // oxlint-disable-next-line typescript/no-unsafe-member-access
+    )?.routeData?.segments;
+
+    return (
+      // Astro v5 and v6 - Joining the segments to get the correct casing of the parametrized route
+      (matchedRouteSegmentsFromManifest && joinRouteSegments(matchedRouteSegmentsFromManifest)) ||
+      // Astro v7 - the manifest is no longer reachable from the context, but
+      // `routePattern` keeps the author's casing, so it needs no correction.
+      rawRoutePattern ||
+      // Fallback (Astro v4 and earlier, which has no `routePattern`)
+      interpolateRouteFromUrlAndParams(ctx.url.pathname, ctx.params)
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+function injectMetaTagsInResponse(originalResponse: Response, metaTagsStr: string): Response {
+  try {
+    const contentType = originalResponse.headers.get('content-type');
+
+    const isPageloadRequest = contentType?.startsWith('text/html');
+    if (!isPageloadRequest) {
+      return originalResponse;
+    }
+
+    // Type case necessary b/c the body's ReadableStream type doesn't include
+    // the async iterator that is actually available in Node
+    // We later on use the async iterator to read the body chunks
+    // see https://github.com/microsoft/TypeScript/issues/39051
+    const originalBody = originalResponse.body as NodeJS.ReadableStream | null;
+    if (!originalBody) {
+      return originalResponse;
+    }
+
+    const decoder = new TextDecoder();
+
+    const newResponseStream = new ReadableStream({
+      start: async controller => {
+        // Assign to a new variable to avoid TS losing the narrower type checked above.
+        const body = originalBody;
+
+        async function* bodyReporter(): AsyncGenerator<string | Buffer> {
+          try {
+            for await (const chunk of body) {
+              yield chunk;
+            }
+          } catch (e) {
+            // Report stream errors coming from user code or Astro rendering.
+            sendErrorToSentry(e);
+            throw e;
+          }
+        }
+
+        try {
+          for await (const chunk of bodyReporter()) {
+            const html = typeof chunk === 'string' ? chunk : decoder.decode(chunk, { stream: true });
+            const modifiedHtml = addMetaTagToHead(html, metaTagsStr);
+            controller.enqueue(new TextEncoder().encode(modifiedHtml));
+          }
+        } catch (e) {
+          controller.error(e);
+        } finally {
+          controller.close();
+        }
+      },
+    });
+
+    return new Response(newResponseStream, {
+      status: originalResponse.status,
+      statusText: originalResponse.statusText,
+      headers: new Headers(originalResponse.headers),
+    });
+  } catch (e) {
+    sendErrorToSentry(e);
+    throw e;
+  }
+}

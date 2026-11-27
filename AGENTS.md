@@ -1,0 +1,128 @@
+# Sentry JavaScript SDK
+
+Monorepo with 40+ packages in `@sentry/*`, managed with pnpm workspaces and Nx.
+
+## Setup
+
+- pnpm manages Node.js and pnpm versions (see `CONTRIBUTING.md`): Node.js in `devEngines.runtime`, pnpm in `packageManager`
+- After cloning: `pnpm install && pnpm run build`
+- Never change Node.js, pnpm, or package manager versions unless explicitly asked
+
+### Code Intelligence
+
+Prefer LSP over Grep/Read for code navigation — it's faster, precise, and avoids reading entire files:
+
+- `workspaceSymbol` to find where something is defined
+- `findReferences` to see all usages across the codebase
+- `goToDefinition` / `goToImplementation` to jump to source
+- `hover` for type info without reading the file
+
+Use Grep only when LSP isn't available or for text/pattern searches (comments, strings, config).
+
+After writing or editing code, check LSP diagnostics and fix errors before proceeding.
+
+## Package Manager
+
+Use **pnpm**, never npm or yarn. Scripts live in the root `package.json`.
+`pnpm run build:dev:filter @sentry/<pkg>` builds one package and its deps.
+
+Single package: `cd packages/<name> && pnpm run test`
+
+## Commit Attribution
+
+AI commits MUST include a `Co-Authored-By` line with the appropriate committer email when known:
+
+```
+Co-Authored-By: <Claude model name> <noreply@anthropic.com>
+Co-Authored-By: <OpenAI/ChatGPT model name> <codex@openai.com>
+Co-Authored-By: <Cursor agent name> <cursoragent@cursor.com>
+```
+
+Use the Cursor email for Cursor, even when it runs a Claude or OpenAI model. Omit the line only when there is no known committer email address for the agent.
+
+## Git Workflow
+
+Uses **Git Flow** (see `docs/gitflow.md`).
+
+- **All PRs target `develop`** (NOT `master`)
+- `master` = last released state — never merge directly
+- Feature branches: `feat/descriptive-name`
+- Never update dependencies, `package.json`, or build scripts unless explicitly asked
+
+## Before Every Pull Request
+
+1. `pnpm run format`
+2. `pnpm run build:dev`
+3. `pnpm run lint`
+4. Run the unit and integration/E2E tests for the affected packages.
+5. NEVER push on `develop`
+
+## Pull Requests
+
+- Use `.github/PULL_REQUEST_TEMPLATE.md` for the body (`gh pr create --body` skips it). Ideally 1-2 sentences per field, no AI walkthrough.
+- Always open PRs as draft.
+- Never apply the `Accept Bundlesize Increase` label.
+- **Keep PR descriptions condensed** — usually a few sentences. Explain the _reasoning_: why the change is needed, and any non-obvious decisions or tradeoffs made along the way. Do **not** walk through the implementation or describe what changed file-by-file — the diff already shows that. Only go longer when the decisions genuinely warrant it.
+
+## Architecture
+
+- Types live in `packages/core/`. The `@sentry/types` package is gone.
+- An AI provider integration spans two places, both in
+  `packages/server-utils/`: the gen-AI instrumentation logic in
+  `src/ai/{provider}/`, and the integration that wires it up in
+  `src/integrations/{provider}.ts`, registered in `getTracingIntegrations()`.
+  Runtime packages (`node`, `cloudflare`, ...) re-export from
+  `@sentry/server-utils` rather than defining their own.
+
+- `Sentry.init()` follows one rule for repeated calls: the first call wins. See
+  `docs/repeated-init.md` before you add or change an `init()`.
+
+- Span origins must follow the [trace origin spec](https://develop.sentry.dev/sdk/telemetry/traces/trace-origin/):
+  `<type>.<category>.<integration_name>.<integration_part>`, at most four parts, no skipped
+  parts, only `[a-zA-Z0-9_]` within a part. `category` is the span op category
+  (`auto.queue.kafkajs.producer`, not `auto.kafkajs.producer`). Don't encode tooling like
+  `otel` or `orchestrion` in the origin.
+
+## Linting & Formatting
+
+- This project uses **Oxlint** and **Oxfmt** — NOT ESLint or Prettier
+- Never run `eslint`, `npx eslint`, or any ESLint CLI — use `pnpm run lint` (Oxlint) instead
+- Never run `prettier` — use `pnpm run format` (Oxfmt) instead
+- ESLint packages in the repo are legacy/e2e test app dependencies — ignore them
+- Do not create, modify, or suggest `.eslintrc`, `eslint.config.*`, or `.prettierrc` files
+
+## Coding Standards
+
+- Follow existing conventions — check neighboring files
+- Reach for existing utils before writing a new one. Most shared helpers live in `@sentry/core` (`packages/core/src/utils/`), with browser helpers in `packages/browser-utils/`. Search first (LSP `workspaceSymbol` or grep) for common needs (type guards in `is.ts`, object/array helpers, `normalize`, `dsn`, `merge`, string/url helpers). Reuse or extend the existing util rather than adding a near-duplicate; only introduce a new util when nothing fits.
+- Only use libraries already in the codebase
+- Never expose secrets or keys
+- When modifying files, cover all occurrences (including `src/` and `test/`)
+- **Write few comments; default to none.** Comments explain **why**, never **what** — never add a comment that restates what the code does or narrates the change being made. Only add one when the reasoning isn't clear from the code itself, or to flag a tradeoff or something that would otherwise look surprising to a reader. When in doubt, leave it out.
+- Do not use `expect(someSpy.mock.calls[0]?.[0])` or similar constructs to check what a spy was called with.
+  Instead use `expect(someSpy).toHaveBeenCalledWith(...)` or derivatives for a more readable and less brittle test assertion.
+
+## Testing
+
+- **Do not set `traceLifecycle` in new tests** (node-integration-tests, e2e). Leave it unset so the test exercises the default — span streaming (`stream`). Many existing suites pin `traceLifecycle: 'static'` (or toggle it via `process.env.STREAMED`); do not copy that into new tests.
+- Under span streaming there is no `transaction` envelope with nested `spans`. Assert the transaction via the streamed span container: `.expect({ span: (container) => { ... } })`, finding the root with `container.items.find(i => i.is_segment)` and child spans with `container.items.filter(...)`. Add `.unordered()` so the span container and error events can arrive in any order and unrelated envelopes (client reports, etc.) are ignored. Errors are still separate `event` envelopes (`.expect({ event })`). A streamed span's error status is `'error'`, not the classic transaction's `'internal_error'`.
+
+## Lazy Loading Is a Last Resort
+
+Do NOT "fix" a bundler, runtime, or platform incompatibility by making an import lazy or opaque — `createRequire`, require-inside-a-function, dynamic `import()`, computed specifiers. Not all bundlers understand `createRequire`, and anything opaque to static analysis just moves the breakage to a different consumer (pnpm isolation, workerd, Turbopack, nft tracing) while masking the real defect. SDK code must stay statically analyzable.
+
+Before even proposing lazy loading:
+
+1. Reproduce the failure and read the **actual** error — not a plausible theory about it. If the error is swallowed, extract it (debug logging, running the server/bundle directly) before choosing a fix.
+2. Fix the root cause at the layer it lives in, in roughly this order: build output shape (rollup/commonjs options like `interop`, `strictRequires`, `requireReturnsDefault`, `output.paths`), module resolution (`exports` maps, self-references, absolute-path externals), packaging (what ships in the tarball, bundled vs external deps), and only then consumer-side configuration.
+3. If, after exhausting these, lazy loading still seems necessary, stop and ask — explain what was tried and why nothing else works. Do not implement it first.
+
+## Reference Documentation
+
+- [Span Attributes](https://develop.sentry.dev/sdk/telemetry/attributes.md)
+- [Scopes (global, isolation, current)](https://develop.sentry.dev/sdk/telemetry/scopes.md)
+
+## Skills
+
+Task-specific instructions live in `.claude/skills/`. Each skill lists its
+own trigger, so consult that directory rather than this file.
