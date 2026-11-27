@@ -14951,8 +14951,8 @@ packages:
       encoding:
         optional: true
 
-  node-forge@1.4.0:
-    resolution: {integrity: sha512-LarFH0+6VfriEhqMMcLX2F7SwSXeWwnEAJEsYm5QKWchiVYVvJyV9v7UDvUv+w5HO23ZpQTXDv/GxdDdMyOuoQ==}
+  node-forge@1.4.4:
+    resolution: {integrity: sha512-T6VRRpF3+czIGcXW/LOeoD7Ej28d8CF1UMEAbJyJRUtYMvyXAgxUPW2kbUibumvV9LiUQAznJOFyeYclzSJMMg==}
     engines: {node: '>= 6.13.0'}
 
   node-gyp-build@4.6.0:
@@ -27609,7 +27609,7 @@ snapshots:
       http-shutdown: 1.2.2
       jiti: 1.21.6
       mlly: 1.8.2
-      node-forge: 1.4.0
+      node-forge: 1.4.4
       pathe: 1.1.2
       std-env: 3.10.0
       ufo: 1.6.4
@@ -31939,7 +31939,7 @@ snapshots:
 
   google-p12-pem@3.1.4:
     dependencies:
-      node-forge: 1.4.0
+      node-forge: 1.4.4
 
   gopd@1.2.0: {}
 
@@ -33447,7 +33447,7 @@ snapshots:
       h3: 1.15.11
       http-shutdown: 1.2.2
       jiti: 2.7.0
-      node-forge: 1.4.0
+      node-forge: 1.4.4
       pathe: 2.0.3
       std-env: 4.3.0
       tinyclip: 0.1.15
@@ -35012,7 +35012,7 @@ snapshots:
     optionalDependencies:
       encoding: 0.1.13
 
-  node-forge@1.4.0: {}
+  node-forge@1.4.4: {}
 
   node-gyp-build@4.6.0: {}
 
@@ -37882,7 +37882,7 @@ snapshots:
   selfsigned@2.4.1:
     dependencies:
       '@types/node-forge': 1.3.11
-      node-forge: 1.4.0
+      node-forge: 1.4.4
 
   semifies@1.0.0: {}
 
