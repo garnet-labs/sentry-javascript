@@ -1,0 +1,457 @@
+import type { Client, Integration, IntegrationFn, ReplayRecordingMode, StreamedSpanJSON } from '@sentry/core';
+import type { BrowserClientReplayOptions } from '@sentry/core/browser';
+import { consoleSandbox, GLOBAL_OBJ, isBrowser, parseSampleRate, safeSetSpanJSONAttributes } from '@sentry/core';
+import {
+  DEFAULT_FLUSH_MAX_DELAY,
+  DEFAULT_FLUSH_MIN_DELAY,
+  MAX_REPLAY_DURATION,
+  MIN_REPLAY_DURATION,
+  MIN_REPLAY_DURATION_LIMIT,
+} from './constants';
+import { ReplayContainer } from './replay';
+import type {
+  InitialReplayPluginOptions,
+  RecordingOptions,
+  ReplayCanvasIntegrationOptions,
+  ReplayConfiguration,
+  ReplayPluginOptions,
+  SendBufferedReplayOptions,
+} from './types';
+import { getPrivacyOptions } from './util/getPrivacyOptions';
+import { maskAttribute } from './util/maskAttribute';
+
+const MEDIA_SELECTORS =
+  'img,image,svg,video,object,picture,embed,map,audio,link[rel="icon"],link[rel="apple-touch-icon"]';
+
+const DEFAULT_NETWORK_HEADERS = ['content-length', 'content-type', 'accept'];
+
+// Symbol to store the original body on Request objects
+const ORIGINAL_BODY = Symbol.for('sentry__originalRequestBody');
+
+let _initialized = false;
+let _isRequestInstrumented = false;
+
+/**
+ * Instruments the global Request constructor to store the original body.
+ * This allows us to retrieve the original body value later, since Request
+ * converts string bodies to ReadableStreams.
+ */
+export function _INTERNAL_instrumentRequestInterface(): void {
+  if (typeof Request === 'undefined' || _isRequestInstrumented) {
+    return;
+  }
+
+  const OriginalRequest = Request;
+
+  try {
+    const SentryRequest = function (input: RequestInfo | URL, init?: RequestInit): Request {
+      const request = new OriginalRequest(input, init);
+      if (init?.body != null) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any,@typescript-eslint/no-unsafe-member-access
+        (request as any)[ORIGINAL_BODY] = init.body;
+      }
+      return request;
+    };
+
+    SentryRequest.prototype = OriginalRequest.prototype;
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any,@typescript-eslint/no-unsafe-member-access
+    (GLOBAL_OBJ as any).Request = SentryRequest;
+
+    _isRequestInstrumented = true;
+  } catch {
+    // Fail silently if Request is frozen
+  }
+}
+
+/**
+ * Sentry integration for [Session Replay](https://sentry.io/for/session-replay/).
+ *
+ * See the [Replay documentation](https://docs.sentry.io/platforms/javascript/guides/session-replay/) for more information.
+ *
+ * @example
+ *
+ * ```
+ * Sentry.init({
+ *   dsn: '__DSN__',
+ *   integrations: [Sentry.replayIntegration()],
+ * });
+ * ```
+ */
+export const replayIntegration = ((options?: ReplayConfiguration) => {
+  return new Replay(options);
+}) satisfies IntegrationFn;
+
+/**
+ * Replay integration
+ */
+export class Replay implements Integration {
+  /**
+   * @inheritDoc
+   */
+  public name: string;
+
+  /**
+   * Options to pass to `rrweb.record()`
+   */
+  private readonly _recordingOptions: RecordingOptions;
+
+  /**
+   * Initial options passed to the replay integration, merged with default values.
+   * Note: `sessionSampleRate` and `errorSampleRate` are not required here, as they
+   * can only be finally set when setupOnce() is called.
+   *
+   * @private
+   */
+  private readonly _initialOptions: InitialReplayPluginOptions;
+
+  private _replay?: ReplayContainer;
+
+  public constructor({
+    flushMinDelay = DEFAULT_FLUSH_MIN_DELAY,
+    flushMaxDelay = DEFAULT_FLUSH_MAX_DELAY,
+    minReplayDuration = MIN_REPLAY_DURATION,
+    maxReplayDuration = MAX_REPLAY_DURATION,
+    stickySession = true,
+    useCompression = true,
+    workerUrl,
+    _experiments = {},
+    maskAllText = true,
+    maskAllInputs = true,
+    blockAllMedia = true,
+
+    mutationBreadcrumbLimit = 750,
+    mutationLimit = 10_000,
+
+    slowClickTimeout = 7_000,
+    slowClickIgnoreSelectors = [],
+
+    networkDetailAllowUrls = [],
+    networkDetailDenyUrls = [],
+    networkCaptureBodies = true,
+    networkRequestHeaders = [],
+    networkResponseHeaders = [],
+
+    mask = [],
+    maskAttributes = ['title', 'placeholder', 'aria-label'],
+    unmask = [],
+    block = [],
+    unblock = [],
+    ignore = [],
+    maskFn,
+
+    beforeAddRecordingEvent,
+    beforeErrorSampling,
+    onError,
+    attachRawBodyFromRequest = false,
+  }: ReplayConfiguration = {}) {
+    this.name = 'Replay';
+
+    const privacyOptions = getPrivacyOptions({
+      mask,
+      unmask,
+      block,
+      unblock,
+      ignore,
+    });
+
+    this._recordingOptions = {
+      maskAllInputs,
+      maskAllText,
+      maskInputOptions: { password: true },
+      maskTextFn: maskFn,
+      maskInputFn: maskFn,
+      maskAttributeFn: (key: string, value: string, el: HTMLElement): string =>
+        maskAttribute({
+          maskAttributes,
+          maskAllText,
+          privacyOptions,
+          key,
+          value,
+          el,
+        }),
+
+      ...privacyOptions,
+
+      // Our defaults
+      slimDOMOptions: 'all',
+      inlineStylesheet: true,
+      // Disable inline images as it will increase segment/replay size
+      inlineImages: false,
+      // collect fonts, but be aware that `sentry.io` needs to be an allowed
+      // origin for playback
+      collectFonts: true,
+      errorHandler: (err: Error & { __rrweb__?: boolean }) => {
+        try {
+          err.__rrweb__ = true;
+        } catch {
+          // ignore errors here
+          // this can happen if the error is frozen or does not allow mutation for other reasons
+        }
+      },
+      // experimental support for recording iframes from different origins
+      recordCrossOriginIframes: Boolean(_experiments.recordCrossOriginIframes),
+    };
+
+    this._initialOptions = {
+      flushMinDelay,
+      flushMaxDelay,
+      minReplayDuration: Math.min(minReplayDuration, MIN_REPLAY_DURATION_LIMIT),
+      maxReplayDuration: Math.min(maxReplayDuration, MAX_REPLAY_DURATION),
+      stickySession,
+      useCompression,
+      workerUrl,
+      blockAllMedia,
+      maskAllInputs,
+      maskAllText,
+      mutationBreadcrumbLimit,
+      mutationLimit,
+      slowClickTimeout,
+      slowClickIgnoreSelectors,
+      networkDetailAllowUrls,
+      networkDetailDenyUrls,
+      networkCaptureBodies,
+      networkRequestHeaders: _getMergedNetworkHeaders(networkRequestHeaders),
+      networkResponseHeaders: _getMergedNetworkHeaders(networkResponseHeaders),
+      beforeAddRecordingEvent,
+      beforeErrorSampling,
+      onError,
+      attachRawBodyFromRequest,
+
+      _experiments,
+    };
+
+    if (this._initialOptions.blockAllMedia) {
+      // `blockAllMedia` is a more user friendly option to configure blocking
+      // embedded media elements
+      this._recordingOptions.blockSelector = !this._recordingOptions.blockSelector
+        ? MEDIA_SELECTORS
+        : `${this._recordingOptions.blockSelector},${MEDIA_SELECTORS}`;
+      this._recordingOptions.ignoreCSSAttributes = new Set(['background-image']);
+    }
+
+    if (this._isInitialized && isBrowser()) {
+      throw new Error('Multiple Sentry Session Replay instances are not supported');
+    }
+
+    this._isInitialized = true;
+  }
+
+  /** If replay has already been initialized */
+  protected get _isInitialized(): boolean {
+    return _initialized;
+  }
+
+  /** Update _isInitialized */
+  protected set _isInitialized(value: boolean) {
+    _initialized = value;
+  }
+
+  /**
+   * Setup and initialize replay container
+   */
+  public afterAllSetup(client: Client): void {
+    if (!isBrowser() || this._replay) {
+      return;
+    }
+
+    if (this._initialOptions.attachRawBodyFromRequest) {
+      _INTERNAL_instrumentRequestInterface();
+    }
+
+    this._setup(client);
+    this._initialize(client);
+  }
+
+  /**
+   * Start a replay regardless of sampling rate. Calling this will always
+   * create a new session. Will log a message if replay is already in progress.
+   *
+   * Creates or loads a session, attaches listeners to varying events (DOM,
+   * PerformanceObserver, Recording, Sentry SDK, etc)
+   */
+  public start(): void {
+    if (!this._replay) {
+      return;
+    }
+    this._replay.start();
+  }
+
+  /**
+   * Start replay buffering. Buffers until `flush()` is called or, if
+   * `replaysOnErrorSampleRate` > 0, until an error occurs.
+   */
+  public startBuffering(): void {
+    if (!this._replay) {
+      return;
+    }
+
+    this._replay.startBuffering();
+  }
+
+  /**
+   * Currently, this needs to be manually called (e.g. for tests). Sentry SDK
+   * does not support a teardown
+   *
+   * @param options.flush - Whether to flush the pending replay segment when stopping.
+   * When recording in `session` mode, `stop()` flushes the buffered-but-unsent segment by
+   * default (`flush: true`), matching the previous behavior. Pass `flush: false` to stop
+   * recording without sending that pending segment — useful when a user withdraws consent
+   * and no further data should leave the browser.
+   *
+   * Note: `flush: false` only prevents the *pending* (final) segment from being sent. It does
+   * **not** retract segments that were already sent earlier during `session` recording.
+   */
+  public stop(options?: { flush?: boolean }): Promise<void> {
+    if (!this._replay) {
+      return Promise.resolve();
+    }
+
+    return this._replay.stop({
+      forceFlush: options?.flush ?? this._replay.recordingMode === 'session',
+      reason: 'manual',
+    });
+  }
+
+  /**
+   * If not in "session" recording mode, flush event buffer which will create a new replay.
+   * If replay is not enabled, a new session replay is started.
+   * Unless `continueRecording` is false, the replay will continue to record and
+   * behave as a "session"-based replay.
+   *
+   * Otherwise, queue up a flush.
+   */
+  public flush(options?: SendBufferedReplayOptions): Promise<void> {
+    if (!this._replay) {
+      return Promise.resolve();
+    }
+
+    // assuming a session should be recorded in this case
+    if (!this._replay.isEnabled()) {
+      this._replay.start();
+      return Promise.resolve();
+    }
+
+    return this._replay.sendBufferedReplayOrFlush(options);
+  }
+
+  /**
+   * Get the current session ID.
+   *
+   * @param onlyIfSampled - If true, will only return the session ID if the session is sampled.
+   *
+   */
+  public getReplayId(onlyIfSampled?: boolean): string | undefined {
+    if (!this._replay?.isEnabled()) {
+      return;
+    }
+
+    return this._replay.getSessionId(onlyIfSampled);
+  }
+
+  /**
+   * Get the current recording mode. This can be either `session` or `buffer`.
+   *
+   * `session`: Recording the whole session, sending it continuously
+   * `buffer`: Always keeping the last 60s of recording, requires:
+   *   - having replaysOnErrorSampleRate > 0 to capture replay when an error occurs
+   *   - or calling `flush()` to send the replay
+   */
+  public getRecordingMode(): ReplayRecordingMode | undefined {
+    if (!this._replay?.isEnabled()) {
+      return;
+    }
+
+    return this._replay.recordingMode;
+  }
+
+  public processSpan(span: StreamedSpanJSON): void {
+    const replayId = this.getReplayId(true);
+    if (replayId) {
+      safeSetSpanJSONAttributes(span, { 'sentry.replay_id': replayId });
+      if (this.getRecordingMode() === 'buffer') {
+        safeSetSpanJSONAttributes(span, { 'sentry._internal.replay_is_buffering': true });
+      }
+    }
+  }
+
+  /**
+   * Initializes replay.
+   */
+  protected _initialize(client: Client): void {
+    if (!this._replay) {
+      return;
+    }
+
+    this._maybeLoadFromReplayCanvasIntegration(client);
+    this._replay.initializeSampling();
+  }
+
+  /** Setup the integration. */
+  private _setup(client: Client): void {
+    // Client is not available in constructor, so we need to wait until setupOnce
+    const finalOptions = loadReplayOptionsFromClient(this._initialOptions, client);
+
+    this._replay = new ReplayContainer({
+      options: finalOptions,
+      recordingOptions: this._recordingOptions,
+    });
+  }
+
+  /** Get canvas options from ReplayCanvas integration, if it is also added. */
+  private _maybeLoadFromReplayCanvasIntegration(client: Client): void {
+    // To save bundle size, we skip checking for stuff here
+    // and instead just try-catch everything - as generally this should all be defined
+    /* eslint-disable @typescript-eslint/no-non-null-assertion */
+    try {
+      const canvasIntegration = client.getIntegrationByName('ReplayCanvas') as Integration & {
+        getOptions(): ReplayCanvasIntegrationOptions;
+      };
+      if (!canvasIntegration) {
+        return;
+      }
+
+      this._replay!['_canvas'] = canvasIntegration.getOptions();
+    } catch {
+      // ignore errors here
+    }
+    /* eslint-enable @typescript-eslint/no-non-null-assertion */
+  }
+}
+
+/** Parse Replay-related options from SDK options */
+function loadReplayOptionsFromClient(initialOptions: InitialReplayPluginOptions, client: Client): ReplayPluginOptions {
+  const opt = client.getOptions() as BrowserClientReplayOptions;
+
+  const finalOptions: ReplayPluginOptions = {
+    sessionSampleRate: 0,
+    errorSampleRate: 0,
+    ...initialOptions,
+  };
+
+  const replaysSessionSampleRate = parseSampleRate(opt.replaysSessionSampleRate);
+  const replaysOnErrorSampleRate = parseSampleRate(opt.replaysOnErrorSampleRate);
+
+  if (replaysSessionSampleRate == null && replaysOnErrorSampleRate == null) {
+    consoleSandbox(() => {
+      // eslint-disable-next-line no-console
+      console.warn(
+        'Replay is disabled because neither `replaysSessionSampleRate` nor `replaysOnErrorSampleRate` are set.',
+      );
+    });
+  }
+
+  if (replaysSessionSampleRate != null) {
+    finalOptions.sessionSampleRate = replaysSessionSampleRate;
+  }
+
+  if (replaysOnErrorSampleRate != null) {
+    finalOptions.errorSampleRate = replaysOnErrorSampleRate;
+  }
+
+  return finalOptions;
+}
+
+function _getMergedNetworkHeaders(headers: string[]): string[] {
+  return [...DEFAULT_NETWORK_HEADERS, ...headers.map(header => header.toLowerCase())];
+}

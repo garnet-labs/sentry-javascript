@@ -1,0 +1,191 @@
+import type { createSentryBuildPluginManager as createSentryBuildPluginManagerType } from '@sentry/bundler-plugins/core';
+import { loadModule } from '@sentry/core/server';
+import * as fs from 'fs';
+import * as path from 'path';
+import { getBuildLogger } from './buildLogger';
+import { getBuildPluginOptions } from './getBuildPluginOptions';
+import type { SentryBuildOptions } from './types';
+
+/**
+ * This function is called by Next.js after the production build is complete.
+ * It is used to upload sourcemaps to Sentry.
+ */
+export async function handleRunAfterProductionCompile(
+  {
+    releaseName,
+    distDir,
+    buildTool,
+    usesNativeDebugIds,
+    sriEnabled,
+  }: {
+    releaseName?: string;
+    distDir: string;
+    buildTool: 'webpack' | 'turbopack';
+    usesNativeDebugIds?: boolean;
+    sriEnabled?: boolean;
+  },
+  sentryBuildOptions: SentryBuildOptions,
+): Promise<void> {
+  const logger = getBuildLogger(sentryBuildOptions.silent);
+
+  if (sentryBuildOptions.debug) {
+    logger.debug('[@sentry/nextjs] Running runAfterProductionCompile logic.');
+  }
+
+  const { createSentryBuildPluginManager } =
+    loadModule<{ createSentryBuildPluginManager: typeof createSentryBuildPluginManagerType }>(
+      '@sentry/bundler-plugins/core',
+      module,
+    ) ?? {};
+
+  if (!createSentryBuildPluginManager) {
+    logger.warn('[@sentry/nextjs] Could not load build manager package. Will not run runAfterProductionCompile logic.');
+    return;
+  }
+
+  const options = getBuildPluginOptions({
+    sentryBuildOptions,
+    releaseName,
+    distDirAbsPath: distDir,
+    buildTool: `after-production-compile-${buildTool}`,
+  });
+
+  const sentryBuildPluginManager = createSentryBuildPluginManager(options, {
+    buildTool,
+    loggerPrefix: '[@sentry/nextjs - After Production Compile]',
+  });
+
+  await sentryBuildPluginManager.telemetry.emitBundlerPluginExecutionSignal();
+  await sentryBuildPluginManager.createRelease();
+
+  // Skip debug ID injection if sourcemaps are disabled which are only relevant for sourcemap correlation
+  if (!usesNativeDebugIds && sentryBuildOptions.sourcemaps?.disable !== true) {
+    await sentryBuildPluginManager.injectDebugIds([distDir]);
+  }
+
+  await sentryBuildPluginManager.uploadSourcemaps([distDir], {
+    // We don't want to prepare the artifacts because we injected debug ids manually before
+    prepareArtifacts: false,
+  });
+
+  const deleteSourcemapsAfterUpload = sentryBuildOptions.sourcemaps?.deleteSourcemapsAfterUpload ?? false;
+
+  // Deletion covers all of `static/`, so if Next.js emits chunks outside the upload
+  // patterns, their maps would be deleted without ever having been uploaded — warn instead
+  // of failing silently.
+  if (
+    deleteSourcemapsAfterUpload &&
+    buildTool === 'turbopack' &&
+    !sentryBuildOptions.sourcemaps?.assets &&
+    options.sourcemaps?.disable !== true
+  ) {
+    await warnAboutUncoveredSourcemaps(
+      path.join(distDir, 'static'),
+      options.sourcemaps?.assets,
+      sentryBuildOptions.silent,
+    );
+  }
+
+  await sentryBuildPluginManager.deleteArtifacts();
+
+  // After deleting source map files in turbopack builds, strip any remaining
+  // sourceMappingURL comments from client JS files. Without this, browsers request
+  // the deleted .map files, and in Next.js 16 (turbopack) those requests fall through
+  // to the app router instead of returning 404, which can break middleware-dependent
+  // features like Clerk auth.
+  // When SRI is enabled, we must skip this step because Next.js computes integrity
+  // hashes during the build — modifying files afterward invalidates those hashes.
+  if (deleteSourcemapsAfterUpload && buildTool === 'turbopack' && !sriEnabled) {
+    await stripSourceMappingURLComments(path.join(distDir, 'static'), sentryBuildOptions);
+  }
+
+  if (deleteSourcemapsAfterUpload && buildTool === 'turbopack' && sriEnabled && sentryBuildOptions.debug) {
+    logger.debug(
+      '[@sentry/nextjs] Skipping sourceMappingURL comment stripping because Subresource Integrity (SRI) is enabled.',
+    );
+  }
+}
+
+async function warnAboutUncoveredSourcemaps(
+  staticDir: string,
+  uploadAssets: string | string[] | undefined,
+  silent: boolean | undefined,
+): Promise<void> {
+  let entries: string[];
+  try {
+    entries = await fs.promises.readdir(staticDir, { recursive: true }).then(e => e.map(f => String(f)));
+  } catch {
+    return;
+  }
+
+  const assetPaths = (Array.isArray(uploadAssets) ? uploadAssets : uploadAssets ? [uploadAssets] : []).map(p =>
+    p.replace(/\\/g, '/'),
+  );
+  const staticDirPosix = staticDir.replace(/\\/g, '/');
+
+  const uncovered = entries
+    .filter(entry => /\.(js|mjs|cjs)\.map$/.test(entry))
+    .map(entry => path.posix.join(staticDirPosix, entry.replace(/\\/g, '/')))
+    .filter(mapPath => !assetPaths.some(assetPath => mapPath === assetPath || mapPath.startsWith(`${assetPath}/`)));
+
+  if (uncovered.length > 0) {
+    getBuildLogger(silent).warn(
+      `[@sentry/nextjs] Found ${uncovered.length} source map file(s) under "${staticDir}" (e.g. "${
+        uncovered[0]
+      }") that are not covered by the source map upload patterns and will be deleted without having been uploaded to Sentry. Stack traces for the affected files will not be symbolicated. Set the \`sourcemaps.assets\` option in \`withSentryConfig\` to cover these files.`,
+    );
+  }
+}
+
+const SOURCEMAPPING_URL_COMMENT_REGEX = /(?:^|\n)\/\/[#@] sourceMappingURL=[^\s'"`*]+\s*$/;
+const CSS_SOURCEMAPPING_URL_COMMENT_REGEX = /\n?\/\*[#@] sourceMappingURL=[^\s*]+\s*\*\/\s*$/;
+
+/**
+ * Strips sourceMappingURL comments from all JS/MJS/CJS/CSS files in the given directory.
+ * This prevents browsers from requesting deleted .map files.
+ */
+export async function stripSourceMappingURLComments(
+  staticDir: string,
+  { debug, silent }: Pick<SentryBuildOptions, 'debug' | 'silent'> = {},
+): Promise<void> {
+  let entries: string[];
+  try {
+    entries = await fs.promises.readdir(staticDir, { recursive: true }).then(e => e.map(f => String(f)));
+  } catch {
+    // Directory may not exist (e.g., no static output)
+    return;
+  }
+
+  const filesToProcess = entries.filter(
+    f => f.endsWith('.js') || f.endsWith('.mjs') || f.endsWith('.cjs') || f.endsWith('.css'),
+  );
+
+  const results = await Promise.all(
+    filesToProcess.map(async file => {
+      const filePath = path.join(staticDir, file);
+      try {
+        const content = await fs.promises.readFile(filePath, 'utf-8');
+
+        const isCSS = file.endsWith('.css');
+        const regex = isCSS ? CSS_SOURCEMAPPING_URL_COMMENT_REGEX : SOURCEMAPPING_URL_COMMENT_REGEX;
+
+        const strippedContent = content.replace(regex, '');
+        if (strippedContent !== content) {
+          await fs.promises.writeFile(filePath, strippedContent, 'utf-8');
+          return file;
+        }
+      } catch {
+        // Skip files that can't be read/written
+      }
+      return undefined;
+    }),
+  );
+
+  const strippedCount = results.filter(Boolean).length;
+
+  if (debug && strippedCount > 0) {
+    getBuildLogger(silent).debug(
+      `[@sentry/nextjs] Stripped sourceMappingURL comments from ${String(strippedCount)} file(s) to prevent requests for deleted source maps.`,
+    );
+  }
+}

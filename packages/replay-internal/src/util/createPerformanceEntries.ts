@@ -1,0 +1,274 @@
+import { _INTERNAL_performanceTimeToSeconds } from '@sentry/core';
+import { record } from '@sentry/rrweb';
+import type {
+  AllPerformanceEntry,
+  AllPerformanceEntryData,
+  ExperimentalPerformanceResourceTiming,
+  NavigationData,
+  PaintData,
+  ReplayContainer,
+  ReplayPerformanceEntry,
+  ResourceData,
+  WebVitalData,
+} from '../types';
+
+// Map entryType -> function to normalize data for event
+const ENTRY_TYPES: Record<
+  string,
+  (entry: AllPerformanceEntry) => null | ReplayPerformanceEntry<AllPerformanceEntryData>
+> = {
+  // @ts-expect-error TODO: entry type does not fit the create* functions entry type
+  resource: createResourceEntry,
+  // @ts-expect-error TODO: entry type does not fit the create* functions entry type
+  paint: createPaintEntry,
+  // @ts-expect-error TODO: entry type does not fit the create* functions entry type
+  navigation: createNavigationEntry,
+};
+
+export interface Metric {
+  /**
+   * The current value of the metric.
+   */
+  value: number;
+
+  /**
+   * The rating as to whether the metric value is within the "good",
+   * "needs improvement", or "poor" thresholds of the metric.
+   */
+  rating: 'good' | 'needs-improvement' | 'poor';
+
+  /**
+   * Any performance entries relevant to the metric value calculation.
+   * The array may also be empty if the metric value was not based on any
+   * entries (e.g. a CLS value of 0 given no layout shifts).
+   */
+  entries: PerformanceEntry[] | LayoutShift[];
+
+  /**
+   * The start time the metric value is relative to.
+   * Non-zero for soft navigations and bfcache restores.
+   */
+  navigationStartTime?: number;
+}
+
+interface LayoutShift extends PerformanceEntry {
+  value: number;
+  sources: LayoutShiftAttribution[];
+  hadRecentInput: boolean;
+}
+
+interface LayoutShiftAttribution {
+  node?: Node;
+  previousRect: DOMRectReadOnly;
+  currentRect: DOMRectReadOnly;
+}
+
+/**
+ * Handler creater for web vitals
+ */
+export function webVitalHandler(
+  getter: (metric: Metric) => ReplayPerformanceEntry<AllPerformanceEntryData>,
+  replay: ReplayContainer,
+): (data: { metric: Metric }) => void {
+  return ({ metric }) => void replay.replayPerformanceEntries.push(getter(metric));
+}
+
+/**
+ * Create replay performance entries from the browser performance entries.
+ */
+export function createPerformanceEntries(
+  entries: AllPerformanceEntry[],
+): ReplayPerformanceEntry<AllPerformanceEntryData>[] {
+  return entries.map(createPerformanceEntry).filter(Boolean) as ReplayPerformanceEntry<AllPerformanceEntryData>[];
+}
+
+function createPerformanceEntry(entry: AllPerformanceEntry): ReplayPerformanceEntry<AllPerformanceEntryData> | null {
+  const entryType = ENTRY_TYPES[entry.entryType];
+  if (!entryType) {
+    return null;
+  }
+
+  return entryType(entry);
+}
+
+function getAbsoluteTime(time: number, entryStartTime = time): number {
+  // Entries are only converted on flush, which can be minutes after they were recorded, so we use the time origin
+  // from when the entry started. Pass the entry's start for all its timings, so its duration stays correct.
+  // The cast is safe: this integration only runs if the Performance API exists.
+  return _INTERNAL_performanceTimeToSeconds(time, entryStartTime) as number;
+}
+
+function createPaintEntry(entry: PerformancePaintTiming): ReplayPerformanceEntry<PaintData> {
+  const { duration, entryType, name, startTime } = entry;
+
+  const start = getAbsoluteTime(startTime);
+  return {
+    type: entryType,
+    name,
+    start,
+    end: start + duration,
+    data: undefined,
+  };
+}
+
+function createNavigationEntry(entry: PerformanceNavigationTiming): ReplayPerformanceEntry<NavigationData> | null {
+  const {
+    entryType,
+    name,
+    decodedBodySize,
+    duration,
+    domComplete,
+    encodedBodySize,
+    domContentLoadedEventStart,
+    domContentLoadedEventEnd,
+    domInteractive,
+    loadEventStart,
+    loadEventEnd,
+    redirectCount,
+    startTime,
+    transferSize,
+    type,
+  } = entry;
+
+  // Ignore entries with no duration, they do not seem to be useful and cause dupes
+  if (duration === 0) {
+    return null;
+  }
+
+  return {
+    type: `${entryType}.${type}`,
+    start: getAbsoluteTime(startTime),
+    end: getAbsoluteTime(domComplete, startTime),
+    name,
+    data: {
+      size: transferSize,
+      decodedBodySize,
+      encodedBodySize,
+      duration,
+      domInteractive,
+      domContentLoadedEventStart,
+      domContentLoadedEventEnd,
+      loadEventStart,
+      loadEventEnd,
+      domComplete,
+      redirectCount,
+    },
+  };
+}
+
+function createResourceEntry(
+  entry: ExperimentalPerformanceResourceTiming,
+): ReplayPerformanceEntry<ResourceData> | null {
+  const {
+    entryType,
+    initiatorType,
+    name,
+    responseEnd,
+    startTime,
+    decodedBodySize,
+    encodedBodySize,
+    responseStatus,
+    transferSize,
+  } = entry;
+
+  // Core SDK handles these
+  if (['fetch', 'xmlhttprequest'].includes(initiatorType)) {
+    return null;
+  }
+
+  return {
+    type: `${entryType}.${initiatorType}`,
+    start: getAbsoluteTime(startTime),
+    end: getAbsoluteTime(responseEnd, startTime),
+    name,
+    data: {
+      size: transferSize,
+      statusCode: responseStatus,
+      decodedBodySize,
+      encodedBodySize,
+    },
+  };
+}
+
+/**
+ * Add a LCP event to the replay based on a LCP metric.
+ */
+export function getLargestContentfulPaint(metric: Metric): ReplayPerformanceEntry<WebVitalData> {
+  // oxlint-disable-next-line typescript/no-unnecessary-type-assertion -- rule false positive: the cast exposes LCP's `element` field; tsc errors without it
+  const lastEntry = metric.entries[metric.entries.length - 1] as (PerformanceEntry & { element?: Node }) | undefined;
+  const node = lastEntry?.element ? [lastEntry.element] : undefined;
+  return getWebVital(metric, 'largest-contentful-paint', node);
+}
+
+function isLayoutShift(entry: PerformanceEntry): entry is LayoutShift {
+  return (entry as LayoutShift).sources !== undefined;
+}
+
+/**
+ * Add a CLS event to the replay based on a CLS metric.
+ */
+export function getCumulativeLayoutShift(metric: Metric): ReplayPerformanceEntry<WebVitalData> {
+  const layoutShifts: WebVitalData['attributions'] = [];
+  const nodes: Node[] = [];
+  for (const entry of metric.entries) {
+    if (isLayoutShift(entry)) {
+      const nodeIds = [];
+      for (const source of entry.sources) {
+        if (source.node) {
+          nodes.push(source.node);
+          const nodeId = record.mirror.getId(source.node);
+          if (nodeId) {
+            nodeIds.push(nodeId);
+          }
+        }
+      }
+      layoutShifts.push({ value: entry.value, nodeIds: nodeIds.length ? nodeIds : undefined });
+    }
+  }
+
+  return getWebVital(metric, 'cumulative-layout-shift', nodes, layoutShifts);
+}
+
+/**
+ * Add an INP event to the replay based on an INP metric.
+ */
+export function getInteractionToNextPaint(metric: Metric): ReplayPerformanceEntry<WebVitalData> {
+  // oxlint-disable-next-line typescript/no-unnecessary-type-assertion -- rule false positive: the cast exposes the entry's `target` field; tsc errors without it
+  const lastEntry = metric.entries[metric.entries.length - 1] as (PerformanceEntry & { target?: Node }) | undefined;
+  const node = lastEntry?.target ? [lastEntry.target] : undefined;
+  return getWebVital(metric, 'interaction-to-next-paint', node);
+}
+
+/**
+ * Add an web vital event to the replay based on the web vital metric.
+ */
+function getWebVital(
+  metric: Metric,
+  name: string,
+  nodes: Node[] | undefined,
+  attributions?: WebVitalData['attributions'],
+): ReplayPerformanceEntry<WebVitalData> {
+  const value = metric.value;
+  const rating = metric.rating;
+
+  // The value is a score for CLS and a duration for INP, so it is not a time. We place the event at the last entry
+  // instead: the render for LCP, the last layout shift for CLS and the interaction for INP. Without entries (a CLS of
+  // 0, a bfcache LCP), we fall back to the start of the navigation the metric belongs to, plus the value. For a soft
+  // navigation, this keeps the event on that navigation instead of at page load.
+  const lastEntry = metric.entries[metric.entries.length - 1];
+  const end = getAbsoluteTime(lastEntry?.startTime ?? (metric.navigationStartTime ?? 0) + value);
+
+  return {
+    type: 'web-vital',
+    name,
+    start: end,
+    end,
+    data: {
+      value,
+      size: value,
+      rating,
+      nodeIds: nodes ? nodes.map(node => record.mirror.getId(node)) : undefined,
+      attributions,
+    },
+  };
+}

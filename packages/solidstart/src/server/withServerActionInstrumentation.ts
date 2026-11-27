@@ -1,0 +1,78 @@
+import { handleCallbackErrors, SPAN_STATUS_ERROR } from '@sentry/core';
+import { flushIfServerless } from '@sentry/core/server';
+import { captureException, getActiveSpan, getRootSpan, spanToJSON, startSpan } from '@sentry/node';
+import { isRedirect } from './utils';
+import {
+  SENTRY_SEGMENT_NAME_SOURCE,
+  CODE_FUNCTION_NAME,
+  HTTP_ROUTE,
+  HTTP_TARGET,
+  SENTRY_OP,
+  URL_PATH,
+  SENTRY_ORIGIN,
+} from '@sentry/conventions/attributes';
+import { FUNCTION } from '@sentry/conventions/op';
+import { setHttpServerSpanRouteAttribute } from '@sentry/server-utils';
+
+/**
+ * Wraps a server action (functions that use the 'use server' directive)
+ * function body with Sentry Error and Performance instrumentation.
+ */
+export async function withServerActionInstrumentation<A extends (...args: unknown[]) => unknown>(
+  serverActionName: string,
+  callback: A,
+): Promise<ReturnType<A>> {
+  const activeSpan = getActiveSpan();
+
+  if (activeSpan) {
+    // Read the request's `http.server` root span, which is the span we rename. The active span is
+    // usually a framework handler span (e.g. Nitro's h3 `handler` span) without any URL attributes.
+    const spanData = spanToJSON(getRootSpan(activeSpan)).attributes;
+
+    // In solid start, server function calls are made to `/_server` which doesn't tell us
+    // a lot. We rewrite the span's route to be that of the sever action name but only
+    // if the target is `/_server`, otherwise we'd overwrite pageloads on routes that use
+    // server actions (which are more meaningful, e.g. a request to `GET /users/5` is more
+    // meaningful than overwriting it with `GET doSomeFunctionCall`).
+    // `@sentry/node` HTTP spans only carry `url.path`; the deprecated `http.target` is kept as a
+    // fallback for instrumentation that still sets only that.
+    // oxlint-disable-next-line typescript/no-deprecated
+    const requestPath = spanData?.[URL_PATH] ?? spanData?.[HTTP_TARGET];
+
+    if (spanData && !spanData[HTTP_ROUTE] && requestPath === '/_server') {
+      setHttpServerSpanRouteAttribute(serverActionName);
+    }
+  }
+
+  try {
+    return await startSpan(
+      {
+        name: serverActionName,
+        attributes: {
+          [SENTRY_OP]: FUNCTION,
+          [CODE_FUNCTION_NAME]: serverActionName,
+          [SENTRY_ORIGIN]: 'auto.function.solidstart',
+          [SENTRY_SEGMENT_NAME_SOURCE]: 'component',
+        },
+      },
+      async span => {
+        // oxlint-disable-next-line typescript/await-thenable -- callback may be async at runtime
+        const result = await handleCallbackErrors(callback, error => {
+          if (!isRedirect(error)) {
+            span.setStatus({ code: SPAN_STATUS_ERROR, message: 'internal_error' });
+            captureException(error, {
+              mechanism: {
+                handled: false,
+                type: 'auto.function.solidstart',
+              },
+            });
+          }
+        });
+
+        return result;
+      },
+    );
+  } finally {
+    await flushIfServerless();
+  }
+}

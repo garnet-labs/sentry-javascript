@@ -1,0 +1,26 @@
+{
+  "name": "@sentry-internal/ts5.0-test",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "build:types": "pnpm run type-check",
+    "ts-version": "tsc --version",
+    "type-check": "tsc --project tsconfig.json",
+    "test:build": "pnpm install && pnpm run build:types",
+    "test:assert": "pnpm -v"
+  },
+  "devDependencies": {
+    "typescript": "5.0.2",
+    "@types/node": "^18.19.1"
+  },
+  "dependencies": {
+    "@sentry/browser": "file:../../packed/sentry-browser-packed.tgz",
+    "@sentry/core": "file:../../packed/sentry-core-packed.tgz",
+    "@sentry/node": "file:../../packed/sentry-node-packed.tgz",
+    "@sentry/replay": "file:../../packed/sentry-replay-packed.tgz",
+    "@sentry/wasm": "file:../../packed/sentry-wasm-packed.tgz"
+  },
+  "volta": {
+    "extends": "../../package.json"
+  }
+}

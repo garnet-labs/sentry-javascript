@@ -1,0 +1,192 @@
+import { SENTRY_OP, SENTRY_ORIGIN } from '@sentry/conventions/attributes';
+import type { Client } from '@sentry/core';
+import * as SentryCore from '@sentry/core';
+import type { NumericRange, RequestEvent } from '@sveltejs/kit';
+import { error, redirect } from '@sveltejs/kit';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { wrapServerRouteWithSentry } from '../../src/server';
+
+describe('wrapServerRouteWithSentry', () => {
+  const originalRouteHandler = vi.fn();
+
+  const getRequestEventMock = () =>
+    ({
+      request: {
+        method: 'GET',
+      },
+      route: {
+        id: '/api/users/:id',
+      },
+    }) as RequestEvent;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  describe('wraps a server route span around the original server route handler', () => {
+    const startSpanSpy = vi.spyOn(SentryCore, 'startSpan');
+
+    it('assigns the route id as name if available', () => {
+      const wrappedRouteHandler = wrapServerRouteWithSentry(originalRouteHandler);
+
+      wrappedRouteHandler(getRequestEventMock());
+
+      expect(startSpanSpy).toHaveBeenCalledWith(
+        {
+          attributes: {
+            [SENTRY_OP]: 'function',
+            'code.function.name': 'GET',
+            [SENTRY_ORIGIN]: 'auto.function.sveltekit',
+            'http.request.method': 'GET',
+            'http.route': '/api/users/:id',
+          },
+          name: 'GET /api/users/:id',
+          onlyIfParent: true,
+        },
+        expect.any(Function),
+      );
+
+      expect(originalRouteHandler).toHaveBeenCalledTimes(1);
+    });
+
+    it('falls back to a generic name if route id is not available', () => {
+      const wrappedRouteHandler = wrapServerRouteWithSentry(originalRouteHandler);
+
+      wrappedRouteHandler({ ...getRequestEventMock(), route: undefined } as unknown as RequestEvent);
+
+      expect(startSpanSpy).toHaveBeenCalledWith(
+        {
+          attributes: {
+            [SENTRY_OP]: 'function',
+            'code.function.name': 'GET',
+            [SENTRY_ORIGIN]: 'auto.function.sveltekit',
+            'http.request.method': 'GET',
+          },
+          name: 'GET Server Route',
+          onlyIfParent: true,
+        },
+        expect.any(Function),
+      );
+
+      expect(originalRouteHandler).toHaveBeenCalledTimes(1);
+    });
+
+    describe('with span streaming enabled', () => {
+      beforeEach(() => {
+        vi.spyOn(SentryCore, 'getClient').mockImplementation(
+          () => ({ getOptions: () => ({ traceLifecycle: 'stream' }) }) as unknown as Client,
+        );
+      });
+
+      afterEach(() => {
+        vi.mocked(SentryCore.getClient).mockRestore();
+      });
+
+      it('names the span after the handler function and keeps the route in the description', () => {
+        const wrappedRouteHandler = wrapServerRouteWithSentry(originalRouteHandler);
+
+        wrappedRouteHandler(getRequestEventMock());
+
+        expect(startSpanSpy).toHaveBeenCalledWith(
+          {
+            attributes: {
+              [SENTRY_OP]: 'function',
+              'code.function.name': 'GET',
+              [SENTRY_ORIGIN]: 'auto.function.sveltekit',
+              'http.request.method': 'GET',
+              'http.route': '/api/users/:id',
+              'sentry.description': 'GET /api/users/:id',
+            },
+            name: 'GET',
+            onlyIfParent: true,
+          },
+          expect.any(Function),
+        );
+      });
+
+      it('keeps the generic description if the route id is not available', () => {
+        const wrappedRouteHandler = wrapServerRouteWithSentry(originalRouteHandler);
+
+        wrappedRouteHandler({ ...getRequestEventMock(), route: undefined } as unknown as RequestEvent);
+
+        expect(startSpanSpy).toHaveBeenCalledWith(
+          {
+            attributes: {
+              [SENTRY_OP]: 'function',
+              'code.function.name': 'GET',
+              [SENTRY_ORIGIN]: 'auto.function.sveltekit',
+              'http.request.method': 'GET',
+              'sentry.description': 'GET Server Route',
+            },
+            name: 'GET',
+            onlyIfParent: true,
+          },
+          expect.any(Function),
+        );
+      });
+    });
+  });
+
+  const captureExceptionSpy = vi.spyOn(SentryCore, 'captureException');
+  describe('captures server route errors', () => {
+    it('captures and rethrows normal server route error', async () => {
+      const error = new Error('Server Route Error');
+
+      const wrappedRouteHandler = wrapServerRouteWithSentry(() => {
+        throw error;
+      });
+
+      await expect(async () => {
+        await wrappedRouteHandler(getRequestEventMock());
+      }).rejects.toThrowError('Server Route Error');
+
+      expect(captureExceptionSpy).toHaveBeenCalledWith(error, {
+        mechanism: { type: 'auto.function.sveltekit.server_route', handled: false },
+      });
+    });
+
+    it.each([500, 501, 599])('captures and rethrows %s error() calls', async status => {
+      const wrappedRouteHandler = wrapServerRouteWithSentry(() => {
+        error(status as NumericRange<400, 599>, `error(${status}) error`);
+      });
+
+      await expect(async () => {
+        await wrappedRouteHandler(getRequestEventMock());
+      }).rejects.toThrow();
+
+      expect(captureExceptionSpy).toHaveBeenCalledWith(
+        { body: { message: `error(${status}) error` }, status },
+        {
+          mechanism: {
+            type: 'auto.function.sveltekit.server_route',
+            handled: false,
+          },
+        },
+      );
+    });
+
+    it.each([400, 401, 499])("doesn't capture but rethrows %s error() calls", async status => {
+      const wrappedRouteHandler = wrapServerRouteWithSentry(() => {
+        error(status as NumericRange<400, 599>, `error(${status}) error`);
+      });
+
+      await expect(async () => {
+        await wrappedRouteHandler(getRequestEventMock());
+      }).rejects.toThrow();
+
+      expect(captureExceptionSpy).not.toHaveBeenCalled();
+    });
+
+    it.each([300, 301, 308])("doesn't capture redirect(%s) calls", async status => {
+      const wrappedRouteHandler = wrapServerRouteWithSentry(() => {
+        redirect(status as NumericRange<300, 308>, '/redirect');
+      });
+
+      await expect(async () => {
+        await wrappedRouteHandler(getRequestEventMock());
+      }).rejects.toThrow();
+
+      expect(captureExceptionSpy).not.toHaveBeenCalled();
+    });
+  });
+});

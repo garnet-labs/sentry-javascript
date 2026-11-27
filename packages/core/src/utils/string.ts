@@ -1,0 +1,170 @@
+import { isPrimitive, isRegExp, isString } from './is';
+import { stringifyValue } from './normalize';
+
+export { escapeStringForRegex } from '../vendor/escapeStringForRegex';
+
+/**
+ * Coerce a value to a string without ever throwing. Strings pass through unchanged (so an
+ * already-serialized value isn't double-encoded and a plain string isn't wrapped in quotes);
+ * anything else is `JSON.stringify`-ed, falling back to `fallback` if that throws (e.g. on
+ * circular references or `BigInt`). Returns `undefined` for values `JSON.stringify` itself drops
+ * (top-level `undefined`, functions, symbols), matching `JSON.stringify`'s own runtime behavior.
+ *
+ * @param value the value to stringify
+ * @param fallback returned when serialization throws, or, if a function, called with `value` to
+ *   produce the fallback. Defaults to `'[unserializable]'`.
+ */
+export function stringify(
+  value: unknown,
+  fallback: string | ((value: unknown) => string) = '[unserializable]',
+): string | undefined {
+  if (typeof value === 'string') {
+    return value;
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return typeof fallback === 'function' ? fallback(value) : fallback;
+  }
+}
+
+/**
+ * Truncates given string to the maximum characters count
+ *
+ * @param str An object that contains serializable values
+ * @param max Maximum number of characters in truncated string (0 = unlimited)
+ * @returns string Encoded
+ */
+export function truncate(str: string, max: number = 0): string {
+  if (typeof str !== 'string' || max === 0) {
+    return str;
+  }
+  return str.length <= max ? str : `${str.slice(0, max)}...`;
+}
+
+/**
+ * This is basically just `trim_line` from
+ * https://github.com/getsentry/sentry/blob/master/src/sentry/lang/javascript/processor.py#L67
+ *
+ * @param str An object that contains serializable values
+ * @param max Maximum number of characters in truncated string
+ * @returns string Encoded
+ */
+export function snipLine(line: string, colno: number): string {
+  let newLine = line;
+  const lineLength = newLine.length;
+  if (lineLength <= 150) {
+    return newLine;
+  }
+  if (colno > lineLength) {
+    // eslint-disable-next-line no-param-reassign
+    colno = lineLength;
+  }
+
+  let start = Math.max(colno - 60, 0);
+  if (start < 5) {
+    start = 0;
+  }
+
+  let end = Math.min(start + 140, lineLength);
+  if (end > lineLength - 5) {
+    end = lineLength;
+  }
+  if (end === lineLength) {
+    start = Math.max(end - 140, 0);
+  }
+
+  newLine = newLine.slice(start, end);
+  if (start > 0) {
+    newLine = `'{snip} ${newLine}`;
+  }
+  if (end < lineLength) {
+    newLine += ' {snip}';
+  }
+
+  return newLine;
+}
+
+/**
+ * Join values in array
+ * @param input array of values to be joined together
+ * @param delimiter string to be placed in-between values
+ * @returns Joined values
+ */
+export function safeJoin(input: unknown[], delimiter?: string): string {
+  if (!Array.isArray(input)) {
+    return '';
+  }
+
+  const output = [];
+  // eslint-disable-next-line typescript/prefer-for-of
+  for (let i = 0; i < input.length; i++) {
+    const value = input[i];
+    if (isPrimitive(value)) {
+      output.push(String(value));
+    } else if (value instanceof Error) {
+      // While stringifyValue does not special-case errors, because we later handle them specifically based on the [object XXX] fallback,
+      // in this method we want to render them more nicely
+      output.push(value.message ? `${value.name}: ${value.message}` : value.name);
+    } else {
+      output.push(stringifyValue(undefined, value));
+    }
+  }
+
+  return output.join(delimiter);
+}
+
+/**
+ * Checks if the given value matches a regex or string
+ *
+ * @param value The string to test
+ * @param pattern Either a regex or a string against which `value` will be matched
+ * @param requireExactStringMatch If true, `value` must match `pattern` exactly. If false, `value` will match
+ * `pattern` if it contains `pattern`. Only applies to string-type patterns.
+ */
+export function isMatchingPattern(
+  value: string,
+  pattern: RegExp | string | ((value: string) => boolean),
+  requireExactStringMatch: boolean = false,
+): boolean {
+  if (!isString(value)) {
+    return false;
+  }
+
+  if (isRegExp(pattern)) {
+    return pattern.test(value);
+  }
+  if (isString(pattern)) {
+    return requireExactStringMatch ? value === pattern : value.includes(pattern);
+  }
+  if (typeof pattern === 'function') {
+    return pattern(value);
+  }
+
+  return false;
+}
+
+/**
+ * Test the given string against an array of strings and regexes. By default, string matching is done on a
+ * substring-inclusion basis rather than a strict equality basis
+ *
+ * @param testString The string to test
+ * @param patterns The patterns against which to test the string
+ * @param requireExactStringMatch If true, `testString` must match one of the given string patterns exactly in order to
+ * count. If false, `testString` will match a string pattern if it contains that pattern.
+ * @returns
+ */
+export function stringMatchesSomePattern(
+  testString: string,
+  patterns:
+    | Array<string | RegExp | ((value: string) => boolean)>
+    | Set<string | RegExp | ((value: string) => boolean)> = [],
+  requireExactStringMatch: boolean = false,
+): boolean {
+  for (const pattern of patterns) {
+    if (isMatchingPattern(testString, pattern, requireExactStringMatch)) {
+      return true;
+    }
+  }
+  return false;
+}

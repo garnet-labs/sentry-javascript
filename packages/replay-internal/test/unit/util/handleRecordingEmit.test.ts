@@ -1,0 +1,329 @@
+/**
+ * @vitest-environment jsdom
+ */
+
+import '../../utils/mock-internal-setTimeout';
+import { EventType, IncrementalSource, record } from '@sentry/rrweb';
+import { NodeType, type serializedElementNodeWithId } from '@sentry/rrweb-snapshot';
+import type { MockInstance } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { handleDom } from '../../../src/coreHandlers/handleDom';
+import type { ReplayOptionFrameEvent } from '../../../src/types';
+import * as SentryAddEvent from '../../../src/util/addEvent';
+import {
+  createOptionsEvent,
+  getHandleRecordingEmit,
+  syncMirrorAttributesFromMutationEvent,
+} from '../../../src/util/handleRecordingEmit';
+import { BASE_TIMESTAMP } from '../..';
+import { setupReplayContainer } from '../../utils/setupReplayContainer';
+
+let optionsEvent: ReplayOptionFrameEvent;
+
+describe('Unit | util | handleRecordingEmit', () => {
+  beforeAll(() => {
+    vi.useFakeTimers();
+  });
+
+  let addEventMock: MockInstance;
+
+  beforeEach(function () {
+    vi.setSystemTime(BASE_TIMESTAMP);
+    addEventMock = vi.spyOn(SentryAddEvent, 'addEventSync').mockImplementation(() => {
+      return true;
+    });
+  });
+
+  afterEach(function () {
+    addEventMock.mockReset();
+    vi.restoreAllMocks();
+  });
+
+  it('interprets first event as checkout event', async function () {
+    const replay = setupReplayContainer({
+      options: {
+        errorSampleRate: 0,
+        sessionSampleRate: 1,
+      },
+    });
+    optionsEvent = createOptionsEvent(replay);
+
+    const handler = getHandleRecordingEmit(replay);
+
+    const event = {
+      type: EventType.FullSnapshot,
+      data: {
+        tag: 'test custom',
+      },
+      timestamp: BASE_TIMESTAMP + 10,
+    };
+
+    handler(event);
+
+    expect(addEventMock).toBeCalledTimes(2);
+    expect(addEventMock).toHaveBeenNthCalledWith(1, replay, event, true);
+    expect(addEventMock).toHaveBeenLastCalledWith(replay, optionsEvent, false);
+
+    handler(event);
+
+    expect(addEventMock).toBeCalledTimes(3);
+    expect(addEventMock).toHaveBeenLastCalledWith(replay, event, false);
+  });
+
+  it('interprets any event with isCheckout as checkout', async function () {
+    const replay = setupReplayContainer({
+      options: {
+        errorSampleRate: 0,
+        sessionSampleRate: 1,
+      },
+    });
+    optionsEvent = createOptionsEvent(replay);
+
+    const handler = getHandleRecordingEmit(replay);
+
+    const event = {
+      type: EventType.IncrementalSnapshot,
+      data: {
+        tag: 'test custom',
+      },
+      timestamp: BASE_TIMESTAMP + 10,
+    };
+
+    handler(event, true);
+
+    // Called twice, once for event and once for settings on checkout only
+    expect(addEventMock).toBeCalledTimes(2);
+    expect(addEventMock).toHaveBeenNthCalledWith(1, replay, event, true);
+    expect(addEventMock).toHaveBeenLastCalledWith(replay, optionsEvent, false);
+
+    handler(event, true);
+
+    expect(addEventMock).toBeCalledTimes(4);
+    expect(addEventMock).toHaveBeenNthCalledWith(3, replay, event, true);
+    expect(addEventMock).toHaveBeenLastCalledWith(replay, { ...optionsEvent, timestamp: BASE_TIMESTAMP }, false);
+  });
+
+  it('is exception-safe: a throw in a sub-handler is caught and does not escape into rrweb', function () {
+    const replay = setupReplayContainer({
+      options: {
+        errorSampleRate: 0,
+        sessionSampleRate: 1,
+      },
+    });
+
+    const handleExceptionSpy = vi.spyOn(replay, 'handleException');
+    const handler = getHandleRecordingEmit(replay);
+
+    // Make `syncMirrorAttributesFromMutationEvent` throw: seed the mirror with an
+    // Element meta so the loop reaches `Object.entries(mutation.attributes)`, then
+    // feed a mutation whose `attributes` is null so `Object.entries(null)` throws.
+    vi.spyOn(record.mirror, 'getNode').mockReturnValue(document.createElement('button'));
+    vi.spyOn(record.mirror, 'getMeta').mockReturnValue({
+      type: NodeType.Element,
+      attributes: {},
+    } as serializedElementNodeWithId);
+
+    const badMutationEvent = {
+      type: EventType.IncrementalSnapshot,
+      timestamp: BASE_TIMESTAMP + 10,
+      data: {
+        source: IncrementalSource.Mutation,
+        texts: [],
+        // `attributes: null` makes `Object.entries(null)` throw inside the handler
+        attributes: [{ id: 42, attributes: null }],
+        removes: [],
+        adds: [],
+      },
+    };
+
+    // The throw is caught instead of escaping to rrweb (which would re-throw it and
+    // tear down recording). It is surfaced via `handleException`.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect(() => handler(badMutationEvent as any)).not.toThrow();
+    expect(handleExceptionSpy).toHaveBeenCalled();
+
+    // And recording keeps working: a subsequent valid event is still added.
+    const goodEvent = {
+      type: EventType.IncrementalSnapshot,
+      timestamp: BASE_TIMESTAMP + 20,
+      data: {
+        source: IncrementalSource.Mutation,
+        texts: [],
+        attributes: [],
+        removes: [],
+        adds: [],
+      },
+    };
+    addEventMock.mockClear();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    handler(goodEvent as any);
+    expect(addEventMock).toHaveBeenCalled();
+  });
+
+  it('syncs mirror attributes from mutation events', function () {
+    const target = document.createElement('button');
+    target.textContent = 'Save Note';
+
+    const meta = {
+      id: 42,
+      type: NodeType.Element,
+      tagName: 'button',
+      childNodes: [{ id: 43, type: NodeType.Text, textContent: 'Save Note' }],
+      attributes: {
+        id: 'next-question-button',
+        'data-testid': 'next-question-button',
+      },
+    };
+
+    record.mirror.add(target, meta as serializedElementNodeWithId);
+
+    syncMirrorAttributesFromMutationEvent({
+      type: EventType.IncrementalSnapshot,
+      timestamp: BASE_TIMESTAMP + 10,
+      data: {
+        source: IncrementalSource.Mutation,
+        texts: [],
+        attributes: [
+          {
+            id: 42,
+            attributes: {
+              id: 'save-note-button',
+              'data-testid': 'save-note-button',
+            },
+          },
+        ],
+        removes: [],
+        adds: [],
+      },
+    });
+
+    expect(
+      handleDom({
+        name: 'click',
+        event: { target },
+      }),
+    ).toEqual({
+      category: 'ui.click',
+      data: {
+        nodeId: 42,
+        node: {
+          id: 42,
+          tagName: 'button',
+          textContent: 'Save Note',
+          attributes: {
+            id: 'save-note-button',
+            testId: 'save-note-button',
+          },
+        },
+      },
+      message: 'button',
+      timestamp: expect.any(Number),
+      type: 'default',
+    });
+  });
+
+  it('preserves masked mutation attribute values', function () {
+    const target = document.createElement('button');
+
+    const meta = {
+      id: 42,
+      type: NodeType.Element,
+      tagName: 'button',
+      childNodes: [],
+      attributes: {
+        'aria-label': 'Save Note',
+      },
+    };
+
+    record.mirror.add(target, meta as serializedElementNodeWithId);
+
+    syncMirrorAttributesFromMutationEvent({
+      type: EventType.IncrementalSnapshot,
+      timestamp: BASE_TIMESTAMP + 10,
+      data: {
+        source: IncrementalSource.Mutation,
+        texts: [],
+        attributes: [
+          {
+            id: 42,
+            attributes: {
+              'aria-label': '*********',
+            },
+          },
+        ],
+        removes: [],
+        adds: [],
+      },
+    });
+
+    expect(record.mirror.getMeta(target)?.attributes['aria-label']).toBe('*********');
+  });
+
+  it('does not rewrite the serialized node that was already emitted in an `adds` payload', function () {
+    const target = document.createElement('div');
+
+    // rrweb stores the very same object in the mirror that it emits in `adds`, so a
+    // previously emitted event and the mirror share this reference.
+    const meta = {
+      id: 42,
+      type: NodeType.Element,
+      tagName: 'div',
+      childNodes: [],
+      attributes: {
+        id: 'popover',
+        style: 'position: fixed; left: 0px; top: 0px; transform: translate(0px, -200%); min-width: max-content;',
+      },
+    };
+
+    record.mirror.add(target, meta as serializedElementNodeWithId);
+
+    const addEvent = {
+      type: EventType.IncrementalSnapshot,
+      timestamp: BASE_TIMESTAMP,
+      data: {
+        source: IncrementalSource.Mutation,
+        texts: [],
+        attributes: [],
+        removes: [],
+        adds: [{ parentId: 1, nextId: null, node: meta }],
+      },
+    };
+
+    // rrweb emits a compact style mutation, where `style` is a partial diff object rather
+    // than the full style string.
+    syncMirrorAttributesFromMutationEvent({
+      type: EventType.IncrementalSnapshot,
+      timestamp: BASE_TIMESTAMP + 10,
+      data: {
+        source: IncrementalSource.Mutation,
+        texts: [],
+        attributes: [
+          {
+            id: 42,
+            attributes: {
+              id: 'popover-open',
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              style: { transform: 'translate(631px, 210px)' } as any,
+            },
+          },
+        ],
+        removes: [],
+        adds: [],
+      },
+    });
+
+    // The already emitted event still describes the element as it was when it was serialized.
+    // Buffers that hold events unserialized (i.e. when compression is disabled) would otherwise
+    // ship this partial style diff in place of the full inline style.
+    expect(addEvent.data.adds[0]?.node.attributes).toEqual({
+      id: 'popover',
+      style: 'position: fixed; left: 0px; top: 0px; transform: translate(0px, -200%); min-width: max-content;',
+    });
+
+    // But the mirror is up to date for the attributes that click breadcrumbs care about.
+    expect(record.mirror.getMeta(target)?.attributes).toEqual({
+      id: 'popover-open',
+      style: 'position: fixed; left: 0px; top: 0px; transform: translate(0px, -200%); min-width: max-content;',
+    });
+  });
+});

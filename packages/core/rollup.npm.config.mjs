@@ -1,0 +1,41 @@
+// @ts-check
+
+import { readFileSync } from 'fs';
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
+import replace from '@rollup/plugin-replace';
+import { makeBaseNPMConfig, makeNPMConfigVariants } from '@sentry-internal/rollup-utils';
+
+const packageJson = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'package.json'), 'utf-8'));
+
+if (!packageJson.version) {
+  throw new Error('invariant: package version not found');
+}
+
+const packageVersion = packageJson.version;
+
+const settings = {
+  packageSpecificConfig: {
+    output: {
+      // set exports to 'named' or 'auto' so that rollup doesn't warn
+      exports: 'named',
+      // set preserveModules to true because we don't want to bundle everything into one file.
+      preserveModules: true,
+    },
+    plugins: [
+      replace({
+        preventAssignment: true,
+        values: {
+          __SENTRY_SDK_VERSION__: JSON.stringify(packageVersion),
+        },
+      }),
+    ],
+  },
+};
+
+export default makeNPMConfigVariants(
+  makeBaseNPMConfig({
+    ...settings,
+    entrypoints: ['src/index.ts', 'src/server.ts', 'src/browser.ts'],
+  }),
+);

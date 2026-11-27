@@ -1,0 +1,1394 @@
+import { describe, expect, it, vi } from 'vitest';
+import {
+  captureBodyFromWinterCGRequest,
+  extractQueryParamsFromUrl,
+  headersToDict,
+  httpHeadersToSpanAttributes,
+  httpRequestToRequestData,
+  winterCGHeadersToDict,
+  winterCGRequestToRequestData,
+} from '../../../src/utils/request';
+import type { ResolvedDataCollection } from '../../../src/types/datacollection';
+import { resolveDataCollectionOptions } from '../../../src/utils/data-collection/resolveDataCollectionOptions';
+import type { Scope } from '../../../src/scope';
+
+describe('request utils', () => {
+  describe('winterCGHeadersToDict', () => {
+    it('works with invalid headers object', () => {
+      expect(winterCGHeadersToDict({} as any)).toEqual({});
+    });
+
+    it('works with header object', () => {
+      expect(
+        winterCGHeadersToDict({
+          forEach: (callbackfn: (value: unknown, key: string) => void): void => {
+            callbackfn('value1', 'key1');
+            callbackfn(['value2'], 'key2');
+            callbackfn('value3', 'key3');
+          },
+        } as any),
+      ).toEqual({
+        key1: 'value1',
+        key3: 'value3',
+      });
+    });
+  });
+
+  describe('headersToDict', () => {
+    it('works with empty object', () => {
+      expect(headersToDict({})).toEqual({});
+    });
+
+    it('works with plain object', () => {
+      expect(
+        headersToDict({
+          key1: 'value1',
+          key2: ['value2'],
+          key3: 'value3',
+        }),
+      ).toEqual({
+        key1: 'value1',
+        key3: 'value3',
+      });
+    });
+
+    it('stringifies numeric values (e.g. OutgoingHttpHeaders content-length)', () => {
+      expect(
+        headersToDict({
+          'content-length': 42,
+          'x-string': 'hello',
+          'x-undef': undefined,
+        }),
+      ).toEqual({
+        'content-length': '42',
+        'x-string': 'hello',
+      });
+    });
+  });
+
+  describe('winterCGRequestToRequestData', () => {
+    it('works', () => {
+      const actual = winterCGRequestToRequestData({
+        method: 'GET',
+        url: 'http://example.com?foo=bar&baz=qux',
+        headers: {
+          forEach: (callbackfn: (value: unknown, key: string) => void): void => {
+            callbackfn('value1', 'key1');
+            callbackfn(['value2'], 'key2');
+            callbackfn('value3', 'key3');
+          },
+        } as any,
+        clone: () => ({}) as any,
+      });
+
+      expect(actual).toEqual({
+        headers: {
+          key1: 'value1',
+          key3: 'value3',
+        },
+        method: 'GET',
+        query_string: 'foo=bar&baz=qux',
+        url: 'http://example.com?foo=bar&baz=qux',
+      });
+    });
+  });
+
+  describe('httpRequestToRequestData', () => {
+    it('works with minimal request', () => {
+      const actual = httpRequestToRequestData({});
+      expect(actual).toEqual({
+        headers: {},
+      });
+    });
+
+    it('works with absolute URL request', () => {
+      const actual = httpRequestToRequestData({
+        method: 'GET',
+        url: 'http://example.com/blabla?xx=a&yy=z',
+        headers: {
+          key1: 'value1',
+          key2: ['value2'],
+          key3: 'value3',
+        },
+      });
+
+      expect(actual).toEqual({
+        method: 'GET',
+        url: 'http://example.com/blabla?xx=a&yy=z',
+        headers: {
+          key1: 'value1',
+          key3: 'value3',
+        },
+        query_string: 'xx=a&yy=z',
+      });
+    });
+
+    it('works with relative URL request without host', () => {
+      const actual = httpRequestToRequestData({
+        method: 'GET',
+        url: '/blabla',
+        headers: {
+          key1: 'value1',
+          key2: ['value2'],
+          key3: 'value3',
+        },
+      });
+
+      expect(actual).toEqual({
+        method: 'GET',
+        headers: {
+          key1: 'value1',
+          key3: 'value3',
+        },
+      });
+    });
+
+    it('works with relative URL request with host', () => {
+      const actual = httpRequestToRequestData({
+        url: '/blabla',
+        headers: {
+          host: 'example.com',
+        },
+      });
+
+      expect(actual).toEqual({
+        url: 'http://example.com/blabla',
+        headers: {
+          host: 'example.com',
+        },
+      });
+    });
+
+    it('works with relative URL request with host & protocol', () => {
+      const actual = httpRequestToRequestData({
+        url: '/blabla',
+        headers: {
+          host: 'example.com',
+        },
+        protocol: 'https',
+      });
+
+      expect(actual).toEqual({
+        url: 'https://example.com/blabla',
+        headers: {
+          host: 'example.com',
+        },
+      });
+    });
+
+    it('works with relative URL request with host & socket', () => {
+      const actual = httpRequestToRequestData({
+        url: '/blabla',
+        headers: {
+          host: 'example.com',
+        },
+        socket: {
+          encrypted: true,
+        },
+      });
+
+      expect(actual).toEqual({
+        url: 'https://example.com/blabla',
+        headers: {
+          host: 'example.com',
+        },
+      });
+    });
+
+    it('extracts non-standard cookies', () => {
+      const actual = httpRequestToRequestData({
+        cookies: { xx: 'a', yy: 'z' },
+      } as any);
+
+      expect(actual).toEqual({
+        headers: {},
+        cookies: { xx: 'a', yy: 'z' },
+      });
+    });
+
+    it('extracts non-standard body', () => {
+      const actual = httpRequestToRequestData({
+        body: { xx: 'a', yy: 'z' },
+      } as any);
+
+      expect(actual).toEqual({
+        headers: {},
+        data: { xx: 'a', yy: 'z' },
+      });
+    });
+
+    describe('x-forwarded headers support', () => {
+      it('should prioritize x-forwarded-proto header over explicit protocol parameter', () => {
+        const actual = httpRequestToRequestData({
+          url: '/test',
+          headers: {
+            host: 'example.com',
+            'x-forwarded-proto': 'https',
+          },
+          protocol: 'http',
+        });
+
+        expect(actual).toEqual({
+          url: 'https://example.com/test',
+          headers: {
+            host: 'example.com',
+            'x-forwarded-proto': 'https',
+          },
+        });
+      });
+
+      it('should prioritize x-forwarded-proto header even when downgrading from https to http', () => {
+        const actual = httpRequestToRequestData({
+          url: '/test',
+          headers: {
+            host: 'example.com',
+            'x-forwarded-proto': 'http',
+          },
+          protocol: 'https',
+        });
+
+        expect(actual).toEqual({
+          url: 'http://example.com/test',
+          headers: {
+            host: 'example.com',
+            'x-forwarded-proto': 'http',
+          },
+        });
+      });
+
+      it('should prioritize x-forwarded-proto header over socket encryption detection', () => {
+        const actual = httpRequestToRequestData({
+          url: '/test',
+          headers: {
+            host: 'example.com',
+            'x-forwarded-proto': 'https',
+          },
+          socket: {
+            encrypted: false,
+          },
+        });
+
+        expect(actual).toEqual({
+          url: 'https://example.com/test',
+          headers: {
+            host: 'example.com',
+            'x-forwarded-proto': 'https',
+          },
+        });
+      });
+
+      it('should prioritize x-forwarded-host header over standard host header', () => {
+        const actual = httpRequestToRequestData({
+          url: '/test',
+          headers: {
+            host: 'localhost:3000',
+            'x-forwarded-host': 'example.com',
+            'x-forwarded-proto': 'https',
+          },
+        });
+
+        expect(actual).toEqual({
+          url: 'https://example.com/test',
+          headers: {
+            host: 'localhost:3000',
+            'x-forwarded-host': 'example.com',
+            'x-forwarded-proto': 'https',
+          },
+        });
+      });
+
+      it('should construct URL correctly when both x-forwarded-proto and x-forwarded-host are present', () => {
+        const actual = httpRequestToRequestData({
+          method: 'POST',
+          url: '/api/test?param=value',
+          headers: {
+            host: 'localhost:3000',
+            'x-forwarded-host': 'api.example.com',
+            'x-forwarded-proto': 'https',
+            'content-type': 'application/json',
+          },
+          protocol: 'http',
+        });
+
+        expect(actual).toEqual({
+          method: 'POST',
+          url: 'https://api.example.com/api/test?param=value',
+          query_string: 'param=value',
+          headers: {
+            host: 'localhost:3000',
+            'x-forwarded-host': 'api.example.com',
+            'x-forwarded-proto': 'https',
+            'content-type': 'application/json',
+          },
+        });
+      });
+
+      it('should fall back to standard headers when x-forwarded headers are not present', () => {
+        const actual = httpRequestToRequestData({
+          url: '/test',
+          headers: {
+            host: 'example.com',
+          },
+          protocol: 'https',
+        });
+
+        expect(actual).toEqual({
+          url: 'https://example.com/test',
+          headers: {
+            host: 'example.com',
+          },
+        });
+      });
+
+      it('should ignore x-forwarded headers when they contain non-string values', () => {
+        const actual = httpRequestToRequestData({
+          url: '/test',
+          headers: {
+            host: 'example.com',
+            'x-forwarded-host': ['forwarded.example.com'] as any,
+            'x-forwarded-proto': ['https'] as any,
+          },
+          protocol: 'http',
+        });
+
+        expect(actual).toEqual({
+          url: 'http://example.com/test',
+          headers: {
+            host: 'example.com',
+          },
+        });
+      });
+
+      it('should correctly transform localhost request to public URL using x-forwarded headers', () => {
+        const actual = httpRequestToRequestData({
+          method: 'GET',
+          url: '/',
+          headers: {
+            host: 'localhost:3000',
+            'x-forwarded-proto': 'https',
+            'x-forwarded-host': 'example.com',
+          },
+        });
+
+        expect(actual).toEqual({
+          method: 'GET',
+          url: 'https://example.com/',
+          headers: {
+            host: 'localhost:3000',
+            'x-forwarded-proto': 'https',
+            'x-forwarded-host': 'example.com',
+          },
+        });
+      });
+
+      it('should respect x-forwarded-proto even when it downgrades from encrypted socket', () => {
+        const actual = httpRequestToRequestData({
+          url: '/test',
+          headers: {
+            host: 'example.com',
+            'x-forwarded-proto': 'http',
+          },
+          socket: {
+            encrypted: true,
+          },
+        });
+
+        expect(actual).toEqual({
+          url: 'http://example.com/test',
+          headers: {
+            host: 'example.com',
+            'x-forwarded-proto': 'http',
+          },
+        });
+      });
+
+      it('should preserve query parameters when constructing URL with x-forwarded headers', () => {
+        const actual = httpRequestToRequestData({
+          method: 'GET',
+          url: '/search?q=test&category=api',
+          headers: {
+            host: 'localhost:8080',
+            'x-forwarded-host': 'search.example.com',
+            'x-forwarded-proto': 'https',
+          },
+        });
+
+        expect(actual).toEqual({
+          method: 'GET',
+          url: 'https://search.example.com/search?q=test&category=api',
+          query_string: 'q=test&category=api',
+          headers: {
+            host: 'localhost:8080',
+            'x-forwarded-host': 'search.example.com',
+            'x-forwarded-proto': 'https',
+          },
+        });
+      });
+    });
+  });
+
+  describe('extractQueryParamsFromUrl', () => {
+    it.each([
+      ['/', undefined],
+      ['http://example.com', undefined],
+      ['/sub-path', undefined],
+      ['/sub-path?xx=a&yy=z', 'xx=a&yy=z'],
+      ['http://example.com/sub-path?xx=a&yy=z', 'xx=a&yy=z'],
+    ])('works with %s', (url, expected) => {
+      expect(extractQueryParamsFromUrl(url)).toEqual(expected);
+    });
+  });
+
+  describe('httpHeadersToSpanAttributes', () => {
+    it('works with empty headers object', () => {
+      expect(httpHeadersToSpanAttributes({}, resolveDataCollectionOptions({}))).toEqual({});
+    });
+
+    it('wraps single string header values in an array', () => {
+      const headers = {
+        'Content-Type': 'application/json',
+        'user-agent': 'test-agent',
+      };
+
+      const result = httpHeadersToSpanAttributes(headers, resolveDataCollectionOptions({}));
+
+      expect(result).toEqual({
+        'http.request.header.content-type': ['application/json'],
+        'http.request.header.user-agent': ['test-agent'],
+      });
+    });
+
+    it('keeps each value of an array header value as a separate entry', () => {
+      const headers = {
+        'custom-header': ['value1', 'value2'],
+        accept: ['application/json', 'text/html'],
+      };
+
+      const result = httpHeadersToSpanAttributes(headers, resolveDataCollectionOptions({}));
+
+      expect(result).toEqual({
+        'http.request.header.custom-header': ['value1', 'value2'],
+        'http.request.header.accept': ['application/json', 'text/html'],
+      });
+    });
+
+    it('drops undefined values in arrays', () => {
+      const headers = {
+        'undefined-values': [undefined, undefined],
+        'valid-header': 'valid-value',
+      } as any;
+
+      const result = httpHeadersToSpanAttributes(headers, resolveDataCollectionOptions({}));
+
+      expect(result).toEqual({
+        'http.request.header.valid-header': ['valid-value'],
+        'http.request.header.undefined-values': [],
+      });
+    });
+
+    it('ignores undefined header values', () => {
+      const headers = {
+        'valid-header': 'valid-value',
+        'undefined-header': undefined,
+      };
+
+      const result = httpHeadersToSpanAttributes(headers, resolveDataCollectionOptions({}));
+
+      expect(result).toEqual({
+        'http.request.header.valid-header': ['valid-value'],
+      });
+    });
+
+    it('adds empty array headers as empty array', () => {
+      const headers = {
+        'empty-header': [],
+        'valid-header': 'valid-value',
+      } as any;
+
+      const result = httpHeadersToSpanAttributes(headers, resolveDataCollectionOptions({}));
+
+      expect(result).toEqual({
+        'http.request.header.empty-header': [],
+        'http.request.header.valid-header': ['valid-value'],
+      });
+    });
+
+    it('converts header names to lowercase and preserves dashes', () => {
+      const headers = {
+        'Content-Type': 'application/json',
+        'X-CUSTOM-HEADER': 'custom-value',
+        'user-Agent': 'test-agent',
+        ACCEPT: 'text/html',
+      };
+
+      const result = httpHeadersToSpanAttributes(headers, resolveDataCollectionOptions({}));
+
+      expect(result).toEqual({
+        'http.request.header.content-type': ['application/json'],
+        'http.request.header.x-custom-header': ['custom-value'],
+        'http.request.header.user-agent': ['test-agent'],
+        'http.request.header.accept': ['text/html'],
+      });
+    });
+
+    it('handles real-world headers', () => {
+      const headers = {
+        Host: 'example.com',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Encoding': 'gzip, deflate',
+        Connection: 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Cache-Control': 'no-cache',
+        'X-Forwarded-For': '192.168.1.1',
+      };
+
+      const result = httpHeadersToSpanAttributes(headers, resolveDataCollectionOptions({}));
+
+      expect(result).toEqual({
+        'http.request.header.host': ['example.com'],
+        'http.request.header.user-agent': ['Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'],
+        'http.request.header.accept': ['text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'],
+        'http.request.header.accept-language': ['en-US,en;q=0.5'],
+        'http.request.header.accept-encoding': ['gzip, deflate'],
+        'http.request.header.connection': ['keep-alive'],
+        'http.request.header.upgrade-insecure-requests': ['1'],
+        'http.request.header.cache-control': ['no-cache'],
+        'http.request.header.x-forwarded-for': ['192.168.1.1'],
+      });
+    });
+
+    it('handles multiple values for the same header', () => {
+      const headers = {
+        'x-random-header': ['test=abc123', 'preferences=dark-mode', 'number=three'],
+        Accept: ['application/json', 'text/html'],
+      };
+
+      const result = httpHeadersToSpanAttributes(headers, resolveDataCollectionOptions({}));
+
+      expect(result).toEqual({
+        'http.request.header.x-random-header': ['test=abc123', 'preferences=dark-mode', 'number=three'],
+        'http.request.header.accept': ['application/json', 'text/html'],
+      });
+    });
+
+    it('handles headers with empty string values', () => {
+      const headers = {
+        'empty-header': '',
+        'valid-header': 'valid-value',
+      };
+
+      const result = httpHeadersToSpanAttributes(headers, resolveDataCollectionOptions({}));
+
+      expect(result).toEqual({
+        'http.request.header.empty-header': [''],
+        'http.request.header.valid-header': ['valid-value'],
+      });
+    });
+
+    it('returns empty object when processing invalid headers throws error', () => {
+      // Create a headers object that will throw an error when iterated
+      const headers = {};
+      Object.defineProperty(headers, Symbol.iterator, {
+        get() {
+          throw new Error('Test error');
+        },
+      });
+
+      const result = httpHeadersToSpanAttributes(headers, resolveDataCollectionOptions({}));
+
+      expect(result).toEqual({});
+    });
+
+    it('stringifies non-nullish, non-string values in arrays', () => {
+      const headers = {
+        'mixed-types': ['string-value', 123, true, null],
+      } as any;
+
+      const result = httpHeadersToSpanAttributes(headers, resolveDataCollectionOptions({}));
+
+      expect(result).toEqual({
+        'http.request.header.mixed-types': ['string-value', '123', 'true'],
+      });
+    });
+
+    it('ignores non-string and non-array header values', () => {
+      const headers = {
+        'string-header': 'valid-value',
+        'number-header': 123,
+        'boolean-header': true,
+        'null-header': null,
+        'object-header': { key: 'value' },
+      } as any;
+
+      const result = httpHeadersToSpanAttributes(headers, resolveDataCollectionOptions({}));
+
+      expect(result).toEqual({
+        'http.request.header.string-header': ['valid-value'],
+      });
+    });
+
+    describe('PII/Sensitive data filtering', () => {
+      it('filters sensitive headers case-insensitively', () => {
+        const headers = {
+          AUTHORIZATION: 'Bearer secret-token',
+          Cookie: 'session=abc123',
+          'x-aPi-kEy': 'key-123',
+          'Content-Type': 'application/json',
+        };
+
+        const result = httpHeadersToSpanAttributes(headers, resolveDataCollectionOptions({}));
+
+        expect(result).toEqual({
+          'http.request.header.content-type': ['application/json'],
+          'http.request.header.cookie': ['session=[Filtered]'],
+          'http.request.header.x-api-key': ['[Filtered]'],
+          'http.request.header.authorization': ['[Filtered]'],
+        });
+      });
+
+      it('attaches and filters sensitive cookie headers', () => {
+        const headers = {
+          Cookie: 'session=abc123; tracking=enabled; theme=dark; lang=en; user_session=xyz789; pref=1',
+        };
+
+        const result = httpHeadersToSpanAttributes(headers, resolveDataCollectionOptions({}));
+
+        expect(result).toEqual({
+          'http.request.header.cookie': [
+            'session=[Filtered]',
+            'tracking=enabled',
+            'theme=dark',
+            'lang=en',
+            'user_session=[Filtered]',
+            'pref=1',
+          ],
+        });
+      });
+
+      it('filters cookie segments that are not a name=value pair', () => {
+        // The bare token is a nameless cookie's value, so it must be filtered.
+        const headers = { Cookie: 'session=abc123; theme=dark; y7Uu0Rk2QpLmXv3' };
+
+        const result = httpHeadersToSpanAttributes(headers, resolveDataCollectionOptions({}));
+
+        expect(result).toEqual({
+          'http.request.header.cookie': ['session=[Filtered]', 'theme=dark', '[Filtered]'],
+        });
+      });
+
+      it('filters a cookie header that holds no name=value pair', () => {
+        const headers = { Cookie: 'y7Uu0Rk2QpLmXv3' };
+
+        const result = httpHeadersToSpanAttributes(headers, resolveDataCollectionOptions({}));
+
+        expect(result).toEqual({ 'http.request.header.cookie': ['[Filtered]'] });
+      });
+
+      it('splits cookies on ";" without a following space', () => {
+        const headers = { Cookie: 'theme=dark;__Secure-session=abc123' };
+
+        const result = httpHeadersToSpanAttributes(headers, resolveDataCollectionOptions({}));
+
+        expect(result).toEqual({
+          'http.request.header.cookie': ['theme=dark', '__Secure-session=[Filtered]'],
+        });
+      });
+
+      it('trims whitespace around cookie names and values', () => {
+        const headers = { Cookie: 'theme = dark; user_session = abc123' };
+
+        const result = httpHeadersToSpanAttributes(headers, resolveDataCollectionOptions({}));
+
+        expect(result).toEqual({
+          'http.request.header.cookie': ['theme=dark', 'user_session=[Filtered]'],
+        });
+      });
+
+      it('filters common framework and provider session-style cookie names', () => {
+        const headers = {
+          Cookie:
+            'connect.sid=s3cr3t; express.sid=opaque; PHPSESSID=abcd; theme=light; sb-access-token=x; __stripe_mid=y',
+        };
+
+        const result = httpHeadersToSpanAttributes(headers, resolveDataCollectionOptions({}));
+
+        expect(result).toEqual({
+          'http.request.header.cookie': [
+            'connect.sid=[Filtered]',
+            'express.sid=[Filtered]',
+            'PHPSESSID=[Filtered]',
+            'theme=light',
+            'sb-access-token=[Filtered]',
+            '__stripe_mid=[Filtered]',
+          ],
+        });
+      });
+
+      it('still filters session-style cookie names when cookie collection is enabled', () => {
+        const headers = { Cookie: 'connect.sid=s3cr3t; analytics=1' };
+
+        const result = httpHeadersToSpanAttributes(headers, {
+          userInfo: true,
+          cookies: true,
+          httpHeaders: { request: true, response: true },
+          httpBodies: [],
+          urlQueryParams: true,
+          graphQL: { document: true, variables: true },
+          genAI: { inputs: true, outputs: true },
+          mcp: { inputs: true, outputs: true },
+          databaseQueryData: true,
+          stackFrameVariables: true,
+          frameContextLines: 5,
+        });
+
+        expect(result).toEqual({
+          'http.request.header.cookie': ['connect.sid=[Filtered]', 'analytics=1'],
+        });
+      });
+
+      it('adds a filtered cookie header when cookie header is present, but has no cookies', () => {
+        const headers1 = { Cookie: [] };
+        const result1 = httpHeadersToSpanAttributes(headers1, resolveDataCollectionOptions({}));
+        expect(result1).toEqual({ 'http.request.header.cookie': ['[Filtered]'] });
+
+        const headers3 = { Cookie: '' };
+        const result3 = httpHeadersToSpanAttributes(headers3, resolveDataCollectionOptions({}));
+        expect(result3).toEqual({ 'http.request.header.cookie': ['[Filtered]'] });
+      });
+
+      it.each([
+        ['preferred-color-mode=light', { 'http.request.header.set-cookie': ['preferred-color-mode=light'] }],
+        ['theme=dark; HttpOnly', { 'http.request.header.set-cookie': ['theme=dark'] }],
+        ['session=abc123; Domain=example.com; HttpOnly', { 'http.request.header.set-cookie': ['session=[Filtered]'] }],
+        ['lang=en; Expires=Wed, 21 Oct 2025 07:28:00 GMT', { 'http.request.header.set-cookie': ['lang=en'] }],
+        ['pref=1; Max-Age=3600', { 'http.request.header.set-cookie': ['pref=1'] }],
+        ['color=blue; Path=/dashboard', { 'http.request.header.set-cookie': ['color=blue'] }],
+        ['token=eyJhbGc=.eyJzdWI=.SflKxw; Secure', { 'http.request.header.set-cookie': ['token=[Filtered]'] }],
+        // A set-cookie string without "=" is a nameless cookie: the bare token is its value.
+        ['auth_required; HttpOnly', { 'http.request.header.set-cookie': ['[Filtered]'] }],
+        ['empty=; Secure', { 'http.request.header.set-cookie': ['empty='] }],
+      ])('should parse and filter Set-Cookie header: %s', (setCookieValue, expected) => {
+        const headers = { 'Set-Cookie': setCookieValue };
+        const result = httpHeadersToSpanAttributes(headers, resolveDataCollectionOptions({}));
+        expect(result).toEqual(expected);
+      });
+
+      it('adds one entry per cookie for multiple Set-Cookie headers and repeated cookie names', () => {
+        const headers = {
+          'Set-Cookie': ['theme=dark; HttpOnly', 'session=abc123; Secure'],
+          Cookie: 'lang=en; lang=de',
+        };
+        const result = httpHeadersToSpanAttributes(headers, resolveDataCollectionOptions({}));
+        expect(result).toEqual({
+          'http.request.header.set-cookie': ['theme=dark', 'session=[Filtered]'],
+          'http.request.header.cookie': ['lang=en', 'lang=de'],
+        });
+      });
+
+      it('only splits cookies once between key and value, even when more equals signs are present', () => {
+        const headers = { Cookie: 'random-string=eyJhbGc=.eyJzdWI=.SflKxw' };
+        const result = httpHeadersToSpanAttributes(headers, resolveDataCollectionOptions({}));
+        expect(result).toEqual({ 'http.request.header.cookie': ['random-string=eyJhbGc=.eyJzdWI=.SflKxw'] });
+      });
+
+      it.each([
+        {
+          dataCollection: resolveDataCollectionOptions({
+            dataCollection: {
+              httpHeaders: { request: { deny: ['forwarded', '-ip', 'remote-', 'via', '-user'] }, response: true },
+            },
+          }),
+          expected: {
+            'http.request.header.content-type': ['application/json'],
+            'http.request.header.user-agent': ['Mozilla/5.0'],
+            'http.request.header.x-user': ['[Filtered]'],
+            'http.request.header.x-forwarded-for': ['[Filtered]'],
+            'http.request.header.x-forwarded-host': ['[Filtered]'],
+            'http.request.header.x-forwarded-proto': ['[Filtered]'],
+          },
+        },
+        {
+          dataCollection: resolveDataCollectionOptions({}),
+          expected: {
+            'http.request.header.content-type': ['application/json'],
+            'http.request.header.user-agent': ['Mozilla/5.0'],
+            'http.request.header.x-user': ['my-personal-username'],
+            'http.request.header.x-forwarded-for': ['192.168.1.1'],
+            'http.request.header.x-forwarded-host': ['example.com'],
+            'http.request.header.x-forwarded-proto': ['https'],
+          },
+        },
+      ])('filters PII headers according to dataCollection.httpHeaders', ({ dataCollection, expected }) => {
+        const headers = {
+          'Content-Type': 'application/json',
+          'User-Agent': 'Mozilla/5.0',
+          'x-user': 'my-personal-username',
+          'X-Forwarded-For': '192.168.1.1',
+          'X-Forwarded-Host': 'example.com',
+          'X-Forwarded-Proto': 'https',
+        };
+
+        expect(httpHeadersToSpanAttributes(headers, dataCollection)).toEqual(expected);
+      });
+
+      it('always filters comprehensive list of sensitive headers', () => {
+        const headers = {
+          'Content-Type': 'application/json',
+          'User-Agent': 'test-agent',
+          Accept: 'application/json',
+          Host: 'example.com',
+
+          // Should be filtered
+          Authorization: 'Bearer token',
+          Cookie: 'session=123',
+          'Set-Cookie': 'session=456',
+          'X-API-Key': 'key',
+          'X-Auth-Token': 'token',
+          'X-Secret': 'secret',
+          'x-secret-key': 'another-secret',
+          'WWW-Authenticate': 'Basic',
+          'Proxy-Authorization': 'Basic auth',
+          'X-Access-Token': 'access',
+          'X-CSRF': 'csrf',
+          'X-XSRF': 'xsrf',
+          'X-Session-Token': 'session',
+          'X-Password': 'password',
+          'X-Private-Key': 'private',
+          'X-Forwarded-user': 'user',
+          'X-Forwarded-authorization': 'auth',
+          'x-jwt-token': 'jwt',
+          'x-bearer-token': 'bearer',
+          'x-sso-token': 'sso',
+          'x-saml-token': 'saml',
+        };
+
+        const result = httpHeadersToSpanAttributes(headers, resolveDataCollectionOptions({}));
+
+        // Security-sensitive headers remain redacted with permissive collection defaults.
+        expect(result).toEqual({
+          'http.request.header.content-type': ['application/json'],
+          'http.request.header.user-agent': ['test-agent'],
+          'http.request.header.accept': ['application/json'],
+          'http.request.header.host': ['example.com'],
+          'http.request.header.authorization': ['[Filtered]'],
+          'http.request.header.cookie': ['session=[Filtered]'],
+          'http.request.header.set-cookie': ['session=[Filtered]'],
+          'http.request.header.x-api-key': ['[Filtered]'],
+          'http.request.header.x-auth-token': ['[Filtered]'],
+          'http.request.header.x-secret': ['[Filtered]'],
+          'http.request.header.x-secret-key': ['[Filtered]'],
+          'http.request.header.www-authenticate': ['[Filtered]'],
+          'http.request.header.proxy-authorization': ['[Filtered]'],
+          'http.request.header.x-access-token': ['[Filtered]'],
+          'http.request.header.x-csrf': ['[Filtered]'],
+          'http.request.header.x-xsrf': ['[Filtered]'],
+          'http.request.header.x-session-token': ['[Filtered]'],
+          'http.request.header.x-password': ['[Filtered]'],
+          'http.request.header.x-private-key': ['[Filtered]'],
+          'http.request.header.x-forwarded-user': ['user'],
+          'http.request.header.x-forwarded-authorization': ['[Filtered]'],
+          'http.request.header.x-jwt-token': ['[Filtered]'],
+          'http.request.header.x-bearer-token': ['[Filtered]'],
+          'http.request.header.x-sso-token': ['[Filtered]'],
+          'http.request.header.x-saml-token': ['[Filtered]'],
+        });
+      });
+
+      it('returns response header attributes if `lifecycle` is "response"', () => {
+        const headers = {
+          Host: 'example.com',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.5',
+          'Accept-Encoding': 'gzip, deflate',
+          Connection: 'keep-alive',
+          'Upgrade-Insecure-Requests': '1',
+          'Cache-Control': 'no-cache',
+          'X-Forwarded-For': '192.168.1.1',
+          Authorization: '[Filtered]',
+          'x-bearer-token': 'bearer',
+          'x-sso-token': 'sso',
+          'x-saml-token': 'saml',
+          'Set-Cookie': 'session=456',
+          Cookie: 'session=abc123',
+        };
+
+        const result = httpHeadersToSpanAttributes(headers, resolveDataCollectionOptions({}), 'response');
+
+        expect(result).toEqual({
+          'http.response.header.host': ['example.com'],
+          'http.response.header.user-agent': ['Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'],
+          'http.response.header.accept': ['text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'],
+          'http.response.header.accept-language': ['en-US,en;q=0.5'],
+          'http.response.header.accept-encoding': ['gzip, deflate'],
+          'http.response.header.connection': ['keep-alive'],
+          'http.response.header.upgrade-insecure-requests': ['1'],
+          'http.response.header.cache-control': ['no-cache'],
+          'http.response.header.x-forwarded-for': ['192.168.1.1'],
+          'http.response.header.authorization': ['[Filtered]'],
+          'http.response.header.x-bearer-token': ['[Filtered]'],
+          'http.response.header.x-saml-token': ['[Filtered]'],
+          'http.response.header.x-sso-token': ['[Filtered]'],
+          'http.response.header.set-cookie': ['session=[Filtered]'],
+          'http.response.header.cookie': ['session=[Filtered]'],
+        });
+      });
+    });
+
+    describe('with ResolvedDataCollection', () => {
+      const defaultDataCollection: ResolvedDataCollection = {
+        userInfo: false,
+        cookies: true,
+        httpHeaders: { request: true, response: true },
+        httpBodies: [],
+        urlQueryParams: true,
+        graphQL: { document: true, variables: true },
+        genAI: { inputs: true, outputs: true },
+        mcp: { inputs: true, outputs: true },
+        databaseQueryData: true,
+        stackFrameVariables: true,
+        frameContextLines: 5,
+      };
+
+      it('filters headers with allowList mode', () => {
+        const headers = {
+          'Content-Type': 'application/json',
+          'X-Request-Id': 'abc-123',
+          'X-Trace-Id': 'trace-456',
+          'User-Agent': 'test-agent',
+        };
+
+        const dc: ResolvedDataCollection = {
+          ...defaultDataCollection,
+          httpHeaders: {
+            request: { allow: ['x-request-id', 'content-type'] },
+            response: true,
+          },
+        };
+
+        const result = httpHeadersToSpanAttributes(headers, dc);
+
+        expect(result).toEqual({
+          'http.request.header.content-type': ['application/json'],
+          'http.request.header.x-request-id': ['abc-123'],
+          'http.request.header.x-trace-id': ['[Filtered]'],
+          'http.request.header.user-agent': ['[Filtered]'],
+        });
+      });
+
+      it('filters headers with custom denyList terms', () => {
+        const headers = {
+          'Content-Type': 'application/json',
+          'X-Custom-Secret': 'secret-value',
+          'X-Forwarded-For': '192.168.1.1',
+          Accept: 'text/html',
+        };
+
+        const dc: ResolvedDataCollection = {
+          ...defaultDataCollection,
+          httpHeaders: {
+            request: { deny: ['x-custom'] },
+            response: true,
+          },
+        };
+
+        const result = httpHeadersToSpanAttributes(headers, dc);
+
+        expect(result).toEqual({
+          'http.request.header.content-type': ['application/json'],
+          'http.request.header.x-custom-secret': ['[Filtered]'],
+          'http.request.header.x-forwarded-for': ['192.168.1.1'],
+          'http.request.header.accept': ['text/html'],
+        });
+      });
+
+      it('skips all headers when httpHeaders behavior is off', () => {
+        const headers = {
+          'Content-Type': 'application/json',
+          Cookie: 'theme=dark',
+        };
+
+        const dc: ResolvedDataCollection = {
+          ...defaultDataCollection,
+          httpHeaders: { request: false, response: true },
+        };
+
+        const result = httpHeadersToSpanAttributes(headers, dc);
+
+        expect(result).toEqual({
+          'http.request.header.cookie': ['theme=dark'],
+        });
+      });
+
+      it('skips all cookies when cookies behavior is off', () => {
+        const headers = {
+          'Content-Type': 'application/json',
+          Cookie: 'session=abc123; theme=dark',
+          'Set-Cookie': 'pref=1; HttpOnly',
+        };
+
+        const dc: ResolvedDataCollection = {
+          ...defaultDataCollection,
+          cookies: false,
+        };
+
+        const result = httpHeadersToSpanAttributes(headers, dc);
+
+        expect(result).toEqual({
+          'http.request.header.content-type': ['application/json'],
+        });
+      });
+
+      it('filters cookies with allowList mode', () => {
+        const headers = {
+          Cookie: 'theme=dark; locale=en; session=secret',
+        };
+
+        const dc: ResolvedDataCollection = {
+          ...defaultDataCollection,
+          cookies: { allow: ['theme', 'locale'] },
+        };
+
+        const result = httpHeadersToSpanAttributes(headers, dc);
+
+        expect(result).toEqual({
+          'http.request.header.cookie': ['theme=dark', 'locale=en', 'session=[Filtered]'],
+        });
+      });
+
+      it('uses response behavior when lifecycle is response', () => {
+        const headers = {
+          'Content-Type': 'application/json',
+          'X-Custom': 'value',
+        };
+
+        const dc: ResolvedDataCollection = {
+          ...defaultDataCollection,
+          httpHeaders: {
+            request: true,
+            response: { allow: ['content-type'] },
+          },
+        };
+
+        const result = httpHeadersToSpanAttributes(headers, dc, 'response');
+
+        expect(result).toEqual({
+          'http.response.header.content-type': ['application/json'],
+          'http.response.header.x-custom': ['[Filtered]'],
+        });
+      });
+
+      it('still filters sensitive keys even in allowList mode', () => {
+        const headers = {
+          Authorization: 'Bearer token',
+          'X-Request-Id': 'abc-123',
+        };
+
+        const dc: ResolvedDataCollection = {
+          ...defaultDataCollection,
+          httpHeaders: {
+            request: { allow: ['authorization', 'x-request-id'] },
+            response: true,
+          },
+        };
+
+        const result = httpHeadersToSpanAttributes(headers, dc);
+
+        expect(result).toEqual({
+          'http.request.header.authorization': ['[Filtered]'],
+          'http.request.header.x-request-id': ['abc-123'],
+        });
+      });
+    });
+  });
+
+  describe('captureBodyFromWinterCGRequest', () => {
+    function createMockRequest(options: {
+      body?: string | null;
+      contentType?: string;
+      contentLength?: string;
+    }): Request {
+      const headers = new Headers();
+      if (options.contentType) {
+        headers.set('content-type', options.contentType);
+      }
+      if (options.contentLength) {
+        headers.set('content-length', options.contentLength);
+      }
+
+      return new Request('https://example.com/test', {
+        method: 'POST',
+        headers,
+        body: options.body ?? undefined,
+      });
+    }
+
+    function createMockScope(): Scope & { capturedData: unknown } {
+      const scope = {
+        capturedData: undefined as unknown,
+        setSDKProcessingMetadata(metadata: { normalizedRequest?: { data?: unknown } }) {
+          scope.capturedData = metadata.normalizedRequest?.data;
+        },
+      };
+      return scope as Scope & { capturedData: unknown };
+    }
+
+    it('captures JSON body', async () => {
+      const jsonBody = JSON.stringify({ userId: 42, email: 'user@example.com', action: 'update_profile' });
+      const request = createMockRequest({
+        body: jsonBody,
+        contentType: 'application/json',
+      });
+      const scope = createMockScope();
+
+      await captureBodyFromWinterCGRequest(request, scope, 'medium');
+
+      expect(scope.capturedData).toBe(jsonBody);
+    });
+
+    it('captures form-urlencoded body', async () => {
+      const request = createMockRequest({
+        body: 'username=test&password=secret',
+        contentType: 'application/x-www-form-urlencoded',
+      });
+      const scope = createMockScope();
+
+      await captureBodyFromWinterCGRequest(request, scope, 'medium');
+
+      expect(scope.capturedData).toBe('username=test&password=secret');
+    });
+
+    it('captures text/plain body', async () => {
+      const request = createMockRequest({
+        body: 'Hello, World!',
+        contentType: 'text/plain',
+      });
+      const scope = createMockScope();
+
+      await captureBodyFromWinterCGRequest(request, scope, 'medium');
+
+      expect(scope.capturedData).toBe('Hello, World!');
+    });
+
+    it('captures text/html body', async () => {
+      const request = createMockRequest({
+        body: '<html><body>Test</body></html>',
+        contentType: 'text/html',
+      });
+      const scope = createMockScope();
+
+      await captureBodyFromWinterCGRequest(request, scope, 'medium');
+
+      expect(scope.capturedData).toBe('<html><body>Test</body></html>');
+    });
+
+    it('captures application/xml body', async () => {
+      const request = createMockRequest({
+        body: '<root><item>value</item></root>',
+        contentType: 'application/xml',
+      });
+      const scope = createMockScope();
+
+      await captureBodyFromWinterCGRequest(request, scope, 'medium');
+
+      expect(scope.capturedData).toBe('<root><item>value</item></root>');
+    });
+
+    it('captures application/graphql body', async () => {
+      const request = createMockRequest({
+        body: 'query { user { name } }',
+        contentType: 'application/graphql',
+      });
+      const scope = createMockScope();
+
+      await captureBodyFromWinterCGRequest(request, scope, 'medium');
+
+      expect(scope.capturedData).toBe('query { user { name } }');
+    });
+
+    it('skips non-textual content types', async () => {
+      const request = createMockRequest({
+        body: 'binary data',
+        contentType: 'application/octet-stream',
+      });
+      const scope = createMockScope();
+
+      await captureBodyFromWinterCGRequest(request, scope, 'medium');
+
+      expect(scope.capturedData).toBeUndefined();
+    });
+
+    it('skips image content types', async () => {
+      const request = createMockRequest({
+        body: 'image data',
+        contentType: 'image/png',
+      });
+      const scope = createMockScope();
+
+      await captureBodyFromWinterCGRequest(request, scope, 'medium');
+
+      expect(scope.capturedData).toBeUndefined();
+    });
+
+    it('skips when content-type is explicitly non-textual', async () => {
+      const request = {
+        headers: {
+          get: (name: string) => (name === 'content-type' ? null : null),
+        },
+        body: {},
+        clone: () => ({
+          text: () => Promise.resolve('some data'),
+        }),
+      } as unknown as Request;
+      const scope = createMockScope();
+
+      await captureBodyFromWinterCGRequest(request, scope, 'medium');
+
+      expect(scope.capturedData).toBeUndefined();
+    });
+
+    it('skips when body is null', async () => {
+      const request = createMockRequest({
+        body: null,
+        contentType: 'application/json',
+      });
+      const scope = createMockScope();
+
+      await captureBodyFromWinterCGRequest(request, scope, 'medium');
+
+      expect(scope.capturedData).toBeUndefined();
+    });
+
+    it('skips when body is empty', async () => {
+      const request = createMockRequest({
+        body: '',
+        contentType: 'application/json',
+      });
+      const scope = createMockScope();
+
+      await captureBodyFromWinterCGRequest(request, scope, 'medium');
+
+      expect(scope.capturedData).toBeUndefined();
+    });
+
+    it('truncates body when it exceeds small size limit (1000 bytes)', async () => {
+      const largeBody = 'x'.repeat(2000);
+      const request = createMockRequest({
+        body: largeBody,
+        contentType: 'text/plain',
+      });
+      const scope = createMockScope();
+
+      await captureBodyFromWinterCGRequest(request, scope, 'small');
+
+      expect(scope.capturedData).toHaveLength(1000);
+      expect((scope.capturedData as string).endsWith('...')).toBe(true);
+    });
+
+    it('truncates body when it exceeds medium size limit (10000 bytes)', async () => {
+      const largeBody = 'x'.repeat(20000);
+      const request = createMockRequest({
+        body: largeBody,
+        contentType: 'text/plain',
+      });
+      const scope = createMockScope();
+
+      await captureBodyFromWinterCGRequest(request, scope, 'medium');
+
+      expect(scope.capturedData).toHaveLength(10000);
+      expect((scope.capturedData as string).endsWith('...')).toBe(true);
+    });
+
+    it('does not truncate body within small size limit', async () => {
+      const smallBody = 'x'.repeat(500);
+      const request = createMockRequest({
+        body: smallBody,
+        contentType: 'text/plain',
+      });
+      const scope = createMockScope();
+
+      await captureBodyFromWinterCGRequest(request, scope, 'small');
+
+      expect(scope.capturedData).toBe(smallBody);
+    });
+
+    it('skips when content-length exceeds 1MB limit', async () => {
+      const request = createMockRequest({
+        body: 'small body',
+        contentType: 'application/json',
+        contentLength: '2000000',
+      });
+      const scope = createMockScope();
+
+      await captureBodyFromWinterCGRequest(request, scope, 'always');
+
+      expect(scope.capturedData).toBeUndefined();
+    });
+
+    it('captures body with always size limit', async () => {
+      const largeBody = 'x'.repeat(50000);
+      const request = createMockRequest({
+        body: largeBody,
+        contentType: 'text/plain',
+      });
+      const scope = createMockScope();
+
+      await captureBodyFromWinterCGRequest(request, scope, 'always');
+
+      expect(scope.capturedData).toBe(largeBody);
+    });
+
+    it('handles content-type with charset', async () => {
+      const request = createMockRequest({
+        body: '{"test":"value"}',
+        contentType: 'application/json; charset=utf-8',
+      });
+      const scope = createMockScope();
+
+      await captureBodyFromWinterCGRequest(request, scope, 'medium');
+
+      expect(scope.capturedData).toBe('{"test":"value"}');
+    });
+
+    it('does not throw on errors', async () => {
+      const request = {
+        headers: {
+          get: () => {
+            throw new Error('Test error');
+          },
+        },
+        body: 'test',
+        clone: () => request,
+      } as unknown as Request;
+      const scope = createMockScope();
+
+      await expect(captureBodyFromWinterCGRequest(request, scope, 'medium')).resolves.not.toThrow();
+      expect(scope.capturedData).toBeUndefined();
+    });
+
+    it('handles timeout gracefully', async () => {
+      vi.useFakeTimers();
+
+      const neverResolve = new Promise<string>(() => {});
+      const request = {
+        headers: new Headers({ 'content-type': 'application/json' }),
+        body: {},
+        clone: () => ({
+          text: () => neverResolve,
+        }),
+      } as unknown as Request;
+      const scope = createMockScope();
+
+      const promise = captureBodyFromWinterCGRequest(request, scope, 'medium');
+
+      await vi.advanceTimersByTimeAsync(2500);
+      await promise;
+
+      expect(scope.capturedData).toBeUndefined();
+
+      vi.useRealTimers();
+    });
+  });
+});

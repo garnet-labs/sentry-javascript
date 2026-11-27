@@ -1,0 +1,9 @@
+{
+  "extends": "../../tsconfig.json",
+
+  "include": ["src/**/*", "test/loader.js"],
+
+  "compilerOptions": {
+    "lib": ["DOM", "es2020", "WebWorker"]
+  }
+}

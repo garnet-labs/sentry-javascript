@@ -1,0 +1,29 @@
+{
+  "name": "node-express-app",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "pnpm build && bun run ./dist/consistentExports.js",
+    "test": " bun run ./dist/consistentExports.js",
+    "clean": "npx rimraf node_modules pnpm-lock.yaml dist",
+    "test:build": "pnpm install && pnpm build",
+    "test:assert": "pnpm test"
+  },
+  "dependencies": {
+    "@sentry/node": "file:../../packed/sentry-node-packed.tgz",
+    "@sentry/sveltekit": "file:../../packed/sentry-sveltekit-packed.tgz",
+    "@sentry/remix": "file:../../packed/sentry-remix-packed.tgz",
+    "@sentry/astro": "file:../../packed/sentry-astro-packed.tgz",
+    "@sentry/nextjs": "file:../../packed/sentry-nextjs-packed.tgz",
+    "@sentry/aws-serverless": "file:../../packed/sentry-aws-serverless-packed.tgz",
+    "@sentry/google-cloud-serverless": "file:../../packed/sentry-google-cloud-serverless-packed.tgz",
+    "@sentry/bun": "file:../../packed/sentry-bun-packed.tgz",
+    "@types/node": "^18.19.1",
+    "typescript": "~5.0.0"
+  },
+  "volta": {
+    "extends": "../../package.json"
+  }
+}

@@ -1,0 +1,20 @@
+import * as Sentry from '@sentry/browser';
+
+Sentry.registerWebWorker({ self });
+
+// Let the main thread know the worker is ready
+self.postMessage({
+  msg: 'WORKER_READY',
+});
+
+self.addEventListener('message', event => {
+  if (event.data.msg === 'TRIGGER_ERROR') {
+    // This will throw an uncaught error in the worker
+    throw new Error(`Uncaught error in worker`);
+  }
+
+  if (event.data.msg === 'TRIGGER_PRIMITIVE_ERROR') {
+    // A thrown primitive has no stack, so only the ErrorEvent knows where it came from
+    throw 'Primitive thrown in worker';
+  }
+});
