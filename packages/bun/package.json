@@ -1,0 +1,91 @@
+{
+  "name": "@sentry/bun",
+  "version": "11.15.0",
+  "description": "Official Sentry SDK for bun",
+  "repository": "git://github.com/getsentry/sentry-javascript.git",
+  "homepage": "https://github.com/getsentry/sentry-javascript/tree/master/packages/bun",
+  "author": "Sentry",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.19.0 <22.0.0 || >=22.12.0 <23.0.0 || >=23.2.0",
+    "bun": ">=1.3.14"
+  },
+  "files": [
+    "/build"
+  ],
+  "main": "build/cjs/index.js",
+  "module": "build/esm/index.js",
+  "types": "build/types/index.d.ts",
+  "exports": {
+    "./package.json": "./package.json",
+    ".": {
+      "import": {
+        "types": "./build/types/index.d.ts",
+        "default": "./build/esm/index.js"
+      },
+      "require": {
+        "types": "./build/types/index.d.ts",
+        "default": "./build/cjs/index.js"
+      }
+    },
+    "./plugin": {
+      "import": {
+        "types": "./build/types/plugin.d.ts",
+        "default": "./build/esm/plugin.js"
+      },
+      "require": {
+        "types": "./build/types/plugin.d.ts",
+        "default": "./build/cjs/plugin.js"
+      }
+    },
+    "./import": {
+      "import": "./build/import.mjs"
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@sentry/bundler-plugins": "11.15.0",
+    "@sentry/core": "11.15.0",
+    "@sentry/conventions": "^0.34.0",
+    "@sentry/node": "11.15.0",
+    "@sentry/server-runtime-injection": "11.15.0",
+    "@sentry/server-utils": "11.15.0"
+  },
+  "devDependencies": {
+    "@sentry-internal/rollup-utils": "11.15.0",
+    "bun-types": "^1.2.9"
+  },
+  "scripts": {
+    "build": "pnpm run \"/^build:(transpile|types)$/\"",
+    "build:dev": "pnpm run build",
+    "build:transpile": "rolldown -c rollup.npm.config.mjs",
+    "build:types": "tsc -p tsconfig.types.json",
+    "build:tarball": "pnpm pack",
+    "clean": "node ../../scripts/rm.mjs build coverage sentry-bun-*.tgz",
+    "lint:fix": "oxlint . --fix --type-aware",
+    "lint": "oxlint . --type-aware",
+    "lint:types": "oxlint src --type-aware --type-check",
+    "lint:es-compatibility": "node ../../scripts/es-check.mjs es2022",
+    "install:bun": "node ./scripts/install-bun.js",
+    "test": "pnpm run install:bun && pnpm run test:bun",
+    "test:bun": "bun test --isolate",
+    "test:watch": "bun test --watch",
+    "yalc:publish": "pnpm dlx yalc publish --push --sig"
+  },
+  "sideEffects": [
+    "./build/import.mjs"
+  ],
+  "nx": {
+    "targets": {
+      "build:transpile": {
+        "outputs": [
+          "{projectRoot}/build/esm",
+          "{projectRoot}/build/cjs",
+          "{projectRoot}/build/import.mjs"
+        ]
+      }
+    }
+  }
+}

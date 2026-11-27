@@ -1,0 +1,46 @@
+import { createTestServer } from '@sentry-internal/test-utils';
+import { describe, expect } from 'vitest';
+import { createEsmAndCjsTests } from '../../../../utils/runner';
+import { supports } from '../../../../utils';
+
+// Bun before 1.4 does not instrument outgoing `node:http` requests.
+// See https://github.com/getsentry/sentry-javascript/issues/23881
+describe.runIf(supports({ bunMin: '1.4.0' }))('outgoing http', () => {
+  createEsmAndCjsTests(__dirname, 'scenario.mjs', 'instrument.mjs', (createRunner, test) => {
+    test('outgoing sampled http requests are correctly instrumented', async () => {
+      expect.assertions(11);
+
+      const [SERVER_URL, closeTestServer] = await createTestServer()
+        .get('/api/v0', headers => {
+          expect(headers['baggage']).toEqual(expect.any(String));
+          expect(headers['sentry-trace']).toEqual(expect.stringMatching(/^([a-f\d]{32})-([a-f\d]{16})-1$/));
+          expect(headers['sentry-trace']).not.toEqual('00000000000000000000000000000000-0000000000000000-1');
+        })
+        .get('/api/v1', headers => {
+          expect(headers['baggage']).toEqual(expect.any(String));
+          expect(headers['sentry-trace']).toEqual(expect.stringMatching(/^([a-f\d]{32})-([a-f\d]{16})-1$/));
+          expect(headers['sentry-trace']).not.toEqual('00000000000000000000000000000000-0000000000000000-1');
+        })
+        .get('/api/v2', headers => {
+          expect(headers['baggage']).toBeUndefined();
+          expect(headers['sentry-trace']).toBeUndefined();
+        })
+        .get('/api/v3', headers => {
+          expect(headers['baggage']).toBeUndefined();
+          expect(headers['sentry-trace']).toBeUndefined();
+        })
+        .start();
+
+      await createRunner()
+        .withEnv({ SERVER_URL })
+        .expect({
+          span: {
+            // Span contents are tested elsewhere, we just want to know that a span envelope was sent
+          },
+        })
+        .start()
+        .completed();
+      closeTestServer();
+    });
+  });
+});

@@ -1,0 +1,200 @@
+import type { RequestEventData } from '@sentry/core';
+import {
+  captureException,
+  continueTrace,
+  debug,
+  getActiveSpan,
+  getClient,
+  getIsolationScope,
+  getSpanStatusFromHttpCode,
+  handleCallbackErrors,
+  hasSpanStreamingEnabled,
+  SPAN_STATUS_ERROR,
+  SPAN_STATUS_OK,
+  startSpan,
+  withIsolationScope,
+} from '@sentry/core';
+import { flushSafelyWithTimeout, waitUntil } from '../common/utils/responseEnd';
+import { DEBUG_BUILD } from './debug-build';
+import {
+  getAuthInterruptStatusCode,
+  isNotFoundNavigationError,
+  isPrerenderControlFlowError,
+  isRedirectNavigationError,
+} from './nextNavigationErrorUtils';
+import {
+  CODE_FUNCTION_NAME,
+  SENTRY_DESCRIPTION,
+  SENTRY_KIND,
+  SENTRY_OP,
+  SENTRY_SEGMENT_NAME_SOURCE,
+  SENTRY_ORIGIN,
+} from '@sentry/conventions/attributes';
+import { FUNCTION } from '@sentry/conventions/op';
+
+interface Options {
+  formData?: FormData;
+
+  /**
+   * Headers as returned from `headers()`.
+   *
+   * Currently accepts both a plain `Headers` object and `Promise<ReadonlyHeaders>` to be compatible with async APIs introduced in Next.js 15: https://github.com/vercel/next.js/pull/68812
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  headers?: Headers | Promise<any>;
+
+  /**
+   * Whether the server action response should be included in any events captured within the server action.
+   */
+  recordResponse?: boolean;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function withServerActionInstrumentation<A extends (...args: any[]) => any>(
+  serverActionName: string,
+  callback: A,
+): Promise<ReturnType<A>>;
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function withServerActionInstrumentation<A extends (...args: any[]) => any>(
+  serverActionName: string,
+  options: Options,
+  callback: A,
+): Promise<ReturnType<A>>;
+
+/**
+ * Wraps a Next.js Server Action implementation with Sentry Error and Performance instrumentation.
+ */
+export function withServerActionInstrumentation<A extends (...args: unknown[]) => unknown>(
+  ...args: [string, Options, A] | [string, A]
+): Promise<ReturnType<A>> {
+  if (typeof args[1] === 'function') {
+    const [serverActionName, callback] = args;
+    return withServerActionInstrumentationImplementation(serverActionName, {}, callback);
+  } else {
+    const [serverActionName, options, callback] = args;
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+    return withServerActionInstrumentationImplementation(serverActionName, options, callback!);
+  }
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function withServerActionInstrumentationImplementation<A extends (...args: any[]) => any>(
+  serverActionName: string,
+  options: Options,
+  callback: A,
+): Promise<ReturnType<A>> {
+  return withIsolationScope(async isolationScope => {
+    const shouldRecordResponse = getClient()?.getDataCollectionOptions().httpBodies.includes('outgoingResponse');
+
+    let sentryTraceHeader;
+    let baggageHeader;
+    const fullHeadersObject: Record<string, string> = {};
+    try {
+      const awaitedHeaders: Headers = await options.headers;
+      sentryTraceHeader = awaitedHeaders?.get('sentry-trace') ?? undefined;
+      baggageHeader = awaitedHeaders?.get('baggage');
+      awaitedHeaders?.forEach((value, key) => {
+        fullHeadersObject[key] = value;
+      });
+    } catch {
+      DEBUG_BUILD &&
+        debug.warn(
+          "Sentry wasn't able to extract the tracing headers for a server action. Will not trace this request.",
+        );
+    }
+
+    isolationScope.setTransactionName(`serverAction/${serverActionName}`);
+    isolationScope.setSDKProcessingMetadata({
+      normalizedRequest: {
+        headers: fullHeadersObject,
+      } satisfies RequestEventData,
+    });
+
+    // Normally, there is an active span here (from Next.js OTEL) and we just use that as parent
+    // Else, we manually continueTrace from the incoming headers
+    const continueTraceIfNoActiveSpan = getActiveSpan()
+      ? <T>(_opts: unknown, callback: () => T) => callback()
+      : continueTrace;
+
+    return continueTraceIfNoActiveSpan(
+      {
+        sentryTrace: sentryTraceHeader,
+        baggage: baggageHeader,
+      },
+      async () => {
+        try {
+          const client = getClient();
+          const description = `serverAction/${serverActionName}`;
+
+          return await startSpan(
+            {
+              name: client && hasSpanStreamingEnabled(client) ? serverActionName : description,
+              // oxlint-disable-next-line typescript/no-deprecated
+              forceTransaction: true,
+              attributes: {
+                [SENTRY_KIND]: 'server',
+                [SENTRY_OP]: FUNCTION,
+                // Overriding span description inference in Relay, because we can't express the serverAction/ prefix
+                // as a sentry-conventions span name rule for `function` spans.
+                [SENTRY_DESCRIPTION]: description,
+                [CODE_FUNCTION_NAME]: serverActionName,
+                [SENTRY_SEGMENT_NAME_SOURCE]: 'route',
+                [SENTRY_ORIGIN]: 'auto.function.nextjs.server_action',
+              },
+            },
+            async span => {
+              // oxlint-disable-next-line typescript/await-thenable -- callback may be async at runtime
+              const result = await handleCallbackErrors(callback, error => {
+                const authInterruptStatusCode = getAuthInterruptStatusCode(error);
+                if (isNotFoundNavigationError(error)) {
+                  // We don't want to report "not-found"s
+                  span.setStatus({ code: SPAN_STATUS_ERROR, message: 'not_found' });
+                } else if (authInterruptStatusCode) {
+                  span.setStatus(getSpanStatusFromHttpCode(authInterruptStatusCode));
+                } else if (isRedirectNavigationError(error)) {
+                  // Redirects are normal Next.js control flow, not errors. Mark the span as OK and end it
+                  // early so the surrounding `startSpan` error handler doesn't override the status to
+                  // `internal_error`
+                  span.setStatus({ code: SPAN_STATUS_OK });
+                  span.end();
+                } else if (isPrerenderControlFlowError(error)) {
+                  // Next.js only throws these from a prerender scope and server actions run in a request
+                  // scope, so this is not reachable today. It is here because `unstable_rethrow` defines
+                  // the contract for anything catching user land errors, without carving out actions.
+                  span.setStatus({ code: SPAN_STATUS_OK });
+                  span.end();
+                } else {
+                  span.setStatus({ code: SPAN_STATUS_ERROR, message: 'internal_error' });
+                  captureException(error, {
+                    mechanism: {
+                      handled: false,
+                      type: 'auto.function.nextjs.server_action',
+                    },
+                  });
+                }
+              });
+
+              if (options.recordResponse !== undefined ? options.recordResponse : shouldRecordResponse) {
+                getIsolationScope().setExtra('server_action_result', result);
+              }
+
+              if (options.formData) {
+                options.formData.forEach((value, key) => {
+                  getIsolationScope().setExtra(
+                    `server_action_form_data.${key}`,
+                    typeof value === 'string' ? value : '[non-string value]',
+                  );
+                });
+              }
+
+              return result;
+            },
+          );
+        } finally {
+          waitUntil(flushSafelyWithTimeout());
+        }
+      },
+    );
+  });
+}

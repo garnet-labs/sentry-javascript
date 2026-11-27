@@ -1,0 +1,100 @@
+import { SENTRY_ORIGIN } from '@sentry/conventions/attributes';
+import type { Context, Link, Span, SpanOptions, Tracer, TracerProvider } from '@opentelemetry/api';
+import { trace } from '@opentelemetry/api';
+import { isObjectLike, startInactiveSpan, startSpanManual } from '@sentry/core';
+import type { SpanLink } from '@sentry/core';
+
+/**
+ * Set up a mock OTEL tracer to allow inter-op with OpenTelemetry emitted spans.
+ * This is not perfect but handles easy/common use cases.
+ */
+export function setupOpenTelemetryTracer(): void {
+  // Clear any pre-existing OTel global registration (e.g. from Supabase Edge Runtime
+  // or Deno's built-in OTel) so Sentry's TracerProvider gets registered successfully.
+  trace.disable();
+  trace.setGlobalTracerProvider(new SentryDenoTraceProvider());
+}
+
+class SentryDenoTraceProvider implements TracerProvider {
+  private readonly _tracers: Map<string, Tracer> = new Map();
+
+  public getTracer(name: string, version?: string, options?: { schemaUrl?: string }): Tracer {
+    const key = `${name}@${version || ''}:${options?.schemaUrl || ''}`;
+    if (!this._tracers.has(key)) {
+      this._tracers.set(key, new SentryDenoTracer());
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+    return this._tracers.get(key)!;
+  }
+}
+
+class SentryDenoTracer implements Tracer {
+  public startSpan(name: string, options?: SpanOptions): Span {
+    return startInactiveSpan({
+      ...options,
+      links: convertSpanLinkType(options?.links),
+      name,
+      attributes: {
+        ...options?.attributes,
+        [SENTRY_ORIGIN]: 'manual',
+        'sentry.deno_tracer': true,
+      },
+    });
+  }
+
+  /**
+   * NOTE: This does not handle `context` being passed in. It will always put spans on the current scope.
+   */
+  public startActiveSpan<F extends (span: Span) => unknown>(name: string, fn: F): ReturnType<F>;
+  public startActiveSpan<F extends (span: Span) => unknown>(name: string, options: SpanOptions, fn: F): ReturnType<F>;
+  public startActiveSpan<F extends (span: Span) => unknown>(
+    name: string,
+    options: SpanOptions,
+    context: Context,
+    fn: F,
+  ): ReturnType<F>;
+  public startActiveSpan<F extends (span: Span) => unknown>(
+    name: string,
+    options: unknown,
+    context?: unknown,
+    fn?: F,
+  ): ReturnType<F> {
+    const opts = (isObjectLike(options) ? options : {}) as SpanOptions;
+
+    const spanOpts = {
+      ...opts,
+      links: convertSpanLinkType(opts.links),
+      name,
+      attributes: {
+        ...opts.attributes,
+        [SENTRY_ORIGIN]: 'manual',
+        'sentry.deno_tracer': true,
+      },
+    };
+
+    const callback = (
+      typeof options === 'function'
+        ? options
+        : typeof context === 'function'
+          ? context
+          : typeof fn === 'function'
+            ? fn
+            : () => {}
+    ) as F;
+
+    // In OTEL the semantic matches `startSpanManual` because spans are not auto-ended
+    return startSpanManual(spanOpts, callback) as ReturnType<F>;
+  }
+}
+
+/**
+ * Converts OpenTelemetry span links to Sentry span links.
+ *
+ * Since `@opentelemetry/api` 1.10.0, link attribute values are typed as `unknown`.
+ * Sentry's `SpanLink` only accepts strings, numbers, booleans and arrays of these as attribute values,
+ * so OTel links do not match its type.
+ */
+function convertSpanLinkType(links: Link[] | undefined): SpanLink[] | undefined {
+  return links as SpanLink[] | undefined;
+}

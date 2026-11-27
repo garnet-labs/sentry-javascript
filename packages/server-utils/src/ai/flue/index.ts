@@ -1,0 +1,270 @@
+import type { Scope, Span } from '@sentry/core';
+import {
+  consoleSandbox,
+  continueTrace,
+  getActiveSpan,
+  getDefaultIsolationScope,
+  getIsolationScope,
+  LRUMap,
+  sentryTraceFromTraceparent,
+  startNewTrace,
+  startSpan,
+  withActiveSpan,
+  withScope,
+} from '@sentry/core';
+import {
+  GEN_AI_AGENT_NAME,
+  GEN_AI_CONVERSATION_ID,
+  GEN_AI_OPERATION_NAME,
+  SENTRY_ORIGIN,
+} from '@sentry/conventions/attributes';
+import type { GenAiSpanHooks } from '../core/span-hooks';
+import type { GenAiCallOptions } from '../core/utils';
+import { getGenAiSpanOp } from '../core/utils';
+import { getOrchestrionInjectedModules } from '../../orchestrion/detect';
+import { piAiModuleNames } from '../../orchestrion/config/pi-ai';
+import { setPiAiDriverOptions } from '../pi-ai/recording';
+import type { PiAssistantMessage } from '../pi-ai/types';
+import { isBun, isCloudflareWorkers, isDeno } from '../../utils/runtime';
+import { withCleanScopes } from '../../utils/withCleanScopes';
+import { FLUE_INSTRUMENTATION_KEY, FLUE_OPERATION, FLUE_ORIGIN, MAX_TRACKED_FLUE_SPANS } from './constants';
+import type { SpanTracker } from './utils';
+import { endToolSpan, startToolSpan } from './utils';
+import type { FlueCallInfo, FlueInstrumentation, FlueObservation } from './types';
+
+/**
+ * The span hooks run for the `gen_ai.chat` spans of the model calls, which pi-ai reports, and for the
+ * tool spans. `onSpanEnd` gets the `AssistantMessage` of a model call, and the `tool` observation of a
+ * tool call, whose `errorInfo` is also the `error` of a failed tool. A tool call that never ends, whose
+ * span is ended when the tracker evicts it or Flue disposes the instrumentation, does not run `onSpanEnd`.
+ */
+export type FlueOptions = GenAiCallOptions<FlueCallInfo> &
+  GenAiSpanHooks<FlueCallInfo, PiAssistantMessage | FlueObservation>;
+
+interface Admission {
+  isolationScope: Scope;
+  span: Span | undefined;
+}
+
+let checkedPiAiInstrumentation = false;
+
+/**
+ * `instrument()` works without Sentry's module hook or bundler plugin, but the pi-ai integration that
+ * spans Flue's model calls doesn't. Checked on the first model call, once pi-ai has loaded.
+ */
+function warnIfPiAiNotInstrumented(): void {
+  if (checkedPiAiInstrumentation) {
+    return;
+  }
+  checkedPiAiInstrumentation = true;
+
+  const injected = getOrchestrionInjectedModules();
+  if (piAiModuleNames.some(name => injected.includes(name))) {
+    return;
+  }
+
+  consoleSandbox(() => {
+    // eslint-disable-next-line no-console
+    console.warn(
+      '[Sentry] Flue model calls are not being traced: `@earendil-works/pi-ai` was not instrumented, so ' +
+        `Flue agents record agent and tool spans but no \`gen_ai.chat\` spans. ${getPiAiInstrumentationHint()}`,
+    );
+  });
+}
+
+function getPiAiInstrumentationHint(): string {
+  if (isBun()) {
+    return 'On Bun 1.4.6 or later, run your app with `bun --preload @sentry/bun/import app.ts`. Or build it with `sentryBunPlugin()` from `@sentry/bun/plugin`.';
+  }
+  if (isDeno()) {
+    return 'Run your app with `deno run --preload=npm:@sentry/deno/import app.ts`.';
+  }
+  if (isCloudflareWorkers()) {
+    return 'Add `sentryCloudflareVitePlugin()` from `@sentry/cloudflare/vite` to your Vite config.';
+  }
+  return 'Load Sentry with `--import`, for example `node --import ./instrument.mjs app.mjs`.';
+}
+
+/**
+ * Flue's Node coordinator runs every submission from one long-lived claim loop, started by the
+ * first admission and keeping that call's async context for the life of the process. Left alone,
+ * every agent run lands in the trace of whichever request admitted the first one
+ * (https://github.com/withastro/flue/issues/813).
+ */
+function runInAdmissionContext<T>(admission: Admission | undefined, next: () => T): T {
+  // Cloudflare runs each turn from a Durable Object alarm, which already starts a trace of its own,
+  // so there is no leaked context to undo there.
+  if (isCloudflareWorkers()) {
+    return next();
+  }
+  if (!admission) {
+    // Admitted by another process, replayed by idempotency key, or evicted: there is nothing to
+    // restore, but the loop's context still belongs to an unrelated request.
+    return withCleanScopes(getDefaultIsolationScope().clone(), () => startNewTrace(next));
+  }
+  return withCleanScopes(admission.isolationScope, () =>
+    admission.span ? withActiveSpan(admission.span, next) : startNewTrace(next),
+  );
+}
+
+/**
+ * Build the object to hand to `instrument()` from `@flue/runtime`.
+ *
+ * The two callbacks own different halves of the result:
+ *
+ * - `interceptor` wraps agent execution, so the agent span is *active* for its duration and every
+ *   span opened underneath parents correctly.
+ * - `observe` opens and closes the tool spans, and names the agent span.
+ *
+ * Model calls get no span here: Flue sends them through pi-ai, whose integration reports each one
+ * as a `gen_ai.chat` span under the agent span.
+ *
+ * Tool arguments and results are gated on `recordInputs`/`recordOutputs`, which fall back to the
+ * current client's `dataCollection.genAI` settings and are decided when each tool span starts. The
+ * same options apply to the message content of the `gen_ai.chat` spans.
+ */
+export function createFlueInstrumentation(options: FlueOptions = {}): FlueInstrumentation {
+  // Keyed by the agent operation's own id, which is what the observations carry. That keeps
+  // concurrent runs apart and gives a delegated subagent its own span: Flue nests a second `agent`
+  // operation inside the parent's for `task` delegation, and the nesting is not bounded at two.
+  // A plain map: the entry is removed in a `finally`, so it is bounded by concurrent agent runs.
+  const agentSpans = new Map<string, Span>();
+  // Capped, unlike the above: these are keyed off ids that only a matching end observation removes.
+  const toolSpans: SpanTracker = new LRUMap(MAX_TRACKED_FLUE_SPANS);
+  // Capped: a submission admitted here but run by another process never settles here.
+  const admissions = new LRUMap<string, Admission>(MAX_TRACKED_FLUE_SPANS);
+
+  return {
+    key: FLUE_INSTRUMENTATION_KEY,
+
+    interceptor: async (operation, ctx, next) => {
+      // `observe` has already opened the tool span; make it active for the duration so whatever the
+      // tool does lands inside it rather than beside it.
+      if (operation?.type === FLUE_OPERATION.TOOL) {
+        const toolSpan = operation.toolCallId ? toolSpans.get(operation.toolCallId) : undefined;
+        return toolSpan ? withActiveSpan(toolSpan, next) : next();
+      }
+      // The `gen_ai.chat` span of the model call comes from the pi-ai integration, which reads the
+      // conversation and the recording options from the scope.
+      if (operation?.type === FLUE_OPERATION.MODEL) {
+        warnIfPiAiNotInstrumented();
+        const { conversationId } = ctx;
+        return withScope(scope => {
+          if (conversationId) {
+            scope.setConversationId(conversationId);
+          }
+          setPiAiDriverOptions(scope, options, { operation: 'chat', execution: operation, context: ctx });
+          return next();
+        });
+      }
+
+      if (operation?.type !== FLUE_OPERATION.AGENT) {
+        return next();
+      }
+
+      // A submission opens with a wrapper operation whose id *is* the submission id; the run it
+      // wraps gets its own operation id, and that is the one the observations reference. Spanning
+      // the wrapper too would double-count every agent invocation, but it is the outermost point of
+      // every attempt, so it is where the admitting context goes back in.
+      const operationId = operation.operationId;
+      if (operationId && operationId === ctx.submissionId) {
+        return runInAdmissionContext(admissions.get(operationId), next);
+      }
+      if (!operationId || agentSpans.has(operationId)) {
+        return next();
+      }
+
+      const openAgentSpan = () =>
+        startSpan(
+          {
+            name: `invoke_agent ${ctx.agentName ?? 'agent'}`,
+            op: getGenAiSpanOp('invoke_agent'),
+            attributes: {
+              [SENTRY_ORIGIN]: FLUE_ORIGIN,
+              [GEN_AI_OPERATION_NAME]: 'invoke_agent',
+              [GEN_AI_AGENT_NAME]: ctx.agentName,
+              [GEN_AI_CONVERSATION_ID]: ctx.conversationId,
+            },
+          },
+          async (span: Span) => {
+            agentSpans.set(operationId, span);
+            try {
+              return await next();
+            } finally {
+              agentSpans.delete(operationId);
+            }
+          },
+        );
+
+      // A durable or dispatched submission is run later by the coordinator, possibly in another
+      // isolate or process, where nothing links it back to the request that enqueued it. Flue
+      // replays that request's `traceparent` here, so continue from it — but only when no trace is
+      // already active, so an in-process dispatch keeps the trace it is genuinely part of.
+      const sentryTrace = ctx.traceCarrier?.traceparent
+        ? sentryTraceFromTraceparent(ctx.traceCarrier.traceparent)
+        : undefined;
+
+      return sentryTrace && !getActiveSpan()
+        ? continueTrace({ sentryTrace, baggage: undefined }, openAgentSpan)
+        : openAgentSpan();
+    },
+
+    observe: (observation, ctx) => {
+      // Observations are emitted synchronously from inside the agent operation, so the active span
+      // here is the agent span the interceptor opened — tool spans parent off it without any
+      // bookkeeping.
+      //
+      // The agent operation that gets the span is the one the observations reference, and it knows
+      // neither the agent's name nor the conversation: the submission wrapper carries the name, the
+      // re-entry carries the conversation, and neither opens a span. Both arrive here instead.
+      const agentSpan = observation.operationId ? agentSpans.get(observation.operationId) : undefined;
+      if (agentSpan) {
+        if (observation.conversationId) {
+          agentSpan.setAttribute(GEN_AI_CONVERSATION_ID, observation.conversationId);
+        }
+        if (observation.agentName) {
+          agentSpan.setAttribute(GEN_AI_AGENT_NAME, observation.agentName);
+          agentSpan.updateName(`invoke_agent ${observation.agentName}`);
+        }
+      }
+
+      switch (observation.type) {
+        // Emitted synchronously from inside the admitting call, so the active context is its own.
+        case 'submission_queued':
+          if (observation.submissionId && !isCloudflareWorkers()) {
+            admissions.set(observation.submissionId, {
+              isolationScope: getIsolationScope(),
+              span: getActiveSpan(),
+            });
+          }
+          return;
+        case 'submission_settled':
+          if (observation.submissionId) {
+            admissions.remove(observation.submissionId);
+          }
+          return;
+        case 'tool_start':
+          startToolSpan(observation, ctx, toolSpans, options);
+          return;
+        case 'tool':
+          endToolSpan(observation, toolSpans);
+          return;
+        default:
+          return;
+      }
+    },
+
+    // Only the tool spans are ended here. They come from `startInactiveSpan`, so nothing else will.
+    // The agent spans come from `startSpan`, which ends them when its callback settles — ending them
+    // here would stamp an early end time on work that is still running, and the later `end()` would
+    // be ignored.
+    dispose: () => {
+      for (const span of toolSpans.values()) {
+        span.end();
+      }
+      agentSpans.clear();
+      admissions.clear();
+      toolSpans.clear();
+    },
+  };
+}

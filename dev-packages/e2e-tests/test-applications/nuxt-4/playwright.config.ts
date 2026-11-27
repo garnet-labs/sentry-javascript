@@ -1,0 +1,48 @@
+import { getPlaywrightConfig, getRuntime } from '@sentry-internal/test-utils';
+
+// The static trace lifecycle variant sets this to `static`.
+process.env.E2E_TEST_TRACE_LIFECYCLE ??= 'stream';
+
+const testEnv = process.env.TEST_ENV;
+
+if (!testEnv) {
+  throw new Error('No test env defined');
+}
+
+// The server config is bundled into the Nitro output, so every runtime starts the server entry without a preload.
+const productionStartCommands = {
+  node: 'pnpm start',
+  bun: 'pnpm start:bun',
+  deno: 'pnpm start:deno',
+  cloudflare: 'pnpm start:cloudflare',
+};
+
+const getStartCommand = () => {
+  if (testEnv === 'development') {
+    // The Sentry server config is bundled into the dev server via a nitro plugin, so no preload is needed.
+    return 'nuxt dev -p 3030';
+  }
+
+  if (testEnv === 'production') {
+    return productionStartCommands[getRuntime()];
+  }
+
+  // Runs the suite with the compat shim preloaded, like existing `--import` deploy commands do.
+  if (testEnv === 'production-import') {
+    return 'pnpm start:import';
+  }
+
+  throw new Error(`Unknown test env: ${testEnv}`);
+};
+
+const config = getPlaywrightConfig({
+  startCommand: getStartCommand(),
+  // Nuxt opens its port before the development server can handle requests.
+  url: 'http://localhost:3030',
+});
+
+export default {
+  ...config,
+  globalSetup: './global-setup.mjs',
+  globalTeardown: './global-teardown.mjs',
+};

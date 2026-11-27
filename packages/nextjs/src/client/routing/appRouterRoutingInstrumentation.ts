@@ -1,0 +1,338 @@
+import type { Client, Span } from '@sentry/core';
+import {
+  GLOBAL_OBJ,
+  hasSpanStreamingEnabled,
+  isObjectLike,
+  NAVIGATION_SPAN_NAME_FALLBACK,
+  filterCollectedUrl,
+  timestampInSeconds,
+} from '@sentry/core';
+import {
+  startBrowserTracingNavigationSpan,
+  WINDOW,
+  getAbsoluteUrl,
+  resolveCurrentRoute,
+  resolveRoute,
+} from '@sentry/react';
+import { stripTrailingSlash } from './parameterization';
+import {
+  SENTRY_OP,
+  SENTRY_SEGMENT_NAME_SOURCE,
+  URL_FULL,
+  URL_PATH,
+  URL_TEMPLATE,
+  SENTRY_ORIGIN,
+  NAVIGATION_TYPE,
+} from '@sentry/conventions/attributes';
+import { NAVIGATION } from '@sentry/conventions/op';
+
+/**
+ * Unlike `getAbsoluteUrl`, keeps a `//host/path` target protocol-relative: Next.js treats such an
+ * href as an external URL and navigates to that host.
+ */
+function getNavigationTargetUrl(href: string): string {
+  // `router.push()` arguments reach this untyped, so a non-string must not throw here.
+  const isProtocolRelative = typeof href === 'string' && href.startsWith('//');
+  return getAbsoluteUrl(isProtocolRelative ? `${WINDOW.location.protocol}${href}` : href);
+}
+
+function setNavigationSpanUrlAttributes(span: Span, urlPath: string, urlOrPath: string): void {
+  span.setAttributes({
+    [URL_PATH]: urlPath,
+    [URL_FULL]: filterCollectedUrl(getNavigationTargetUrl(urlOrPath)),
+  });
+}
+
+/**
+ * `router.back()` and `router.forward()` carry no destination, so their navigation span can only be
+ * started once the resulting `popstate` event tells us where we ended up. Until then, this remembers
+ * which router method triggered the traversal and when, so the span still gets the router's
+ * navigation type and starts at the router call rather than at the `popstate`.
+ */
+interface PendingHistoryTraversal {
+  navigationType: 'router.back' | 'router.forward';
+  startTime: number;
+}
+
+let pendingHistoryTraversal: PendingHistoryTraversal | undefined;
+let pendingHistoryTraversalTimeout: ReturnType<typeof setTimeout> | undefined;
+
+/**
+ * A `back()`/`forward()` without a matching history entry never fires `popstate`. Without an expiry,
+ * a later unrelated `popstate` (e.g. the browser's back button) would be attributed to that stale
+ * router call. Browsers dispatch the `popstate` of a same-document traversal within a few
+ * milliseconds, so anything older than this is not the traversal we are waiting for. A timer rather
+ * than a timestamp comparison keeps this tolerant of a blocked main thread, which delays the
+ * `popstate` and the timer alike.
+ */
+const PENDING_HISTORY_TRAVERSAL_TIMEOUT_MS = 1000;
+
+function setPendingHistoryTraversal(navigationType: PendingHistoryTraversal['navigationType']): void {
+  clearTimeout(pendingHistoryTraversalTimeout);
+  pendingHistoryTraversal = { navigationType, startTime: timestampInSeconds() };
+  pendingHistoryTraversalTimeout = setTimeout(() => {
+    pendingHistoryTraversal = undefined;
+  }, PENDING_HISTORY_TRAVERSAL_TIMEOUT_MS);
+}
+
+function takePendingHistoryTraversal(): PendingHistoryTraversal | undefined {
+  clearTimeout(pendingHistoryTraversalTimeout);
+  const traversal = pendingHistoryTraversal;
+  pendingHistoryTraversal = undefined;
+  return traversal;
+}
+
+/**
+ * This mutable keeps track of what router navigation instrumentation mechanism we are using.
+ *
+ * The default one is 'router-patch' which is a way of instrumenting that worked up until Next.js 15.3.0 was released.
+ * For this method we took the global router instance and simply monkey patched all the router methods like push(), replace(), and so on.
+ * This worked because Next.js itself called the router methods for things like the <Link /> component.
+ * Vercel decided that it is not good to call these public API methods from within the framework so they switched to an internal system that completely bypasses our monkey patching. This happened in 15.3.0.
+ *
+ * We raised with Vercel that this breaks our SDK so together with them we came up with an API for `instrumentation-client.ts` called `onRouterTransitionStart` that is called whenever a navigation is kicked off.
+ *
+ * Now we have the problem of version compatibility.
+ * For older Next.js versions we cannot use the new hook so we need to always patch the router.
+ * For newer Next.js versions we cannot know whether the user actually registered our handler for the `onRouterTransitionStart` hook, so we need to wait until it was called at least once before switching the instrumentation mechanism.
+ * The problem is, that the user may still have registered a hook and then call a patched router method.
+ * First, the monkey patched router method will be called, starting a navigation span, then the hook will also called.
+ * We need to handle this case and not create two separate navigation spans but instead update the current navigation span and then switch to the new instrumentation mode.
+ * This is all denoted by this `navigationRoutingMode` variable.
+ */
+let navigationRoutingMode: 'router-patch' | 'transition-start-hook' = 'router-patch';
+
+const currentRouterPatchingNavigationSpanRef: NavigationSpanRef = { current: undefined };
+
+interface NavigationSpanRef {
+  current: Span | undefined;
+}
+
+interface NextRouter {
+  back: () => void;
+  forward: () => void;
+  push: (target: string) => void;
+  replace: (target: string) => void;
+}
+
+// Yes, yes, I know we shouldn't depend on these internals. But that's where we are at. We write the ugly code, so you don't have to.
+const GLOBAL_OBJ_WITH_NEXT_ROUTER = GLOBAL_OBJ as typeof GLOBAL_OBJ & {
+  // Available from 13.4.4-canary.4 - https://github.com/vercel/next.js/pull/50210
+  next?: {
+    router?: NextRouter;
+  };
+};
+
+const globalWithInjectedBasePath = GLOBAL_OBJ as typeof GLOBAL_OBJ & {
+  _sentryBasePath: string | undefined;
+};
+
+/*
+ * The routing instrumentation needs to handle a few cases:
+ * - Router operations:
+ *  - router.push() (either explicitly called or implicitly through <Link /> tags)
+ *  - router.replace() (either explicitly called or implicitly through <Link replace /> tags)
+ *  - router.back()
+ *  - router.forward()
+ * - Browser operations:
+ *  - native Browser-back / popstate event (implicitly called by router.back())
+ *  - native Browser-forward / popstate event (implicitly called by router.forward())
+ */
+
+/** Instruments the Next.js app router for navigation. */
+export function appRouterInstrumentNavigation(client: Client): void {
+  routerTransitionHandler = (href, navigationType) => {
+    const basePath = process.env._sentryBasePath ?? globalWithInjectedBasePath._sentryBasePath;
+    const normalizedHref = basePath && href.startsWith('/') && !href.startsWith(basePath) ? `${basePath}${href}` : href;
+    const unparameterizedPathname = stripTrailingSlash(new URL(normalizedHref, WINDOW.location.href).pathname);
+    const parameterizedPathname = resolveRoute(normalizedHref, client);
+    // With span streaming, span names have to be low cardinality, so we can't fall back to the URL.
+    const spanName =
+      parameterizedPathname ??
+      (hasSpanStreamingEnabled(client) ? NAVIGATION_SPAN_NAME_FALLBACK : unparameterizedPathname);
+
+    if (navigationRoutingMode === 'router-patch') {
+      navigationRoutingMode = 'transition-start-hook';
+    }
+
+    const currentNavigationSpan = currentRouterPatchingNavigationSpanRef.current;
+    if (currentNavigationSpan) {
+      currentNavigationSpan.updateName(spanName);
+      currentNavigationSpan.setAttributes({
+        // oxlint-disable-next-line typescript/no-deprecated -- Preserve the existing attribute name.
+        [NAVIGATION_TYPE]: `router.${navigationType}`,
+        [SENTRY_SEGMENT_NAME_SOURCE]: parameterizedPathname ? 'route' : 'url',
+        ...(parameterizedPathname && { [URL_TEMPLATE]: parameterizedPathname }),
+      });
+      setNavigationSpanUrlAttributes(currentNavigationSpan, unparameterizedPathname, normalizedHref);
+      currentRouterPatchingNavigationSpanRef.current = undefined;
+    } else {
+      startBrowserTracingNavigationSpan(
+        client,
+        {
+          name: spanName,
+          attributes: {
+            [SENTRY_OP]: NAVIGATION,
+            [SENTRY_ORIGIN]: 'auto.navigation.nextjs.app_router_instrumentation',
+            [SENTRY_SEGMENT_NAME_SOURCE]: parameterizedPathname ? 'route' : 'url',
+            // oxlint-disable-next-line typescript/no-deprecated -- Preserve the existing attribute name.
+            [NAVIGATION_TYPE]: `router.${navigationType}`,
+            [URL_TEMPLATE]: parameterizedPathname,
+          },
+        },
+        { url: getNavigationTargetUrl(normalizedHref) },
+      );
+    }
+  };
+
+  WINDOW.addEventListener('popstate', () => {
+    const pathname = stripTrailingSlash(WINDOW.location.pathname);
+    const parameterizedPathname = resolveCurrentRoute(client);
+    // With span streaming, span names have to be low cardinality, so we can't fall back to the URL.
+    const spanName =
+      parameterizedPathname ?? (hasSpanStreamingEnabled(client) ? NAVIGATION_SPAN_NAME_FALLBACK : pathname);
+    const traversal = takePendingHistoryTraversal();
+    // A traversal triggered through the router always gets its own span: an open router-patch span
+    // here would be a `push()`/`replace()` that the user navigated away from again.
+    if (!traversal && currentRouterPatchingNavigationSpanRef.current?.isRecording()) {
+      currentRouterPatchingNavigationSpanRef.current.updateName(spanName);
+      currentRouterPatchingNavigationSpanRef.current.setAttribute(
+        SENTRY_SEGMENT_NAME_SOURCE,
+        parameterizedPathname ? 'route' : 'url',
+      );
+      if (parameterizedPathname) {
+        currentRouterPatchingNavigationSpanRef.current.setAttribute(URL_TEMPLATE, parameterizedPathname);
+      }
+      setNavigationSpanUrlAttributes(currentRouterPatchingNavigationSpanRef.current, pathname, WINDOW.location.href);
+    } else {
+      currentRouterPatchingNavigationSpanRef.current = startBrowserTracingNavigationSpan(
+        client,
+        {
+          name: spanName,
+          startTime: traversal?.startTime,
+          attributes: {
+            [SENTRY_ORIGIN]: 'auto.navigation.nextjs.app_router_instrumentation',
+            [SENTRY_SEGMENT_NAME_SOURCE]: parameterizedPathname ? 'route' : 'url',
+            // oxlint-disable-next-line typescript/no-deprecated -- Preserve the existing attribute name.
+            [NAVIGATION_TYPE]: traversal?.navigationType ?? 'browser.popstate',
+            [URL_TEMPLATE]: parameterizedPathname,
+          },
+        },
+        // The full location rather than just the pathname, so the span's `url.full` keeps the
+        // (filtered) query string like the update path above does.
+        { url: WINDOW.location.href },
+      );
+    }
+  });
+
+  let routerPatched = false;
+  let triesToFindRouter = 0;
+  const MAX_TRIES_TO_FIND_ROUTER = 500;
+  const ROUTER_AVAILABILITY_CHECK_INTERVAL_MS = 20;
+  const checkForRouterAvailabilityInterval = setInterval(() => {
+    triesToFindRouter++;
+    const router = GLOBAL_OBJ_WITH_NEXT_ROUTER?.next?.router;
+
+    if (routerPatched || triesToFindRouter > MAX_TRIES_TO_FIND_ROUTER) {
+      clearInterval(checkForRouterAvailabilityInterval);
+    } else if (router) {
+      clearInterval(checkForRouterAvailabilityInterval);
+      routerPatched = true;
+
+      patchRouter(client, router, currentRouterPatchingNavigationSpanRef);
+
+      // If the router at any point gets overridden - patch again
+      const globalValue = GLOBAL_OBJ_WITH_NEXT_ROUTER.next;
+      if (globalValue) {
+        GLOBAL_OBJ_WITH_NEXT_ROUTER.next = new Proxy(globalValue, {
+          set(target, p, newValue) {
+            if (p === 'router' && isObjectLike(newValue)) {
+              patchRouter(client, newValue as unknown as NextRouter, currentRouterPatchingNavigationSpanRef);
+            }
+
+            // @ts-expect-error we cannot possibly type this
+            target[p] = newValue;
+            return true;
+          },
+        });
+      }
+    }
+  }, ROUTER_AVAILABILITY_CHECK_INTERVAL_MS);
+}
+
+function transactionNameifyRouterArgument(target: string): string {
+  try {
+    // We provide an arbitrary base because we only care about the pathname and it makes URL parsing more resilient.
+    return new URL(target, 'http://example.com/').pathname;
+  } catch {
+    return '/';
+  }
+}
+
+const patchedRouters = new WeakSet<NextRouter>();
+
+function patchRouter(client: Client, router: NextRouter, currentNavigationSpanRef: NavigationSpanRef): void {
+  if (patchedRouters.has(router)) {
+    return;
+  }
+  patchedRouters.add(router);
+
+  (['back', 'forward', 'push', 'replace'] as const).forEach(routerFunctionName => {
+    if (router?.[routerFunctionName]) {
+      // @ts-expect-error Weird type error related to not knowing how to associate return values with the individual functions - we can just ignore
+      router[routerFunctionName] = new Proxy(router[routerFunctionName], {
+        apply(target, thisArg, argArray) {
+          if (navigationRoutingMode !== 'router-patch') {
+            return target.apply(thisArg, argArray);
+          }
+
+          if (routerFunctionName === 'back' || routerFunctionName === 'forward') {
+            setPendingHistoryTraversal(`router.${routerFunctionName}`);
+            return target.apply(thisArg, argArray);
+          }
+
+          const href = argArray[0];
+          const basePath = process.env._sentryBasePath ?? globalWithInjectedBasePath._sentryBasePath;
+          const normalizedHref =
+            basePath && typeof href === 'string' && href.startsWith('/') && !href.startsWith(basePath)
+              ? `${basePath}${href}`
+              : href;
+          const transactionName = stripTrailingSlash(transactionNameifyRouterArgument(normalizedHref));
+          const parameterizedPathname = resolveRoute(transactionName, client);
+
+          currentNavigationSpanRef.current = startBrowserTracingNavigationSpan(
+            client,
+            {
+              // With span streaming, span names have to be low cardinality, so we can't fall back to the URL.
+              name:
+                parameterizedPathname ??
+                (hasSpanStreamingEnabled(client) ? NAVIGATION_SPAN_NAME_FALLBACK : transactionName),
+              attributes: {
+                [SENTRY_OP]: NAVIGATION,
+                [SENTRY_ORIGIN]: 'auto.navigation.nextjs.app_router_instrumentation',
+                [SENTRY_SEGMENT_NAME_SOURCE]: parameterizedPathname ? 'route' : 'url',
+                // oxlint-disable-next-line typescript/no-deprecated -- Preserve the existing attribute name.
+                [NAVIGATION_TYPE]: `router.${routerFunctionName}`,
+                [URL_TEMPLATE]: parameterizedPathname,
+              },
+            },
+            { url: getNavigationTargetUrl(normalizedHref) },
+          );
+
+          return target.apply(thisArg, argArray);
+        },
+      });
+    }
+  });
+}
+
+let routerTransitionHandler: undefined | ((href: string, navigationType: string) => void) = undefined;
+
+/**
+ * A handler for Next.js' `onRouterTransitionStart` hook in `instrumentation-client.ts` to record navigation spans in Sentry.
+ */
+export function captureRouterTransitionStart(href: string, navigationType: string): void {
+  if (routerTransitionHandler) {
+    routerTransitionHandler(href, navigationType);
+  }
+}

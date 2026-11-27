@@ -1,0 +1,276 @@
+import { getClient, startInactiveSpan } from '@sentry/browser';
+import type { Span } from '@sentry/core';
+import {
+  hasSpanStreamingEnabled,
+  spanToJSON,
+  timestampInSeconds,
+  UI_MOUNT_SPAN_NAME_FALLBACK,
+  UI_RENDER_SPAN_NAME_FALLBACK,
+  UI_UPDATE_SPAN_NAME_FALLBACK,
+  withActiveSpan,
+} from '@sentry/core';
+import { SENTRY_DESCRIPTION, SENTRY_OP, UI_COMPONENT_NAME, SENTRY_ORIGIN } from '@sentry/conventions/attributes';
+import { UI_MOUNT, UI_RENDER, UI_UPDATE } from '@sentry/conventions/op';
+import * as React from 'react';
+import { hoistNonReactStatics } from './hoist-non-react-statics';
+
+export const UNKNOWN_COMPONENT = 'unknown';
+
+export type ProfilerProps = {
+  // The name of the component being profiled.
+  name: string;
+  // If the Profiler is disabled. False by default. This is useful if you want to disable profilers
+  // in certain environments.
+  disabled?: boolean;
+  // If time component is on page should be displayed as spans. True by default.
+  includeRender?: boolean;
+  // If component updates should be displayed as spans. True by default.
+  includeUpdates?: boolean;
+  // Component that is being profiled.
+  children?: React.ReactNode;
+  // props given to component being profiled.
+  updateProps: { [key: string]: unknown };
+};
+
+/**
+ * The Profiler component leverages Sentry's Tracing integration to generate
+ * spans based on component lifecycles.
+ */
+class Profiler extends React.Component<ProfilerProps> {
+  /**
+   * The span of the mount activity
+   * Made protected for the React Native SDK to access
+   */
+  protected _mountSpan: Span | undefined;
+  /**
+   * The span that represents the duration of time between shouldComponentUpdate and componentDidUpdate
+   */
+  protected _updateSpan: Span | undefined;
+
+  public constructor(props: ProfilerProps) {
+    super(props);
+    const { name, disabled = false } = this.props;
+
+    if (disabled) {
+      return;
+    }
+
+    const client = getClient();
+    const hasSpanStreaming = !!client && hasSpanStreamingEnabled(client);
+    const description = `<${name}>`;
+    const componentName = name === UNKNOWN_COMPONENT ? undefined : name;
+
+    this._mountSpan = startInactiveSpan({
+      name: hasSpanStreaming ? componentName || UI_MOUNT_SPAN_NAME_FALLBACK : description,
+      onlyIfParent: true,
+      attributes: {
+        [SENTRY_OP]: UI_MOUNT,
+        [SENTRY_ORIGIN]: 'auto.ui.react.profiler',
+        [UI_COMPONENT_NAME]: componentName || undefined,
+        ...(hasSpanStreaming && { [SENTRY_DESCRIPTION]: description }),
+      },
+    });
+  }
+
+  // If a component mounted, we can finish the mount activity.
+  public componentDidMount(): void {
+    if (this._mountSpan) {
+      this._mountSpan.end();
+    }
+  }
+
+  public shouldComponentUpdate({ updateProps, includeUpdates = true }: ProfilerProps): boolean {
+    // Only generate an update span if includeUpdates is true, if there is a valid mountSpan,
+    // and if the updateProps have changed. It is ok to not do a deep equality check here as it is expensive.
+    // We are just trying to give baseline clues for further investigation.
+    if (includeUpdates && this._mountSpan && updateProps !== this.props.updateProps) {
+      // See what props have changed between the previous props, and the current props. This is
+      // set as data on the span. We just store the prop keys as the values could be potentially very large.
+      const changedProps = Object.keys(updateProps).filter(k => updateProps[k] !== this.props.updateProps[k]);
+      if (changedProps.length > 0) {
+        const now = timestampInSeconds();
+        this._updateSpan = withActiveSpan(this._mountSpan, () => {
+          const client = getClient();
+          const hasSpanStreaming = !!client && hasSpanStreamingEnabled(client);
+          const description = `<${this.props.name}>`;
+          const componentName = this.props.name === UNKNOWN_COMPONENT ? undefined : this.props.name;
+
+          return startInactiveSpan({
+            name: hasSpanStreaming ? componentName || UI_UPDATE_SPAN_NAME_FALLBACK : description,
+            onlyIfParent: true,
+            startTime: now,
+            attributes: {
+              [SENTRY_OP]: UI_UPDATE,
+              [SENTRY_ORIGIN]: 'auto.ui.react.profiler',
+              [UI_COMPONENT_NAME]: componentName || undefined,
+              'ui.react.changed_props': changedProps,
+              ...(hasSpanStreaming && { [SENTRY_DESCRIPTION]: description }),
+            },
+          });
+        });
+      }
+    }
+
+    return true;
+  }
+
+  public componentDidUpdate(): void {
+    if (this._updateSpan) {
+      this._updateSpan.end();
+      this._updateSpan = undefined;
+    }
+  }
+
+  // If a component is unmounted, we can say it is no longer on the screen.
+  // This means we can finish the span representing the component render.
+  public componentWillUnmount(): void {
+    const endTimestamp = timestampInSeconds();
+    const { name, includeRender = true } = this.props;
+
+    if (this._mountSpan && includeRender) {
+      const startTime = spanToJSON(this._mountSpan).end_timestamp;
+      withActiveSpan(this._mountSpan, () => {
+        const client = getClient();
+        const hasSpanStreaming = !!client && hasSpanStreamingEnabled(client);
+        const description = `<${name}>`;
+        const componentName = name === UNKNOWN_COMPONENT ? undefined : name;
+
+        const renderSpan = startInactiveSpan({
+          onlyIfParent: true,
+          name: hasSpanStreaming ? componentName || UI_RENDER_SPAN_NAME_FALLBACK : description,
+          startTime,
+          attributes: {
+            [SENTRY_OP]: UI_RENDER,
+            [SENTRY_ORIGIN]: 'auto.ui.react.profiler',
+            [UI_COMPONENT_NAME]: componentName || undefined,
+            ...(hasSpanStreaming && { [SENTRY_DESCRIPTION]: description }),
+          },
+        });
+        if (renderSpan) {
+          // Have to cast to Span because the type of _mountSpan is Span | undefined
+          // and not getting narrowed properly
+          renderSpan.end(endTimestamp);
+        }
+      });
+    }
+  }
+
+  public render(): React.ReactNode {
+    return this.props.children;
+  }
+}
+
+// React.Component default props are defined as static property on the class
+Object.assign(Profiler, {
+  defaultProps: {
+    disabled: false,
+    includeRender: true,
+    includeUpdates: true,
+  },
+});
+
+/**
+ * withProfiler is a higher order component that wraps a
+ * component in a {@link Profiler} component. It is recommended that
+ * the higher order component be used over the regular {@link Profiler} component.
+ *
+ * @param WrappedComponent component that is wrapped by Profiler
+ * @param options the {@link ProfilerProps} you can pass into the Profiler
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function withProfiler<P extends Record<string, any>>(
+  WrappedComponent: React.ComponentType<P>,
+  // We do not want to have `updateProps` given in options, it is instead filled through the HOC.
+  options?: Pick<Partial<ProfilerProps>, Exclude<keyof ProfilerProps, 'updateProps' | 'children'>>,
+): React.FC<P> {
+  const componentDisplayName =
+    options?.name || WrappedComponent.displayName || WrappedComponent.name || UNKNOWN_COMPONENT;
+
+  const Wrapped: React.FC<P> = (props: P) => (
+    <Profiler {...options} name={componentDisplayName} updateProps={props}>
+      <WrappedComponent {...props} />
+    </Profiler>
+  );
+
+  Wrapped.displayName = `profiler(${componentDisplayName})`;
+
+  // Copy over static methods from Wrapped component to Profiler HOC
+  // See: https://reactjs.org/docs/higher-order-components.html#static-methods-must-be-copied-over
+  hoistNonReactStatics(Wrapped, WrappedComponent);
+  return Wrapped;
+}
+
+/**
+ *
+ * `useProfiler` is a React hook that profiles a React component.
+ *
+ * @param name displayName of component being profiled
+ */
+function useProfiler(
+  name: string,
+  options: { disabled?: boolean; hasRenderSpan?: boolean } = {
+    disabled: false,
+    hasRenderSpan: true,
+  },
+): void {
+  const [mountSpan] = React.useState(() => {
+    if (options?.disabled) {
+      return undefined;
+    }
+
+    const client = getClient();
+    const hasSpanStreaming = !!client && hasSpanStreamingEnabled(client);
+    const description = `<${name}>`;
+    const componentName = name === UNKNOWN_COMPONENT ? undefined : name;
+
+    return startInactiveSpan({
+      name: hasSpanStreaming ? componentName || UI_MOUNT_SPAN_NAME_FALLBACK : description,
+      onlyIfParent: true,
+      attributes: {
+        [SENTRY_OP]: UI_MOUNT,
+        [SENTRY_ORIGIN]: 'auto.ui.react.profiler',
+        [UI_COMPONENT_NAME]: componentName || undefined,
+        ...(hasSpanStreaming && { [SENTRY_DESCRIPTION]: description }),
+      },
+    });
+  });
+
+  React.useEffect(() => {
+    if (mountSpan) {
+      mountSpan.end();
+    }
+
+    return (): void => {
+      if (mountSpan && options.hasRenderSpan) {
+        const startTime = spanToJSON(mountSpan).end_timestamp;
+        const endTimestamp = timestampInSeconds();
+
+        const client = getClient();
+        const hasSpanStreaming = !!client && hasSpanStreamingEnabled(client);
+        const description = `<${name}>`;
+        const componentName = name === UNKNOWN_COMPONENT ? undefined : name;
+
+        const renderSpan = startInactiveSpan({
+          name: hasSpanStreaming ? componentName || UI_RENDER_SPAN_NAME_FALLBACK : description,
+          onlyIfParent: true,
+          startTime,
+          attributes: {
+            [SENTRY_OP]: UI_RENDER,
+            [SENTRY_ORIGIN]: 'auto.ui.react.profiler',
+            [UI_COMPONENT_NAME]: componentName || undefined,
+            ...(hasSpanStreaming && { [SENTRY_DESCRIPTION]: description }),
+          },
+        });
+        if (renderSpan) {
+          // Have to cast to Span because the type of _mountSpan is Span | undefined
+          // and not getting narrowed properly
+          renderSpan.end(endTimestamp);
+        }
+      }
+    };
+    // We only want this to run once.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+}
+
+export { Profiler, useProfiler, withProfiler };

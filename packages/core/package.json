@@ -1,0 +1,93 @@
+{
+  "name": "@sentry/core",
+  "version": "11.15.0",
+  "description": "Base implementation for all Sentry JavaScript SDKs",
+  "repository": "git://github.com/getsentry/sentry-javascript.git",
+  "homepage": "https://github.com/getsentry/sentry-javascript/tree/master/packages/core",
+  "author": "Sentry",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.19.0 <22.0.0 || >=22.12.0 <23.0.0 || >=23.2.0"
+  },
+  "files": [
+    "/build",
+    "browser.js",
+    "browser.d.ts",
+    "server.js",
+    "server.d.ts"
+  ],
+  "main": "build/cjs/index.js",
+  "module": "build/esm/index.js",
+  "types": "build/types/index.d.ts",
+  "exports": {
+    "./package.json": "./package.json",
+    "./server": {
+      "react-native": {
+        "types": "./build/types/server.d.ts",
+        "default": "./build/esm/server.js"
+      },
+      "import": {
+        "types": "./build/types/server.d.ts",
+        "default": "./build/esm/server.js"
+      },
+      "require": {
+        "types": "./build/types/server.d.ts",
+        "default": "./build/cjs/server.js"
+      }
+    },
+    "./browser": {
+      "react-native": {
+        "types": "./build/types/browser.d.ts",
+        "default": "./build/esm/browser.js"
+      },
+      "import": {
+        "types": "./build/types/browser.d.ts",
+        "default": "./build/esm/browser.js"
+      },
+      "require": {
+        "types": "./build/types/browser.d.ts",
+        "default": "./build/cjs/browser.js"
+      }
+    },
+    ".": {
+      "react-native": {
+        "types": "./build/types/index.d.ts",
+        "default": "./build/esm/index.js"
+      },
+      "import": {
+        "types": "./build/types/index.d.ts",
+        "default": "./build/esm/index.js"
+      },
+      "require": {
+        "types": "./build/types/index.d.ts",
+        "default": "./build/cjs/index.js"
+      }
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "pnpm run \"/^build:(transpile|types)$/\"",
+    "build:dev": "pnpm run build",
+    "build:transpile": "rolldown -c rollup.npm.config.mjs",
+    "build:types": "tsc -p tsconfig.types.json",
+    "build:tarball": "pnpm pack",
+    "clean": "node ../../scripts/rm.mjs build coverage sentry-core-*.tgz",
+    "lint:fix": "oxlint . --fix --type-aware",
+    "lint": "oxlint . --type-aware",
+    "lint:types": "oxlint src --type-aware --type-check",
+    "lint:es-compatibility": "node ../../scripts/es-check.mjs es2020",
+    "test": "vitest run",
+    "test:watch": "vitest --watch",
+    "yalc:publish": "pnpm dlx yalc publish --push --sig"
+  },
+  "sideEffects": false,
+  "devDependencies": {
+    "@sentry-internal/rollup-utils": "11.15.0",
+    "zod": "^4.6.7"
+  },
+  "dependencies": {
+    "@sentry/conventions": "^0.34.0"
+  }
+}

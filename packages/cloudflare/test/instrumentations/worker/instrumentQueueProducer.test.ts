@@ -1,0 +1,365 @@
+import type { Queue } from '@cloudflare/workers-types';
+import { MESSAGING_MESSAGE_BODY_SIZE } from '@sentry/conventions/attributes';
+import * as SentryCore from '@sentry/core';
+import { beforeEach, describe, expect, test, vi } from 'vitest';
+import { instrumentQueueProducer } from '../../../src/instrumentations/worker/instrumentQueueProducer';
+
+function createMockQueue(): Queue {
+  return {
+    send: vi.fn().mockResolvedValue(undefined),
+    sendBatch: vi.fn().mockResolvedValue(undefined),
+  } as unknown as Queue;
+}
+
+describe('instrumentQueueProducer', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    vi.clearAllMocks();
+  });
+
+  describe('send', () => {
+    test('forwards the call to the underlying queue', async () => {
+      const queue = createMockQueue();
+      const wrapped = instrumentQueueProducer(queue, 'MY_QUEUE');
+
+      await wrapped.send({ hello: 'world' }, { contentType: 'json' });
+
+      expect(queue.send).toHaveBeenCalledTimes(1);
+      expect(queue.send).toHaveBeenLastCalledWith({ hello: 'world' }, { contentType: 'json' });
+    });
+
+    test('does not add trace context by default', async () => {
+      vi.spyOn(SentryCore, 'getTraceData').mockReturnValue({
+        'sentry-trace': '1234567890abcdef1234567890abcdef-1234567890abcdef-1',
+      });
+      const queue = createMockQueue();
+      const wrapped = instrumentQueueProducer(queue, 'BILLING_QUEUE');
+      const message = { invoiceId: 'inv_123' };
+
+      await wrapped.send(message);
+
+      expect(queue.send).toHaveBeenCalledTimes(1);
+      expect(queue.send).toHaveBeenLastCalledWith(message, undefined);
+    });
+
+    test('adds trace context to object payloads', async () => {
+      vi.spyOn(SentryCore, 'getTraceData').mockReturnValue({
+        'sentry-trace': '1234567890abcdef1234567890abcdef-1234567890abcdef-1',
+        baggage: 'sentry-release=1.0.0',
+      });
+      const queue = createMockQueue();
+      const wrapped = instrumentQueueProducer(queue, 'BILLING_QUEUE', true);
+      const message = { invoiceId: 'inv_123' };
+
+      await wrapped.send(message);
+
+      expect(queue.send).toHaveBeenCalledTimes(1);
+      expect(queue.send).toHaveBeenLastCalledWith(
+        {
+          invoiceId: 'inv_123',
+          __sentry_queue_trace__: '1234567890abcdef1234567890abcdef-1234567890abcdef-1',
+        },
+        undefined,
+      );
+      expect(message).toEqual({ invoiceId: 'inv_123' });
+    });
+
+    test('includes injected trace context in body size', async () => {
+      const setAttribute = vi.fn();
+      vi.spyOn(SentryCore, 'startSpan').mockImplementation(((_options, callback) =>
+        callback({ setAttribute } as unknown as SentryCore.Span)) as typeof SentryCore.startSpan);
+      vi.spyOn(SentryCore, 'getTraceData').mockReturnValue({
+        'sentry-trace': '1234567890abcdef1234567890abcdef-1234567890abcdef-1',
+      });
+      const queue = createMockQueue();
+      const wrapped = instrumentQueueProducer(queue, 'BILLING_QUEUE', true);
+
+      await wrapped.send({ invoiceId: 'inv_123' });
+
+      const sentBody = {
+        invoiceId: 'inv_123',
+        __sentry_queue_trace__: '1234567890abcdef1234567890abcdef-1234567890abcdef-1',
+      };
+      expect(queue.send).toHaveBeenCalledExactlyOnceWith(sentBody, undefined);
+      expect(setAttribute).toHaveBeenCalledExactlyOnceWith(
+        MESSAGING_MESSAGE_BODY_SIZE,
+        new TextEncoder().encode(JSON.stringify(sentBody)).byteLength,
+      );
+    });
+
+    test('preserves an existing metadata field', async () => {
+      vi.spyOn(SentryCore, 'getTraceData').mockReturnValue({
+        'sentry-trace': '1234567890abcdef1234567890abcdef-1234567890abcdef-1',
+      });
+      const queue = createMockQueue();
+      const wrapped = instrumentQueueProducer(queue, 'BILLING_QUEUE', true);
+      const message = {
+        invoiceId: 'inv_123',
+        __sentry_queue_trace__: 'abcdefabcdefabcdefabcdefabcdefab-fedcbafedcbafedc-0',
+      };
+
+      await wrapped.send(message);
+
+      expect(queue.send).toHaveBeenCalledTimes(1);
+      expect(queue.send).toHaveBeenLastCalledWith(message, undefined);
+    });
+
+    test('does not add trace context to array payloads', async () => {
+      vi.spyOn(SentryCore, 'getTraceData').mockReturnValue({
+        'sentry-trace': '1234567890abcdef1234567890abcdef-1234567890abcdef-1',
+      });
+      const queue = createMockQueue();
+      const wrapped = instrumentQueueProducer(queue, 'BILLING_QUEUE', true);
+      const message = [{ invoiceId: 'inv_123' }];
+
+      await wrapped.send(message);
+
+      expect(queue.send).toHaveBeenCalledTimes(1);
+      expect(queue.send).toHaveBeenLastCalledWith(message, undefined);
+    });
+
+    test('does not add trace context to binary payloads', async () => {
+      vi.spyOn(SentryCore, 'getTraceData').mockReturnValue({
+        'sentry-trace': '1234567890abcdef1234567890abcdef-1234567890abcdef-1',
+      });
+      const queue = createMockQueue();
+      const wrapped = instrumentQueueProducer(queue, 'BILLING_QUEUE', true);
+      const message = new ArrayBuffer(42);
+
+      await wrapped.send(message);
+
+      expect(queue.send).toHaveBeenCalledTimes(1);
+      expect(queue.send).toHaveBeenLastCalledWith(message, undefined);
+    });
+
+    test('starts a queue.publish span with messaging attributes', async () => {
+      const startSpanSpy = vi.spyOn(SentryCore, 'startSpan');
+      const queue = createMockQueue();
+      const wrapped = instrumentQueueProducer(queue, 'MY_QUEUE');
+
+      await wrapped.send('hello');
+
+      expect(startSpanSpy).toHaveBeenCalledTimes(1);
+      const [spanCtx] = startSpanSpy.mock.calls[0]!;
+      expect(spanCtx).toMatchObject({
+        name: 'send MY_QUEUE',
+        attributes: {
+          'messaging.system': 'cloudflare',
+          'messaging.destination.name': 'MY_QUEUE',
+          'messaging.operation.type': 'send',
+          'messaging.operation.name': 'send',
+          'messaging.message.body.size': 5,
+          'sentry.op': 'queue.publish',
+          'sentry.origin': 'auto.faas.cloudflare.queue',
+        },
+      });
+    });
+
+    test('computes body size for object payloads via JSON.stringify', async () => {
+      const startSpanSpy = vi.spyOn(SentryCore, 'startSpan');
+      const queue = createMockQueue();
+      const wrapped = instrumentQueueProducer(queue, 'MY_QUEUE');
+
+      await wrapped.send({ a: 1 });
+
+      const attrs = startSpanSpy.mock.calls[0]![0].attributes!;
+      expect(attrs['messaging.message.body.size']).toBe(JSON.stringify({ a: 1 }).length);
+    });
+
+    test('computes body size for ArrayBuffer payloads', async () => {
+      const startSpanSpy = vi.spyOn(SentryCore, 'startSpan');
+      const queue = createMockQueue();
+      const wrapped = instrumentQueueProducer(queue, 'MY_QUEUE');
+
+      const buf = new ArrayBuffer(42);
+      await wrapped.send(buf);
+
+      const attrs = startSpanSpy.mock.calls[0]![0].attributes!;
+      expect(attrs['messaging.message.body.size']).toBe(42);
+    });
+
+    test('omits body size when payload cannot be serialized', async () => {
+      const startSpanSpy = vi.spyOn(SentryCore, 'startSpan');
+      const queue = createMockQueue();
+      const wrapped = instrumentQueueProducer(queue, 'MY_QUEUE');
+
+      // Circular reference - JSON.stringify throws
+      const circular: Record<string, unknown> = {};
+      circular.self = circular;
+      await wrapped.send(circular);
+
+      const attrs = startSpanSpy.mock.calls[0]![0].attributes!;
+      expect(attrs['messaging.message.body.size']).toBeUndefined();
+    });
+  });
+
+  describe('sendBatch', () => {
+    test('forwards the call to the underlying queue', async () => {
+      const queue = createMockQueue();
+      const wrapped = instrumentQueueProducer(queue, 'MY_QUEUE');
+
+      await wrapped.sendBatch([{ body: 'a' }, { body: 'b' }]);
+
+      expect(queue.sendBatch).toHaveBeenCalledTimes(1);
+    });
+
+    test('adds the publish span context to every object body', async () => {
+      vi.spyOn(SentryCore, 'getTraceData').mockReturnValue({
+        'sentry-trace': 'abcdefabcdefabcdefabcdefabcdefab-fedcbafedcbafedc-0',
+        baggage: 'sentry-environment=production',
+      });
+      const queue = createMockQueue();
+      const wrapped = instrumentQueueProducer(queue, 'BILLING_QUEUE', true);
+
+      await wrapped.sendBatch(
+        [
+          { body: { invoiceId: 'inv_123' }, contentType: 'json' },
+          { body: { invoiceId: 'inv_456' }, delaySeconds: 10 },
+        ],
+        { delaySeconds: 5 },
+      );
+
+      expect(queue.sendBatch).toHaveBeenCalledTimes(1);
+      expect(queue.sendBatch).toHaveBeenLastCalledWith(
+        [
+          {
+            body: {
+              invoiceId: 'inv_123',
+              __sentry_queue_trace__: 'abcdefabcdefabcdefabcdefabcdefab-fedcbafedcbafedc-0',
+            },
+            contentType: 'json',
+          },
+          {
+            body: {
+              invoiceId: 'inv_456',
+              __sentry_queue_trace__: 'abcdefabcdefabcdefabcdefabcdefab-fedcbafedcbafedc-0',
+            },
+            delaySeconds: 10,
+          },
+        ],
+        { delaySeconds: 5 },
+      );
+    });
+
+    test('includes injected trace context in batch body size', async () => {
+      const setAttribute = vi.fn();
+      vi.spyOn(SentryCore, 'startSpan').mockImplementation(((_options, callback) =>
+        callback({ setAttribute } as unknown as SentryCore.Span)) as typeof SentryCore.startSpan);
+      vi.spyOn(SentryCore, 'getTraceData').mockReturnValue({
+        'sentry-trace': 'abcdefabcdefabcdefabcdefabcdefab-fedcbafedcbafedc-1',
+      });
+      const queue = createMockQueue();
+      const wrapped = instrumentQueueProducer(queue, 'BILLING_QUEUE', true);
+
+      await wrapped.sendBatch([{ body: { invoiceId: 'inv_123' } }, { body: { invoiceId: 'inv_456' } }]);
+
+      const sentTrace = 'abcdefabcdefabcdefabcdefabcdefab-fedcbafedcbafedc-1';
+      const sentMessages = [
+        { body: { invoiceId: 'inv_123', __sentry_queue_trace__: sentTrace } },
+        { body: { invoiceId: 'inv_456', __sentry_queue_trace__: sentTrace } },
+      ];
+      const expectedSize = sentMessages.reduce(
+        (total, message) => total + new TextEncoder().encode(JSON.stringify(message.body)).byteLength,
+        0,
+      );
+      expect(queue.sendBatch).toHaveBeenCalledExactlyOnceWith(sentMessages, undefined);
+      expect(setAttribute).toHaveBeenCalledExactlyOnceWith(MESSAGING_MESSAGE_BODY_SIZE, expectedSize);
+    });
+
+    test('starts a queue.publish span with batch attributes', async () => {
+      const startSpanSpy = vi.spyOn(SentryCore, 'startSpan');
+      const queue = createMockQueue();
+      const wrapped = instrumentQueueProducer(queue, 'MY_QUEUE');
+
+      await wrapped.sendBatch([{ body: 'aa' }, { body: 'bbb' }]);
+
+      expect(startSpanSpy).toHaveBeenCalledTimes(1);
+      const [spanCtx] = startSpanSpy.mock.calls[0]!;
+      expect(spanCtx).toMatchObject({
+        name: 'send MY_QUEUE',
+        attributes: {
+          'messaging.system': 'cloudflare',
+          'messaging.destination.name': 'MY_QUEUE',
+          'messaging.operation.type': 'send',
+          'messaging.operation.name': 'send',
+          'messaging.batch.message_count': 2,
+          'messaging.message.body.size': 5,
+          'sentry.op': 'queue.publish',
+          'sentry.origin': 'auto.faas.cloudflare.queue',
+        },
+      });
+    });
+
+    test('handles iterables (not just arrays)', async () => {
+      const queue = createMockQueue();
+      const wrapped = instrumentQueueProducer(queue, 'MY_QUEUE');
+
+      function* gen() {
+        yield { body: 'a' };
+        yield { body: 'b' };
+      }
+
+      await wrapped.sendBatch(gen());
+
+      expect(queue.sendBatch).toHaveBeenCalledTimes(1);
+      const passed = (queue.sendBatch as unknown as ReturnType<typeof vi.fn>).mock.calls[0]![0];
+      expect(Array.isArray(passed)).toBe(true);
+      expect(passed).toHaveLength(2);
+    });
+
+    test('omits body size when all payloads cannot be serialized', async () => {
+      const startSpanSpy = vi.spyOn(SentryCore, 'startSpan');
+      const queue = createMockQueue();
+      const wrapped = instrumentQueueProducer(queue, 'MY_QUEUE');
+
+      const circular1: Record<string, unknown> = {};
+      circular1.self = circular1;
+      const circular2: Record<string, unknown> = {};
+      circular2.self = circular2;
+
+      await wrapped.sendBatch([{ body: circular1 }, { body: circular2 }]);
+
+      const attrs = startSpanSpy.mock.calls[0]![0].attributes!;
+      expect(attrs['messaging.message.body.size']).toBeUndefined();
+    });
+
+    test('sums only sizable bodies when batch contains mixed payloads', async () => {
+      const startSpanSpy = vi.spyOn(SentryCore, 'startSpan');
+      const queue = createMockQueue();
+      const wrapped = instrumentQueueProducer(queue, 'MY_QUEUE');
+
+      const circular: Record<string, unknown> = {};
+      circular.self = circular;
+
+      await wrapped.sendBatch([{ body: 'aa' }, { body: circular }, { body: 'bbb' }]);
+
+      const attrs = startSpanSpy.mock.calls[0]![0].attributes!;
+      expect(attrs['messaging.message.body.size']).toBe(5);
+    });
+  });
+
+  test('forwards unknown property accesses transparently', () => {
+    const queue = Object.assign(createMockQueue(), {
+      customMethod: vi.fn().mockReturnValue('hi'),
+    }) as unknown as Queue & {
+      customMethod: () => string;
+    };
+    const wrapped = instrumentQueueProducer(queue, 'MY_QUEUE') as Queue & { customMethod: () => string };
+    expect(wrapped.customMethod()).toBe('hi');
+  });
+
+  test('calls pass-through methods with the underlying queue as `this`', async () => {
+    const metrics = { backlogCount: 3, backlogBytes: 42 };
+    const queue = Object.assign(createMockQueue(), {
+      metrics(this: unknown) {
+        if (this !== queue) {
+          throw new TypeError('Illegal invocation: function called with incorrect `this` reference.');
+        }
+        return Promise.resolve(metrics);
+      },
+    }) as unknown as Queue & { metrics: () => Promise<typeof metrics> };
+    const wrapped = instrumentQueueProducer(queue, 'MY_QUEUE') as typeof queue;
+
+    await expect(wrapped.metrics()).resolves.toEqual(metrics);
+  });
+});

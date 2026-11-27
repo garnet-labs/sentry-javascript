@@ -1,0 +1,175 @@
+import type { Page } from '@playwright/test';
+import { expect } from '@playwright/test';
+import { getSpanOp, waitForStreamedSpan } from '../../../../utils/spanUtils';
+import { sentryTest } from '../../../../utils/fixtures';
+import { envelopeRequestParser, waitForErrorRequest, shouldSkipTracingTest } from '../../../../utils/helpers';
+
+async function mockSupabaseAuthRoutesSuccess(page: Page) {
+  await page.route(/\/auth\/v1\/token\?grant_type=password/, route => {
+    return route.fulfill({
+      status: 200,
+      body: JSON.stringify({
+        access_token: 'test-access-token',
+        refresh_token: 'test-refresh-token',
+        token_type: 'bearer',
+        expires_in: 3600,
+        // `auth-js` rejects a token response without a user as `AuthInvalidTokenResponseError`,
+        // which would make `signInWithPassword` report an error instead of a successful sign-in.
+        user: {
+          id: '11111111-1111-1111-1111-111111111111',
+          aud: 'authenticated',
+          role: 'authenticated',
+          email: 'test@example.com',
+          created_at: '2024-01-01T00:00:00Z',
+          app_metadata: {},
+          user_metadata: {},
+        },
+      }),
+      headers: {
+        'Content-Type': 'application/json',
+      },
+    });
+  });
+
+  await page.route('**/auth/v1/logout**', route => {
+    return route.fulfill({
+      status: 200,
+      body: JSON.stringify({
+        message: 'Logged out',
+      }),
+      headers: {
+        'Content-Type': 'application/json',
+      },
+    });
+  });
+}
+
+async function mockSupabaseAuthRoutesFailure(page: Page) {
+  await page.route(/\/auth\/v1\/token\?grant_type=password/, route => {
+    return route.fulfill({
+      status: 400,
+      body: JSON.stringify({
+        error_description: 'Invalid email or password',
+        error: 'invalid_grant',
+      }),
+      headers: {
+        'Content-Type': 'application/json',
+      },
+    });
+  });
+
+  await page.route('**/auth/v1/logout**', route => {
+    return route.fulfill({
+      status: 400,
+      body: JSON.stringify({
+        error_description: 'Invalid refresh token',
+        error: 'invalid_grant',
+      }),
+      headers: {
+        'Content-Type': 'application/json',
+      },
+    });
+  });
+}
+
+const bundle = process.env.PW_BUNDLE || '';
+// We only want to run this in non-CDN bundle mode
+if (bundle.startsWith('bundle')) {
+  sentryTest.skip();
+}
+
+sentryTest('should capture Supabase authentication spans', async ({ getLocalTestUrl, page }) => {
+  if (shouldSkipTracingTest()) {
+    sentryTest.skip();
+  }
+
+  await mockSupabaseAuthRoutesSuccess(page);
+
+  const url = await getLocalTestUrl({ testDir: __dirname });
+
+  const rootSpanPromise = waitForStreamedSpan(page, span => span.is_segment && getSpanOp(span) === 'pageload');
+  const signInSpanPromise = waitForStreamedSpan(page, span => span.name === 'auth.signInWithPassword');
+  const signOutSpanPromise = waitForStreamedSpan(page, span => span.name === 'auth.signOut');
+  await page.goto(url);
+
+  const [rootSpan, signInSpan, signOutSpan] = await Promise.all([
+    rootSpanPromise,
+    signInSpanPromise,
+    signOutSpanPromise,
+  ]);
+
+  expect(signInSpan).toMatchObject({
+    name: 'auth.signInWithPassword',
+    parent_span_id: rootSpan.span_id,
+    span_id: expect.any(String),
+    start_timestamp: expect.any(Number),
+    end_timestamp: expect.any(Number),
+    trace_id: rootSpan.trace_id,
+    status: 'ok',
+    attributes: expect.objectContaining({
+      'sentry.op': { type: 'string', value: 'db' },
+      'sentry.origin': { type: 'string', value: 'auto.db.supabase' },
+      'db.operation.name': { type: 'string', value: 'auth.signInWithPassword' },
+      'db.system.name': { type: 'string', value: 'postgresql' },
+    }),
+  });
+
+  expect(signOutSpan).toMatchObject({
+    name: 'auth.signOut',
+    parent_span_id: rootSpan.span_id,
+    span_id: expect.any(String),
+    start_timestamp: expect.any(Number),
+    end_timestamp: expect.any(Number),
+    trace_id: rootSpan.trace_id,
+    status: 'ok',
+    attributes: expect.objectContaining({
+      'sentry.op': { type: 'string', value: 'db' },
+      'sentry.origin': { type: 'string', value: 'auto.db.supabase' },
+      'db.operation.name': { type: 'string', value: 'auth.signOut' },
+      'db.system.name': { type: 'string', value: 'postgresql' },
+    }),
+  });
+});
+
+sentryTest('should capture Supabase authentication errors', async ({ getLocalTestUrl, page }) => {
+  if (shouldSkipTracingTest()) {
+    sentryTest.skip();
+  }
+
+  await mockSupabaseAuthRoutesFailure(page);
+
+  const url = await getLocalTestUrl({ testDir: __dirname });
+
+  const rootSpanPromise = waitForStreamedSpan(page, span => span.is_segment && getSpanOp(span) === 'pageload');
+  const signInSpanPromise = waitForStreamedSpan(page, span => span.name === 'auth.signInWithPassword');
+  const errorRequestPromise = waitForErrorRequest(
+    page,
+    event => event.exception?.values?.[0]?.value === 'Invalid email or password',
+  );
+  await page.goto(url);
+
+  const [rootSpan, signInSpan, errorRequest] = await Promise.all([
+    rootSpanPromise,
+    signInSpanPromise,
+    errorRequestPromise,
+  ]);
+  const errorEvent = envelopeRequestParser(errorRequest);
+
+  expect(errorEvent.exception?.values?.[0].value).toBe('Invalid email or password');
+
+  expect(signInSpan).toMatchObject({
+    name: 'auth.signInWithPassword',
+    parent_span_id: rootSpan.span_id,
+    span_id: expect.any(String),
+    start_timestamp: expect.any(Number),
+    end_timestamp: expect.any(Number),
+    trace_id: rootSpan.trace_id,
+    status: 'error',
+    attributes: expect.objectContaining({
+      'sentry.op': { type: 'string', value: 'db' },
+      'sentry.origin': { type: 'string', value: 'auto.db.supabase' },
+      'db.operation.name': { type: 'string', value: 'auth.signInWithPassword' },
+      'db.system.name': { type: 'string', value: 'postgresql' },
+    }),
+  });
+});

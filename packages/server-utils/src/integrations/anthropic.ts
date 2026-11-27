@@ -1,0 +1,301 @@
+import { GEN_AI_REQUEST_MODEL, SENTRY_ORIGIN } from '@sentry/conventions/attributes';
+import * as diagnosticsChannel from '../utils/diagnosticsChannel';
+import type { IntegrationFn, Span, SpanAttributeValue } from '@sentry/core';
+import { defineIntegration, getActiveSpan, getClient, hasSpanStreamingEnabled, startInactiveSpan } from '@sentry/core';
+import { getGenAiSpanOp, getRequestSignal, markCancelledIfAborted, resolveGenAiCallRecording } from '../ai/core/utils';
+import { wrapApiPromiseResponse } from '../ai/core/apiPromise';
+import { type GenAiSpanResult, runGenAiSpanEnd, runGenAiSpanStart } from '../ai/core/span-hooks';
+import { addPrivateRequestAttributes, extractRequestAttributes } from '../ai/anthropic-ai';
+import { ANTHROPIC_AI_ORIGIN } from '../ai/anthropic-ai/constants';
+import { addResponseAttributes, getProviderName } from '../ai/anthropic-ai/utils';
+import { instrumentAsyncIterableStream, instrumentMessageStream } from '../ai/anthropic-ai/streaming';
+import { instrumentSessionToolRunner, instrumentToolRunner } from '../ai/anthropic-ai/tool-runner';
+import type { AnthropicAiCallInfo, AnthropicAiOptions, AnthropicAiResponse } from '../ai/anthropic-ai/types';
+import { shouldSkipAiProviderSpan } from '../ai/pi-ai/providers';
+import type { OrchestrionChannelContext } from '../orchestrion/types';
+import { CHANNELS } from '../orchestrion/channels';
+import { bindTracingChannelToSpan } from '../tracing-channel';
+import { anthropicAiModuleNames } from '../orchestrion/config/anthropic-ai';
+import { invokeOrchestrionInstrumentation } from '../orchestrion/instrumentation';
+
+// Same name as the OTel integration by design, so the OTel 'Anthropic_AI'
+// integration is deduplicated out of the default set.
+const INTEGRATION_NAME = 'Anthropic_AI' as const;
+
+// The recording decision is made once, when the span starts, in the caller's async context.
+type AnthropicChannelContext = OrchestrionChannelContext & {
+  _sentryRecordOutputs?: boolean;
+  _sentryOnSpanEnd?: (result: GenAiSpanResult<unknown>) => void;
+};
+
+// `stream` determines how the span is ended
+const INSTRUMENTED_CHANNELS = [
+  { channel: CHANNELS.ANTHROPIC_CHAT, operation: 'chat', stream: 'async-iterable' },
+  {
+    channel: CHANNELS.ANTHROPIC_MESSAGES_STREAM,
+    operation: 'chat',
+    stream: 'message-stream',
+  },
+] as const;
+
+type StreamMode = (typeof INSTRUMENTED_CHANNELS)[number]['stream'];
+
+const _anthropicAIIntegration = ((options: AnthropicAiOptions = {}) => {
+  return {
+    name: INTEGRATION_NAME,
+    setup(client) {
+      invokeOrchestrionInstrumentation(client, anthropicAiModuleNames, instrumentAnthropic, [options]);
+    },
+  };
+}) satisfies IntegrationFn;
+
+// Since 0.134 `@anthropic-ai/sdk` traces itself through the global OTel tracer provider, which duplicates our
+// spans. Only turned off once our channels subscribe, so an app we do not instrument keeps the SDK's spans.
+// A value the user set wins.
+function disableNativeTracing(): void {
+  try {
+    process.env.ANTHROPIC_OPEN_TELEMETRY ??= 'false';
+  } catch {
+    // `process` is absent (edge runtimes) or env access is gated (Deno without `--allow-env`).
+  }
+}
+
+function instrumentAnthropic(options: AnthropicAiOptions): void {
+  disableNativeTracing();
+  for (const { channel, operation, stream } of INSTRUMENTED_CHANNELS) {
+    bindTracingChannelToSpan(
+      diagnosticsChannel.tracingChannel<AnthropicChannelContext>(channel),
+      data => createGenAiSpan(data, operation, options, stream),
+      {
+        beforeSpanEnd: (span, data) => {
+          if ('error' in data) {
+            markCancelledIfAborted(span, getRequestSignal(data.arguments?.[1]));
+          }
+          addResponseAttributes(span, data.result as AnthropicAiResponse, !!data._sentryRecordOutputs);
+          data._sentryOnSpanEnd?.('error' in data ? { error: data.error } : { response: data.result });
+        },
+        deferSpanEnd: ({ span, data, end }) =>
+          wrapThreadStreamRequest(span, data, end) ||
+          wrapApiPromiseResponse(
+            data.result,
+            response => {
+              data.result = response;
+              if (!wrapStreamResult(span, data, stream)) {
+                end();
+              }
+            },
+            end,
+          ) ||
+          wrapStreamResult(span, data, stream),
+      },
+    );
+  }
+
+  diagnosticsChannel
+    .tracingChannel<OrchestrionChannelContext>(CHANNELS.ANTHROPIC_TOOL_RUNNER)
+    .end.subscribe(message => {
+      instrumentToolRunner((message as OrchestrionChannelContext).result, options);
+    });
+  diagnosticsChannel
+    .tracingChannel<OrchestrionChannelContext>(CHANNELS.ANTHROPIC_SESSION_TOOL_RUNNER)
+    .end.subscribe(message => {
+      instrumentSessionToolRunner((message as OrchestrionChannelContext).self, options);
+    });
+  // On `start`, because `_start()` sends the first request before it returns.
+  diagnosticsChannel
+    .tracingChannel<OrchestrionChannelContext>(CHANNELS.ANTHROPIC_THREAD_STREAM)
+    .start.subscribe(message => {
+      const data = message as OrchestrionChannelContext;
+      const stream = data.self as ThreadStream | undefined;
+      if (isMessageStream(stream) && stream.controller?.signal) {
+        // `_start(create, params, options)`: each `create()` gets only the stream's own signal, which doesn't carry
+        // the reason a caller's signal fired with.
+        threadStreams.set(stream.controller.signal, { stream, callerSignal: getRequestSignal(data.arguments?.[2]) });
+      }
+    });
+}
+
+/**
+ * Build the span for an instrumented call.
+ * Returning `undefined` opts the payload out so no span is opened.
+ */
+function createGenAiSpan(
+  data: AnthropicChannelContext,
+  operation: 'chat',
+  options: AnthropicAiOptions,
+  stream: StreamMode,
+): Span | undefined {
+  const args = data.arguments ?? [];
+
+  if (shouldSkipAiProviderSpan(INTEGRATION_NAME)) {
+    return undefined;
+  }
+
+  // `messages.stream()` internally calls the instrumented `messages.create({ stream: true })` tagged with
+  // a `stream` helper-method header. The messages-stream channel already covers it, so skip the nested
+  // create to avoid a duplicate span. Only the non-beta helper is on that channel, though:
+  // `beta.messages.stream()` and the streaming tool runner send the same header with no span covering
+  // them, so the header alone is not enough. Skip only while a stream-helper span of ours is active.
+  const requestOptions = args[1] as { headers?: unknown } | undefined;
+  if (isStreamHelperRequest(requestOptions?.headers) && isInsideStreamHelperSpan()) {
+    return undefined;
+  }
+
+  const params = typeof args[0] === 'object' && args[0] !== null ? (args[0] as Record<string, unknown>) : undefined;
+
+  const call: AnthropicAiCallInfo = { operation, request: params };
+  const { recordInputs, recordOutputs } = resolveGenAiCallRecording(options, call);
+  data._sentryRecordOutputs = recordOutputs;
+
+  const attributes = extractRequestAttributes(args, operation, recordInputs, getProviderName(data.self));
+  const model = (attributes[GEN_AI_REQUEST_MODEL] as string) || 'unknown';
+  attributes[SENTRY_ORIGIN] = ANTHROPIC_AI_ORIGIN;
+  const client = getClient();
+
+  const span = startInactiveSpan({
+    // With span streaming, omit the `'unknown'` model sentinel so the name stays low-cardinality.
+    name: model !== 'unknown' || !(client && hasSpanStreamingEnabled(client)) ? `${operation} ${model}` : operation,
+    op: getGenAiSpanOp(operation),
+    attributes: attributes as Record<string, SpanAttributeValue>,
+  });
+
+  if (recordInputs && params) {
+    addPrivateRequestAttributes(span, params);
+  }
+
+  runGenAiSpanStart(options, span, call);
+  data._sentryOnSpanEnd = result => runGenAiSpanEnd(options, span, call, result);
+
+  if (stream === 'message-stream') {
+    streamHelperSpans.add(span);
+  }
+
+  return span;
+}
+
+const STREAM_HELPER_METHOD_HEADER = 'x-stainless-helper-method';
+
+/** The spans opened for the messages-stream channel, i.e. for `messages.stream()` calls. */
+const streamHelperSpans = new WeakSet<Span>();
+
+/**
+ * Whether the active span is one this integration opened for `messages.stream()`. The helper's
+ * internal `create` runs inside that span, so this is what tells it apart from the beta helper and
+ * the tool runner, which send the same header but are not on the messages-stream channel.
+ */
+function isInsideStreamHelperSpan(): boolean {
+  const activeSpan = getActiveSpan();
+  return !!activeSpan && streamHelperSpans.has(activeSpan);
+}
+
+/**
+ * Whether request options carry the header the SDK's `messages.stream()` helper puts on its internal
+ * `create` call. The SDK sent it as `X-Stainless-Helper-Method` up to 0.105 and lowercase since 0.106, and
+ * HTTP header names are case-insensitive either way, so match without regard to case. The headers
+ * arrive as a plain object; a `Headers` instance is handled for completeness.
+ */
+function isStreamHelperRequest(headers: unknown): boolean {
+  if (!headers || typeof headers !== 'object') {
+    return false;
+  }
+
+  if (typeof (headers as Headers).get === 'function') {
+    return (headers as Headers).get(STREAM_HELPER_METHOD_HEADER) === 'stream';
+  }
+
+  return Object.entries(headers as Record<string, unknown>).some(
+    ([name, value]) => name.toLowerCase() === STREAM_HELPER_METHOD_HEADER && value === 'stream',
+  );
+}
+
+type AsyncIterableStream = { [Symbol.asyncIterator]: () => AsyncIterator<unknown> };
+type MessageStreamEmitter = { on: (...args: unknown[]) => void };
+
+function isAsyncIterable(value: unknown): value is AsyncIterableStream {
+  return !!value && typeof (value as AsyncIterableStream)[Symbol.asyncIterator] === 'function';
+}
+
+function isMessageStream(value: unknown): value is MessageStreamEmitter {
+  return !!value && typeof (value as MessageStreamEmitter).on === 'function';
+}
+
+type ThreadStream = MessageStreamEmitter & { ended?: boolean; controller?: { signal?: AbortSignal } };
+
+/**
+ * The streams of threads and tool runners on 1.2+, by the signal they send each `create()` call with. Such a
+ * stream parses the response itself, so the `create()` result is never parsed and never ends its span.
+ */
+const threadStreams = new WeakMap<AbortSignal, { stream: ThreadStream; callerSignal: AbortSignal | undefined }>();
+
+/**
+ * End the span of a thread stream's `create()` call from the stream once the response arrives. A thread may
+ * retry a rejected call, so a failed call ends its own span and only the one that succeeds reads the stream.
+ */
+function wrapThreadStreamRequest(span: Span, data: AnthropicChannelContext, end: (error?: unknown) => void): boolean {
+  const signal = (data.arguments?.[1] as { signal?: AbortSignal } | undefined)?.signal;
+  const threadStream = signal && threadStreams.get(signal);
+  const request = data.result as { _responseProps?: () => Promise<unknown> } | undefined;
+  // A finished stream sends no more requests, so a later call with its signal is the caller's own.
+  if (!threadStream || threadStream.stream.ended || typeof request?._responseProps !== 'function') {
+    return false;
+  }
+  const { stream, callerSignal } = threadStream;
+
+  const recordOutputs = !!data._sentryRecordOutputs;
+  // Not `asResponse()`, which on 1.x also ends the SDK's own span when the user turned its tracing on.
+  void request._responseProps().then(
+    () => {
+      // Only a rejected attempt is retried, so nothing else may claim this stream.
+      threadStreams.delete(signal);
+      instrumentMessageStream(stream, span, recordOutputs, callerSignal, data._sentryOnSpanEnd);
+    },
+    error => {
+      // An abort is not a failed request. The stream still emits 'end', which sets the status from the caller's signal.
+      if (signal.aborted) {
+        instrumentMessageStream(stream, span, recordOutputs, callerSignal, data._sentryOnSpanEnd);
+      } else {
+        end(error);
+      }
+    },
+  );
+  return true;
+}
+
+/**
+ * Hand span-ending ownership to a streamed result: returns `true` to skip the normal `beforeSpanEnd`,
+ * `false` for non-streaming results (which end via `beforeSpanEnd`).
+ *
+ * - `async-iterable`: patch the `Stream`'s async iterator in place so `instrumentAsyncIterableStream` ends
+ *   the span when iteration finishes.
+ * - `message-stream`: `instrumentMessageStream` attaches `'message'`/`'error'`/`'end'` listeners that end the span.
+ */
+function wrapStreamResult(span: Span, data: AnthropicChannelContext, stream: StreamMode): boolean {
+  const recordOutputs = !!data._sentryRecordOutputs;
+  const result = data.result;
+
+  if (stream === 'async-iterable' && isAsyncIterable(result)) {
+    const iterate = result[Symbol.asyncIterator].bind(result);
+    const instrumented = instrumentAsyncIterableStream(
+      { [Symbol.asyncIterator]: iterate },
+      span,
+      recordOutputs,
+      data._sentryOnSpanEnd,
+    );
+    result[Symbol.asyncIterator] = () => instrumented;
+    return true;
+  }
+
+  if (stream === 'message-stream' && isMessageStream(result)) {
+    instrumentMessageStream(result, span, recordOutputs, getRequestSignal(data.arguments?.[1]), data._sentryOnSpanEnd);
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Diagnostics-channel-based Anthropic integration. Subscribes to the `orchestrion:@anthropic-ai/sdk:*`
+ * diagnostics_channels injected into the SDK's chat (`messages`/`completions`/beta `messages`) and
+ * `messages.stream()` methods, so it requires the Sentry runtime hook or bundler plugin.
+ */
+export const anthropicAIIntegration = defineIntegration(_anthropicAIIntegration);
