@@ -1,6 +1,5 @@
 import base64
 import datetime
-import hashlib
 import io
 import json
 import unittest
@@ -11,10 +10,6 @@ from unittest.mock import Mock, call, patch
 from mirror import (
     API,
     FORK,
-    GATE_MARKER,
-    HOLD,
-    HOLD_MARKER,
-    MARK_READY,
     SOURCE,
     WORKFLOW,
     APIError,
@@ -29,7 +24,6 @@ from mirror import (
 
 
 DEPENDABOT = {"login": "dependabot[bot]", "id": 49699333, "type": "Bot"}
-REAL_ADAPTERS = Mirror.reviewer_adapters
 UPSTREAM_HEAD = {"repo": {"full_name": SOURCE}}
 
 
@@ -107,35 +101,6 @@ class DiscoveryTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "live writes to the mirror"):
                 api.call(repo, "pulls", "POST", {})
 
-    def test_ready_mutation_only_accepts_live_mirror_pairs(self):
-        pr = {
-            "node_id": "PR_node",
-            "base": {"ref": "shadow/base/1", "repo": {"full_name": FORK}},
-            "head": {"ref": "shadow/pr/1", "repo": {"full_name": FORK}},
-        }
-        api = API("unused", True)
-        api._request = Mock()
-        with self.assertRaisesRegex(ValueError, "live writes to the mirror"):
-            api.mark_ready(pr, 1)
-        api.dry_run = False
-        with self.assertRaisesRegex(ValueError, "live writes to the mirror"):
-            api.mark_ready(
-                {**pr, "head": {**pr["head"], "repo": {"full_name": SOURCE}}}, 1
-            )
-        api._request.assert_not_called()
-        api._request.return_value = {
-            "data": {
-                "markPullRequestReadyForReview": {"pullRequest": {"isDraft": False}}
-            }
-        }
-        api.mark_ready(pr, 1)
-        api._request.assert_called_once_with(
-            "graphql", "POST", {"query": MARK_READY, "variables": {"id": "PR_node"}}
-        )
-        api._request.return_value = {"errors": [{"message": "permission denied"}]}
-        with self.assertRaisesRegex(ValueError, "permission denied"):
-            api.mark_ready(pr, 1)
-
     def test_scrub_title_removes_upstream_references(self):
         self.assertEqual(
             scrub_title(
@@ -189,9 +154,6 @@ class ReplayTest(unittest.TestCase):
             "head": {"sha": self.source_head, "repo": {"full_name": SOURCE}},
         }
         self.files = [{"filename": "pnpm-lock.yaml"}]
-        adapters = patch.object(Mirror, "reviewer_adapters", return_value=[])
-        adapters.start()
-        self.addCleanup(adapters.stop)
         self.workflow_path = (
             Path(__file__).resolve().parents[2] / "workflows" / WORKFLOW
         )
@@ -244,107 +206,16 @@ class ReplayTest(unittest.TestCase):
                 "git/commits",
                 "git/refs",
                 "pulls",
-                "issues/2/comments",
             ],
         )
         self.assertEqual(writes[0].args[1]["parents"], [])
         self.assertEqual(writes[2].args[1]["parents"], ["baseline"])
         self.assertEqual(writes[4].args[1]["base"], "shadow/base/1")
         self.assertEqual(writes[4].args[1]["head"], "shadow/pr/1")
-        self.assertIs(writes[4].args[1]["draft"], True)
+        self.assertNotIn("draft", writes[4].args[1])
         self.assertNotIn(
             "<!-- garnet:record-summary:opt-in -->", writes[4].args[1]["body"]
         )
-        self.assertEqual(writes[5], call("issues/2/comments", {"body": HOLD}))
-        self.api.mark_ready.assert_not_called()
-
-    def test_later_sync_promotes_only_with_trusted_finalized_current_head(self):
-        head = "d" * 40
-        existing = {
-            "number": 2,
-            "node_id": "PR_node",
-            "html_url": "mirror",
-            "draft": True,
-            "state": "open",
-            "base": {"ref": "shadow/base/1", "repo": {"full_name": FORK}},
-            "head": {"ref": "shadow/pr/1", "repo": {"full_name": FORK}, "sha": head},
-            "body": (
-                f"<!-- garnet-shadow-mirror upstream=1 upstream_head={self.source_head} "
-                f"upstream_base={self.merge_base} -->"
-            ),
-        }
-
-        def evidence(
-            login="garnet-runtime-review[bot]",
-            head_marker=head,
-            summary_head=head,
-            status="finalized",
-            owned=True,
-        ):
-            summary = json.dumps({"commit": summary_head, "status": status})
-            body = [
-                "<!-- garnet-runtime-review -->",
-                f"<!-- garnet:commit {head_marker} -->",
-                f"<!-- garnet:summary {summary} -->",
-            ]
-            if owned:
-                body.append("<!-- garnet-control-plane-pr-comment:v1:app.garnet.ai -->")
-            return {"user": {"login": login}, "body": "\n".join(body)}
-
-        malformed = {
-            **evidence(),
-            "body": evidence()["body"].replace('"status"', "status"),
-        }
-        updated = {**existing, "head": {**existing["head"], "sha": self.source_head}}
-        cases = (
-            ("finalized", evidence(), existing, existing, True),
-            ("pending", evidence(status="pending"), existing, existing, False),
-            ("untrusted", evidence(login="contributor"), existing, existing, False),
-            ("no owner marker", evidence(owned=False), existing, existing, False),
-            (
-                "stale marker",
-                evidence(head_marker=self.source_head),
-                existing,
-                existing,
-                False,
-            ),
-            (
-                "stale summary",
-                evidence(summary_head=self.source_head),
-                existing,
-                existing,
-                False,
-            ),
-            ("malformed", malformed, existing, existing, False),
-            ("head moved", evidence(), existing, updated, False),
-            (
-                "already ready",
-                evidence(),
-                {**existing, "draft": False},
-                existing,
-                False,
-            ),
-        )
-        self.mirror.workflow = "trusted workflow"
-        fingerprint = hashlib.sha256(json.dumps([self.mirror.workflow, []]).encode()).hexdigest()
-        baseline = {
-            "message": f"chore: shadow baseline\n\nSource tree at {self.merge_base}; recorder {fingerprint}"
-        }
-        for name, comment, listed, current, promoted in cases:
-            with self.subTest(name=name):
-                self.api.reset_mock()
-                self.api.call.side_effect = [baseline, current]
-                self.api.pages.return_value = [{"body": HOLD}, comment]
-                with patch.object(self.mirror, "get_ref", return_value="mirror-base"):
-                    result = self.mirror.replay(
-                        1, self.pr, self.files, self.merge_base, {1: listed}
-                    )
-                self.assertEqual(result["status"], "ready" if promoted else "unchanged")
-                if promoted:
-                    self.api.mark_ready.assert_called_once_with(current, 1)
-                else:
-                    self.api.mark_ready.assert_not_called()
-                self.api.write.assert_not_called()
 
     def test_changed_base_creates_new_pair_without_updating_open_refs(self):
         old = {"state": "open", "number": 5, "body": "original"}
@@ -498,29 +369,6 @@ class ReplayTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             recording_workflow(workflow.replace("persist-credentials: false", ""))
 
-    def test_replay_trees_carry_reviewer_adapters_from_develop(self):
-        entry = {"mode": "100644", "type": "blob", "sha": "s"}
-        self.api.call.side_effect = [
-            {"commit": {"tree": {"sha": "develop-tree"}}},
-            {
-                "tree": [
-                    {**entry, "path": "greptile.json"},
-                    {**entry, "path": ".agents", "mode": "040000", "type": "tree"},
-                    {**entry, "path": "REVIEW.md"},
-                    {**entry, "path": "README.md"},
-                    {**entry, "path": ".github", "mode": "040000", "type": "tree"},
-                ]
-            },
-        ]
-        adapters = REAL_ADAPTERS(self.mirror)
-        self.assertEqual(
-            [a["path"] for a in adapters], [".agents", "REVIEW.md", "greptile.json"]
-        )
-        self.assertEqual(
-            self.api.call.call_args_list,
-            [call(FORK, "commits/develop"), call(FORK, "git/trees/develop-tree")],
-        )
-
     def test_baseline_can_be_dispatched_if_ref_creation_does_not_trigger_it(self):
         self.api.call.side_effect = [{"workflow_runs": []}] * 6 + [
             {"workflow_runs": [{"id": 1}]}
@@ -531,24 +379,3 @@ class ReplayTest(unittest.TestCase):
             f"actions/workflows/{WORKFLOW}/dispatches", {"ref": "shadow/base/1"}
         )
 
-    def test_gate_comment_is_only_created_when_absent(self):
-        unrelated = {"id": 1, "body": "unrelated"}
-        self.api.pages.return_value = [unrelated]
-        self.mirror.ensure_gate_comment(3)
-        self.api.pages.assert_called_once_with(FORK, "issues/3/comments")
-        self.api.write.assert_called_once_with("issues/3/comments", {"body": HOLD})
-
-        for marker in (HOLD_MARKER, GATE_MARKER):
-            for verdict in ("**PASS** · Nothing new recorded", "**HOLD** · Changed"):
-                with self.subTest(marker=marker, verdict=verdict):
-                    self.api.reset_mock()
-                    self.api.pages.return_value = [
-                        unrelated,
-                        {"id": 2, "body": f"{marker}\n{verdict}"},
-                    ]
-                    self.mirror.ensure_gate_comment(3)
-                    self.api.write.assert_not_called()
-
-
-if __name__ == "__main__":
-    unittest.main()

@@ -17,28 +17,11 @@ FORK = "garnet-labs/sentry-javascript"
 SOURCE = "getsentry/sentry-javascript"
 BRANCH = "develop"
 LOOKBACK_DAYS = 10
-REVIEWER_ADAPTERS = frozenset(
-    {".agents", ".coderabbit.yaml", ".devin", ".pr_agent.toml", "REVIEW.md", "greptile.json"}
-)
 WORKFLOW = "garnet-record.yml"
 MARKER = re.compile(
     r"<!-- garnet-shadow-mirror upstream=(\d+) upstream_head=([a-f0-9]{40}) "
     r"upstream_base=([a-f0-9]{40}) -->"
 )
-HOLD_MARKER = "<!-- garnet-shadow-mirror-gate -->"
-GATE_MARKER = "<!-- garnet-merge-gate -->"
-HOLD = f"{HOLD_MARKER}\n**HOLD** · Waiting for the gate to evaluate runtime evidence."
-REVIEW_BOTS = {
-    "garnet-runtime-review[bot]",
-    "garnet-runtime-review-dev[bot]",
-    "garnet-ai[bot]",
-}
-REVIEW_MARKER = "<!-- garnet-runtime-review -->"
-REVIEW_OWNER = re.compile(
-    r"<!--\s*garnet-(?:control-plane|action)-pr-comment:v1(?::[a-z0-9.-]+)?\s*-->"
-)
-REVIEW_COMMIT = re.compile(r"<!--\s*garnet:commit\s+([a-f0-9]{40})\s*-->")
-REVIEW_SUMMARY = re.compile(r"<!-- garnet:summary (\{[^\n]*\}) -->")
 DEPENDENCY_BOTS = {"dependabot[bot]": 49699333, "renovate[bot]": 29139614}
 ROOT_INPUTS = {"package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "yarn.lock", ".npmrc"}
 WORKSPACE_ROOTS = {"packages", "dev-packages"}
@@ -53,15 +36,6 @@ query ($search: String!, $cursor: String) {
   }
 }
 """
-MARK_READY = """
-mutation ($id: ID!) {
-  markPullRequestReadyForReview(input: {pullRequestId: $id}) {
-    pullRequest { isDraft }
-  }
-}
-"""
-
-
 class APIError(RuntimeError):
     def __init__(self, method, path, status, detail):
         super().__init__(f"{method} {path}: HTTP {status}: {detail}")
@@ -108,22 +82,6 @@ class API:
 
     def write(self, path, data, method="POST"):
         return self.call(FORK, path, method, data)
-
-    def mark_ready(self, pr, upstream_number):
-        if self.dry_run or mirror_revision(pr, upstream_number) is None:
-            raise ValueError("Only live writes to the mirror repository are allowed")
-        result = self._request(
-            "graphql", "POST", {"query": MARK_READY, "variables": {"id": pr["node_id"]}}
-        )
-        if result.get("errors"):
-            raise ValueError(
-                f'GitHub markPullRequestReadyForReview: {result["errors"]}'
-            )
-        mutation = (result.get("data") or {}).get("markPullRequestReadyForReview") or {}
-        if (mutation.get("pullRequest") or {}).get("isDraft") is not False:
-            raise ValueError(
-                "GitHub did not confirm the pull request is ready for review"
-            )
 
     def dependency_candidates(self, now=None):
         since = (now or datetime.datetime.now(datetime.timezone.utc)) - datetime.timedelta(
@@ -230,29 +188,6 @@ def mirror_revision(pr, number):
     return None
 
 
-def finalized_review(comment, head):
-    body = comment.get("body") or ""
-    if (
-        (comment.get("user") or {}).get("login") not in REVIEW_BOTS
-        or REVIEW_MARKER not in body
-        or not REVIEW_OWNER.search(body)
-    ):
-        return False
-    commit = REVIEW_COMMIT.search(body)
-    summary = REVIEW_SUMMARY.search(body)
-    if not commit or commit[1] != head or not summary:
-        return False
-    try:
-        record = json.loads(summary[1])
-    except ValueError:
-        return False
-    return (
-        isinstance(record, dict)
-        and record.get("commit") == head
-        and record.get("status") == "finalized"
-    )
-
-
 class Mirror:
     def __init__(self, api):
         self.api = api
@@ -266,7 +201,6 @@ class Mirror:
             if revision is not None:
                 self.mirrors.setdefault(number, {})[revision] = pr
         self.workflow = None
-        self.adapters = []
 
     def sync(self, number):
         api = self.api
@@ -318,12 +252,9 @@ class Mirror:
             self.workflow = recording_workflow(
                 base64.b64decode(data["content"]).decode()
             )
-            self.adapters = self.reviewer_adapters()
         last = max(history, default=0)
         revision = max(1, last)
-        fingerprint = hashlib.sha256(
-            json.dumps([self.workflow, self.adapters]).encode()
-        ).hexdigest()
+        fingerprint = hashlib.sha256(self.workflow.encode()).hexdigest()
         baseline_message = f"chore: shadow baseline\n\nSource tree at {upstream_base}; recorder {fingerprint}"
         while True:
             suffix = f"-r{revision}" if revision > 1 else ""
@@ -344,11 +275,9 @@ class Mirror:
             upstream_head,
             upstream_base,
         ):
-            self.ensure_gate_comment(existing["number"])
-            ready = self.ready_if_finalized(existing, number, revision)
             self.close(history, "superseded", keep=existing["number"])
             return {
-                "status": "ready" if ready else "unchanged",
+                "status": "unchanged",
                 "url": existing["html_url"],
             }
 
@@ -393,34 +322,13 @@ class Mirror:
             result = api.write(f'pulls/{existing["number"]}', data, "PATCH")
         else:
             result = api.write(
-                "pulls", {**data, "head": head_ref, "base": base_ref, "draft": True}
+                "pulls", {**data, "head": head_ref, "base": base_ref}
             )
-        self.ensure_gate_comment(result["number"])
         self.close(history, "superseded", keep=result["number"])
         return {
             "status": "updated" if existing else "created",
             "url": result["html_url"],
         }
-
-    def ready_if_finalized(self, pr, upstream_number, revision):
-        if not pr.get("draft"):
-            return False
-        head = pr["head"]["sha"]
-        path = f'issues/{pr["number"]}/comments'
-        if not any(
-            finalized_review(comment, head) for comment in self.api.pages(FORK, path)
-        ):
-            return False
-        current = self.api.call(FORK, f'pulls/{pr["number"]}')
-        if (
-            current["state"] != "open"
-            or not current.get("draft")
-            or mirror_revision(current, upstream_number) != revision
-            or current["head"]["sha"] != head
-        ):
-            return False
-        self.api.mark_ready(current, upstream_number)
-        return True
 
     def get_ref(self, name):
         try:
@@ -491,34 +399,14 @@ class Mirror:
                 "base_tree": root,
                 "tree": [
                     {"path": ".github", "mode": "040000", "type": "tree", "sha": github},
-                    *self.adapters,
                 ],
             },
         )["sha"]
-
-    def reviewer_adapters(self):
-        commit = self.api.call(FORK, f"commits/{BRANCH}")["commit"]["tree"]["sha"]
-        return sorted(
-            (
-                {"path": e["path"], "mode": e["mode"], "type": e["type"], "sha": e["sha"]}
-                for e in self.api.call(FORK, f"git/trees/{commit}")["tree"]
-                if e["path"] in REVIEWER_ADAPTERS
-            ),
-            key=lambda e: e["path"],
-        )
 
     def commit(self, tree, parents, message):
         return self.api.write(
             "git/commits", {"tree": tree, "parents": parents, "message": message}
         )["sha"]
-
-    def ensure_gate_comment(self, number):
-        path = f"issues/{number}/comments"
-        for comment in self.api.pages(FORK, path):
-            if comment["body"].startswith((HOLD_MARKER, GATE_MARKER)):
-                return
-        self.api.write(path, {"body": HOLD})
-
 
 def main():
     parser = argparse.ArgumentParser()
