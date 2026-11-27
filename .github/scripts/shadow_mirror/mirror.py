@@ -134,12 +134,21 @@ def is_dependency_pr(pr, files):
     )
 
 
-def recently_merged(pr, now=None):
+def within_lookback(timestamp, now=None):
+    if not timestamp:
+        return False
+    moment = datetime.datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    return now - moment <= datetime.timedelta(days=LOOKBACK_DAYS)
+
+
+def recently_merged(pr, now=None, history=None):
     if not pr.get("merged_at"):
         return False
-    merged = datetime.datetime.fromisoformat(pr["merged_at"].replace("Z", "+00:00"))
-    now = now or datetime.datetime.now(datetime.timezone.utc)
-    return now - merged <= datetime.timedelta(days=LOOKBACK_DAYS)
+    return within_lookback(pr["merged_at"], now) or any(
+        mirror["state"] == "open" and within_lookback(mirror.get("created_at"), now)
+        for mirror in (history or {}).values()
+    )
 
 
 def scrub_title(title):
@@ -208,14 +217,15 @@ class Mirror:
         path = f"pulls/{number}"
         try:
             pr = api.call(SOURCE, path)
-            if pr["state"] == "open" or recently_merged(pr):
+            live = pr["state"] == "open" or recently_merged(pr, history=history)
+            if live:
                 files = list(api.pages(SOURCE, f"{path}/files"))
                 current = api.call(SOURCE, path)
         except APIError as error:
             if error.status != 404:
                 raise
             return {"status": "skipped", "reason": "upstream PR not found"}
-        if pr["state"] != "open" and not recently_merged(pr):
+        if not live:
             return self.close(history, "source closed")
         if any(current[key] != pr[key] for key in ("state", "changed_files")) or any(
             current[key]["sha"] != pr[key]["sha"] for key in ("base", "head")
@@ -409,11 +419,14 @@ class Mirror:
         )["sha"]
 
 def main():
+    global LOOKBACK_DAYS
     parser = argparse.ArgumentParser()
     sync = parser.add_subparsers(dest="command", required=True).add_parser("sync")
     sync.add_argument("--pr", type=int, action="append")
     sync.add_argument("--dry-run", action="store_true")
+    sync.add_argument("--lookback-days", type=int, default=LOOKBACK_DAYS)
     args = parser.parse_args()
+    LOOKBACK_DAYS = args.lookback_days
     token = os.environ.get("SHADOW_MIRROR_TOKEN") or os.environ.get("GH_TOKEN")
     if not token:
         parser.error("Set SHADOW_MIRROR_TOKEN or GH_TOKEN")

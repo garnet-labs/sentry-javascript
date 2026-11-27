@@ -73,6 +73,17 @@ class DiscoveryTest(unittest.TestCase):
         self.assertFalse(recently_merged({"merged_at": "2026-11-16T00:00:00Z"}, now))
         self.assertFalse(recently_merged({"merged_at": None}, now))
 
+    def test_open_backfilled_mirror_stays_in_window(self):
+        now = datetime.datetime(2026, 11, 27, tzinfo=datetime.timezone.utc)
+        pr = {"merged_at": "2026-10-16T00:00:00Z"}
+        fresh = {1: {"state": "open", "created_at": "2026-11-26T00:00:00Z"}}
+        stale = {1: {"state": "open", "created_at": "2026-11-10T00:00:00Z"}}
+        closed = {1: {"state": "closed", "created_at": "2026-11-26T00:00:00Z"}}
+        self.assertTrue(recently_merged(pr, now, fresh))
+        self.assertFalse(recently_merged(pr, now, stale))
+        self.assertFalse(recently_merged(pr, now, closed))
+        self.assertFalse(recently_merged({"merged_at": None}, now, fresh))
+
     def test_candidates_cover_open_and_recently_merged_bot_changes(self):
         api = API("unused", True)
 
