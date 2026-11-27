@@ -1,0 +1,345 @@
+import type { Integration } from '@sentry/core';
+import { debug, getMainCarrier, GLOBAL_OBJ, SentryNonRecordingSpan, spanToJSON } from '@sentry/core';
+import * as SentryReact from '@sentry/react';
+import { close, getClient, getIsolationScope, WINDOW } from '@sentry/react';
+import { JSDOM } from 'jsdom';
+import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
+import { breadcrumbsIntegration, browserTracingIntegration, init } from '../src/client';
+
+const reactInit = vi.spyOn(SentryReact, 'init');
+const debugLogSpy = vi.spyOn(debug, 'log');
+
+// We're setting up JSDom here because the Next.js routing instrumentations requires a few things to be present on pageload:
+// 1. Access to window.document API for `window.document.getElementById`
+// 2. Access to window.location API for `window.location.pathname`
+const dom = new JSDOM(undefined, { url: 'https://example.com/' });
+Object.defineProperty(global, 'document', { value: dom.window.document, writable: true });
+Object.defineProperty(global, 'location', { value: dom.window.document.location, writable: true });
+Object.defineProperty(global, 'addEventListener', { value: () => undefined, writable: true });
+Object.defineProperty(global, 'removeEventListener', { value: () => undefined, writable: true });
+
+const originalGlobalDocument = WINDOW.document;
+const originalGlobalLocation = WINDOW.location;
+const originalNavigator = WINDOW.navigator;
+// eslint-disable-next-line @typescript-eslint/unbound-method
+const originalGlobalAddEventListener = WINDOW.addEventListener;
+// eslint-disable-next-line @typescript-eslint/unbound-method
+const originalGlobalRemoveEventListener = WINDOW.removeEventListener;
+
+afterAll(() => {
+  // Clean up JSDom
+  Object.defineProperty(WINDOW, 'document', { value: originalGlobalDocument });
+  Object.defineProperty(WINDOW, 'location', { value: originalGlobalLocation });
+  Object.defineProperty(WINDOW, 'navigator', { value: originalNavigator, writable: true, configurable: true });
+  Object.defineProperty(WINDOW, 'addEventListener', { value: originalGlobalAddEventListener });
+  Object.defineProperty(WINDOW, 'removeEventListener', { value: originalGlobalRemoveEventListener });
+});
+
+function findIntegrationByName(integrations: Integration[] = [], name: string): Integration | undefined {
+  return integrations.find(integration => integration.name === name);
+}
+
+const TEST_DSN = 'https://public@dsn.ingest.sentry.io/1337';
+
+describe('Client init()', () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+
+    getMainCarrier().__SENTRY__ = undefined;
+    Object.defineProperty(WINDOW, 'navigator', { value: originalNavigator, writable: true, configurable: true });
+  });
+
+  it('inits the React SDK', () => {
+    expect(reactInit).toHaveBeenCalledTimes(0);
+    init({});
+    expect(reactInit).toHaveBeenCalledTimes(1);
+    expect(reactInit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        _metadata: {
+          sdk: {
+            name: 'sentry.javascript.nextjs',
+            version: expect.any(String),
+            packages: [
+              {
+                name: 'npm:@sentry/nextjs',
+                version: expect.any(String),
+              },
+              {
+                name: 'npm:@sentry/react',
+                version: expect.any(String),
+              },
+            ],
+            settings: {
+              infer_ip: 'auto',
+            },
+          },
+        },
+        environment: 'test',
+        defaultIntegrations: expect.arrayContaining([
+          expect.objectContaining({
+            name: 'NextjsClientStackFrameNormalization',
+          }),
+        ]),
+      }),
+    );
+  });
+
+  describe('transaction filtering', () => {
+    const TEST_DSN_404 = 'https://dogsarebadatkeepingsecrets@squirrelchasers.ingest.sentry.io/12312012';
+
+    it('drops /404 transactions', () => {
+      init({ dsn: TEST_DSN_404, tracesSampleRate: 1.0 });
+      const transportSend = vi.spyOn(getClient()!.getTransport()!, 'send');
+
+      // Ensure we have no current span, so our next span is a transaction
+      SentryReact.withActiveSpan(null, () => {
+        SentryReact.startInactiveSpan({ name: '/404' })?.end();
+      });
+
+      expect(transportSend).not.toHaveBeenCalled();
+      expect(debugLogSpy).toHaveBeenCalledWith(expect.stringContaining('matches `ignoreSpans`'));
+    });
+
+    describe('span streaming', () => {
+      it('drops /404 segment spans', () => {
+        init({ dsn: TEST_DSN_404, tracesSampleRate: 1.0, traceLifecycle: 'stream' });
+
+        // Ensure we have no current span, so our next span is a segment span
+        const span = SentryReact.withActiveSpan(null, () => SentryReact.startInactiveSpan({ name: '/404' }));
+
+        expect(span).toBeInstanceOf(SentryNonRecordingSpan);
+        expect(debugLogSpy).toHaveBeenCalledWith(expect.stringContaining('matches `ignoreSpans`'));
+      });
+
+      it('drops /404 non-segment spans', () => {
+        init({ dsn: TEST_DSN_404, tracesSampleRate: 1.0, traceLifecycle: 'stream' });
+
+        SentryReact.startSpan({ name: 'parent' }, parent => {
+          expect(parent).not.toBeInstanceOf(SentryNonRecordingSpan);
+          const child = SentryReact.startInactiveSpan({ name: '/404' });
+          expect(child).toBeInstanceOf(SentryNonRecordingSpan);
+        });
+      });
+    });
+  });
+
+  describe('integrations', () => {
+    // Options passed by `@sentry/nextjs`'s `init` to `@sentry/react`'s `init` after modifying them
+    type ModifiedInitOptionsIntegrationArray = { defaultIntegrations: Integration[]; integrations: Integration[] };
+
+    it('supports passing unrelated integrations through options', () => {
+      init({ integrations: [breadcrumbsIntegration({ dom: false })] });
+
+      const reactInitOptions = reactInit.mock.calls[0]![0] as ModifiedInitOptionsIntegrationArray;
+      const installedBreadcrumbsIntegration = findIntegrationByName(reactInitOptions.integrations, 'Breadcrumbs');
+
+      expect(installedBreadcrumbsIntegration).toBeDefined();
+    });
+
+    it('forces correct router instrumentation if user provides `browserTracingIntegration` in an array', () => {
+      const providedBrowserTracingInstance = browserTracingIntegration();
+
+      const client = init({
+        dsn: TEST_DSN,
+        tracesSampleRate: 1.0,
+        integrations: [providedBrowserTracingInstance],
+      });
+
+      const integration = client?.getIntegrationByName('BrowserTracing');
+      expect(integration).toBe(providedBrowserTracingInstance);
+    });
+
+    it('forces correct router instrumentation if user provides `BrowserTracing` in a function', () => {
+      const providedBrowserTracingInstance = browserTracingIntegration();
+
+      const client = init({
+        dsn: TEST_DSN,
+        tracesSampleRate: 1.0,
+        integrations: defaults => [...defaults, providedBrowserTracingInstance],
+      });
+
+      const integration = client?.getIntegrationByName('BrowserTracing');
+
+      expect(integration).toBe(providedBrowserTracingInstance);
+    });
+
+    describe('browserTracingIntegration()', () => {
+      it('adds the browserTracingIntegration when `__SENTRY_TRACING__` is not set', () => {
+        const client = init({
+          dsn: TEST_DSN,
+        });
+
+        const browserTracingIntegration = client?.getIntegrationByName('BrowserTracing');
+        expect(browserTracingIntegration).toBeDefined();
+      });
+
+      it("doesn't add a browserTracingIntegration if `__SENTRY_TRACING__` is set to false", () => {
+        // @ts-expect-error Test setup for build-time flag
+        globalThis.__SENTRY_TRACING__ = false;
+
+        const client = init({
+          dsn: TEST_DSN,
+        });
+
+        const browserTracingIntegration = client?.getIntegrationByName('BrowserTracing');
+        expect(browserTracingIntegration).toBeUndefined();
+
+        // @ts-expect-error Test setup for build-time flag
+        delete globalThis.__SENTRY_TRACING__;
+      });
+
+      it('names the pageload span after the parameterized route', () => {
+        const globalWithManifest = GLOBAL_OBJ as typeof GLOBAL_OBJ & { _sentryRouteManifest?: string };
+        globalWithManifest._sentryRouteManifest = JSON.stringify({
+          staticRoutes: [{ path: '/' }],
+          dynamicRoutes: [],
+        });
+
+        init({ dsn: TEST_DSN, tracesSampleRate: 1.0 });
+
+        expect(spanToJSON(SentryReact.getActiveSpan()!)).toMatchObject({
+          name: '/',
+          attributes: {
+            'sentry.op': 'pageload',
+            'sentry.segment.name.source': 'route',
+            'url.template': '/',
+          },
+        });
+
+        delete globalWithManifest._sentryRouteManifest;
+      });
+
+      it('keeps a route provider passed by the user', () => {
+        const routeProvider = { resolveRoute: () => '/custom', resolveCurrentRoute: () => '/custom' };
+
+        init({ dsn: TEST_DSN, routeProvider });
+
+        expect(reactInit).toHaveBeenCalledWith(expect.objectContaining({ routeProvider }));
+      });
+
+      it("doesn't run Next.js router instrumentation for bot user agents", () => {
+        Object.defineProperty(WINDOW, 'navigator', {
+          value: {
+            userAgent: 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
+          },
+          writable: true,
+          configurable: true,
+        });
+
+        const setIntervalSpy = vi.spyOn(globalThis, 'setInterval');
+
+        init({
+          dsn: TEST_DSN,
+          tracesSampleRate: 1.0,
+        });
+
+        expect(setIntervalSpy).not.toHaveBeenCalled();
+      });
+    });
+  });
+
+  it('returns client from init', () => {
+    expect(init({})).not.toBeUndefined();
+  });
+
+  it('registers its event processors on the client', () => {
+    const client = init({});
+
+    expect(client?.getEventProcessors().map(processor => processor.id)).toContain('NextRedirectErrorFilter');
+  });
+
+  it('does not add event processors to the isolation scope after close()', async () => {
+    const isolationProcessorCount = getIsolationScope().getScopeData().eventProcessors.length;
+
+    init({});
+    await close();
+    init({});
+
+    expect(getIsolationScope().getScopeData().eventProcessors.length).toBe(isolationProcessorCount);
+  });
+
+  describe('environment option', () => {
+    const originalEnv = process.env.SENTRY_ENVIRONMENT;
+    const originalNodeEnv = process.env.NODE_ENV;
+
+    afterEach(() => {
+      if (originalEnv !== undefined) {
+        process.env.SENTRY_ENVIRONMENT = originalEnv;
+      } else {
+        delete process.env.SENTRY_ENVIRONMENT;
+      }
+      if (originalNodeEnv !== undefined) {
+        process.env.NODE_ENV = originalNodeEnv;
+      } else {
+        delete process.env.NODE_ENV;
+      }
+    });
+
+    it('uses environment from options when provided', () => {
+      delete process.env.SENTRY_ENVIRONMENT;
+      process.env.NODE_ENV = 'development';
+
+      init({
+        dsn: TEST_DSN,
+        environment: 'custom-env',
+      });
+
+      expect(reactInit).toHaveBeenCalledTimes(1);
+      const callArgs = reactInit.mock.calls[0]?.[0];
+      expect(callArgs?.environment).toBe('custom-env');
+    });
+
+    it('uses SENTRY_ENVIRONMENT env var when options.environment is not provided', () => {
+      process.env.SENTRY_ENVIRONMENT = 'env-from-variable';
+      process.env.NODE_ENV = 'development';
+
+      init({
+        dsn: TEST_DSN,
+      });
+
+      expect(reactInit).toHaveBeenCalledTimes(1);
+      const callArgs = reactInit.mock.calls[0]?.[0];
+      expect(callArgs?.environment).toBe('env-from-variable');
+    });
+
+    it('uses NODE_ENV as fallback when neither options.environment nor SENTRY_ENVIRONMENT is provided', () => {
+      delete process.env.SENTRY_ENVIRONMENT;
+      process.env.NODE_ENV = 'production';
+
+      init({
+        dsn: TEST_DSN,
+      });
+
+      expect(reactInit).toHaveBeenCalledTimes(1);
+      const callArgs = reactInit.mock.calls[0]?.[0];
+      expect(callArgs?.environment).toBe('production');
+    });
+
+    it('prioritizes options.environment over SENTRY_ENVIRONMENT env var', () => {
+      process.env.SENTRY_ENVIRONMENT = 'env-from-variable';
+      process.env.NODE_ENV = 'development';
+
+      init({
+        dsn: TEST_DSN,
+        environment: 'options-env',
+      });
+
+      expect(reactInit).toHaveBeenCalledTimes(1);
+      const callArgs = reactInit.mock.calls[0]?.[0];
+      expect(callArgs?.environment).toBe('options-env');
+    });
+
+    it('prioritizes SENTRY_ENVIRONMENT over NODE_ENV', () => {
+      process.env.SENTRY_ENVIRONMENT = 'sentry-env';
+      process.env.NODE_ENV = 'development';
+
+      init({
+        dsn: TEST_DSN,
+      });
+
+      expect(reactInit).toHaveBeenCalledTimes(1);
+      const callArgs = reactInit.mock.calls[0]?.[0];
+      expect(callArgs?.environment).toBe('sentry-env');
+    });
+  });
+});

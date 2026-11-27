@@ -1,0 +1,140 @@
+{
+  "name": "@sentry/aws-serverless",
+  "version": "11.12.0",
+  "description": "Official Sentry SDK for AWS Lambda and AWS Serverless Environments",
+  "repository": "git://github.com/getsentry/sentry-javascript.git",
+  "homepage": "https://github.com/getsentry/sentry-javascript/tree/master/packages/aws-serverless",
+  "author": "Sentry",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.19.0 <22.0.0 || >=22.12.0 <23.0.0 || >=23.2.0"
+  },
+  "files": [
+    "/build/npm",
+    "/build/import-hook.mjs",
+    "/build/lambda-extension"
+  ],
+  "main": "build/npm/cjs/index.js",
+  "module": "build/npm/esm/index.js",
+  "types": "build/npm/types/index.d.ts",
+  "exports": {
+    "./package.json": "./package.json",
+    ".": {
+      "import": {
+        "types": "./build/npm/types/index.d.ts",
+        "default": "./build/npm/esm/index.js"
+      },
+      "require": {
+        "types": "./build/npm/types/index.d.ts",
+        "default": "./build/npm/cjs/index.js"
+      }
+    },
+    "./import": {
+      "import": {
+        "default": "./build/import-hook.mjs"
+      }
+    },
+    "./awslambda-auto": {
+      "require": {
+        "default": "./build/npm/cjs/awslambda-auto.js"
+      },
+      "import": {
+        "default": "./build/npm/esm/awslambda-auto.js"
+      }
+    },
+    "./run-lambda-handler": {
+      "default": "./build/npm/run-lambda-handler.mjs"
+    },
+    "./dist/awslambda-auto": {
+      "//": "@deprecated Use `./awslambda-auto` instead",
+      "require": {
+        "default": "./build/npm/cjs/awslambda-auto.js"
+      }
+    },
+    "./esbuild": {
+      "import": {
+        "types": "./build/npm/types/bundler-plugin/esbuild.d.ts",
+        "default": "./build/npm/esm/bundler-plugin/esbuild.js"
+      },
+      "require": {
+        "types": "./build/npm/types/bundler-plugin/esbuild.d.ts",
+        "default": "./build/npm/cjs/bundler-plugin/esbuild.js"
+      }
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@sentry/conventions": "^0.32.0",
+    "@sentry/core": "11.12.0",
+    "@sentry/node": "11.12.0",
+    "@sentry/server-runtime-injection": "11.12.0",
+    "@sentry/server-utils": "11.12.0",
+    "@types/aws-lambda": "^8.10.164"
+  },
+  "devDependencies": {
+    "@sentry-internal/rollup-utils": "11.12.0",
+    "@types/node": "^20.19.0",
+    "@vercel/nft": "^1.11.0"
+  },
+  "scripts": {
+    "build": "run-p build:transpile build:types",
+    "build:extension": "rollup -c rollup.lambda-extension.config.mjs && pnpm exec tsx scripts/buildLambdaExtension.ts",
+    "build:layer": "node ../../scripts/rm.mjs build/aws && pnpm exec tsx scripts/buildLambdaLayer.ts",
+    "build:dev": "run-p build:transpile build:types",
+    "build:transpile": "run-s build:transpile:npm build:extension",
+    "build:transpile:npm": "rollup -c rollup.npm.config.mjs",
+    "build:types": "tsc -p tsconfig.types.json",
+    "build:watch": "run-p build:transpile:watch",
+    "build:dev:watch": "pnpm run build:watch",
+    "build:transpile:watch": "rollup -c rollup.npm.config.mjs --watch",
+    "build:tarball": "pnpm pack",
+    "circularDepCheck": "madge --circular src/index.ts",
+    "clean": "node ../../scripts/rm.mjs build dist-awslambda-layer coverage sentry-serverless-*.tgz",
+    "lint:fix": "oxlint . --fix --type-aware",
+    "lint": "oxlint . --type-aware",
+    "lint:types": "oxlint src --type-aware --type-check",
+    "lint:es-compatibility": "es-check es2022 ./build/npm/cjs/*.js && es-check es2022 ./build/npm/esm/*.js --module",
+    "test": "vitest run",
+    "test:watch": "vitest --watch",
+    "yalc:publish": "yalc publish --push --sig"
+  },
+  "sideEffects": false,
+  "nx": {
+    "targets": {
+      "build:transpile": {
+        "inputs": [
+          "production",
+          "^production"
+        ],
+        "dependsOn": [
+          "^build:transpile"
+        ],
+        "outputs": [
+          "{projectRoot}/build/npm/esm",
+          "{projectRoot}/build/npm/cjs",
+          "{projectRoot}/build/npm/run-lambda-handler.mjs",
+          "{projectRoot}/build/npm/run-lambda-handler.mjs.map",
+          "{projectRoot}/build/lambda-extension",
+          "{projectRoot}/build/import-hook.mjs"
+        ],
+        "cache": true
+      },
+      "build:layer": {
+        "inputs": [
+          "production",
+          "^production"
+        ],
+        "dependsOn": [
+          "build:transpile",
+          "build:types"
+        ],
+        "outputs": [
+          "{projectRoot}/build/aws"
+        ],
+        "cache": true
+      }
+    }
+  }
+}

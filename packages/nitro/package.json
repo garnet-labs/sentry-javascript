@@ -1,0 +1,86 @@
+{
+  "name": "@sentry/nitro",
+  "version": "11.12.0",
+  "description": "Official Sentry SDK for Nitro",
+  "repository": "git://github.com/getsentry/sentry-javascript.git",
+  "homepage": "https://github.com/getsentry/sentry-javascript/tree/master/packages/nitro",
+  "author": "Sentry",
+  "license": "MIT",
+  "keywords": [
+    "nitro",
+    "sentry",
+    "apm",
+    "tracing",
+    "error-tracking"
+  ],
+  "engines": {
+    "node": ">=20.19.0 <22.0.0 || >=22.12.0 <23.0.0 || >=23.2.0"
+  },
+  "files": [
+    "/build"
+  ],
+  "module": "build/esm/index.js",
+  "types": "build/types/index.d.ts",
+  "exports": {
+    "./package.json": "./package.json",
+    ".": {
+      "types": "./build/types/index.d.ts",
+      "default": "./build/esm/index.js"
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "peerDependencies": {
+    "nitro": ">=3.0.0-0 <4.0.0 || 3.0.260311-beta || 3.0.260415-beta || 3.0.260429-beta || 3.0.260522-beta || 3.0.260603-beta || 3.0.260610-beta || 3.0.260903-beta"
+  },
+  "dependencies": {
+    "@sentry/bundler-plugins": "11.12.0",
+    "@sentry/conventions": "^0.32.0",
+    "@sentry/core": "11.12.0",
+    "@sentry/node": "11.12.0",
+    "@sentry/server-runtime-injection": "11.12.0",
+    "@sentry/server-utils": "11.12.0"
+  },
+  "devDependencies": {
+    "@sentry-internal/rollup-utils": "11.12.0",
+    "h3": "^2.0.1-rc.20",
+    "nitro": "^3.0.260415-beta",
+    "srvx": "^0.11.22"
+  },
+  "scripts": {
+    "build": "run-p build:transpile build:types",
+    "build:dev": "pnpm run build",
+    "build:transpile": "rollup -c rollup.npm.config.mjs",
+    "build:types": "run-s build:types:core",
+    "build:types:core": "tsc -p tsconfig.types.json",
+    "build:watch": "run-p build:transpile:watch build:types:watch",
+    "build:dev:watch": "pnpm run build:watch",
+    "build:transpile:watch": "rollup -c rollup.npm.config.mjs --watch",
+    "build:types:watch": "tsc -p tsconfig.types.json --watch",
+    "build:tarball": "pnpm pack",
+    "clean": "node ../../scripts/rm.mjs build coverage sentry-nitro-*.tgz",
+    "lint": "oxlint . --type-aware",
+    "lint:types": "oxlint src --type-aware --type-check",
+    "lint:fix": "oxlint . --fix --type-aware",
+    "lint:es-compatibility": "es-check es2022 ./build/esm/*.js --module",
+    "test": "vitest run",
+    "test:watch": "vitest --watch",
+    "yalc:publish": "yalc publish --push --sig"
+  },
+  "sideEffects": false,
+  "nx": {
+    "targets": {
+      "build:transpile": {
+        "dependsOn": [
+          "^build:transpile",
+          "^build:types",
+          "build:types"
+        ],
+        "outputs": [
+          "{projectRoot}/build/esm"
+        ]
+      }
+    }
+  }
+}

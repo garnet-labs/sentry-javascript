@@ -1,0 +1,10 @@
+{
+  "name": "vite6-integration-tests",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "vite": "6.4.1",
+    "@sentry/bundler-plugins": "11.12.0"
+  }
+}

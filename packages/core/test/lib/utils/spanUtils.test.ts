@@ -1,0 +1,990 @@
+import { SENTRY_LINK_TYPE, SENTRY_STATUS_MESSAGE, SENTRY_OP, SENTRY_ORIGIN } from '@sentry/conventions/attributes';
+import { afterEach, beforeEach, describe, expect, it, test, vi } from 'vitest';
+import {
+  browserPerformanceTimeOrigin,
+  convertSpanLinksForEnvelope,
+  getCurrentScope,
+  Scope,
+  SentryNonRecordingSpan,
+  SentrySpan,
+  setCurrentClient,
+  SPAN_STATUS_ERROR,
+  SPAN_STATUS_OK,
+  SPAN_STATUS_UNSET,
+  spanToTraceHeader,
+  startInactiveSpan,
+  startSpan,
+  timestampInSeconds,
+  TRACEPARENT_REGEXP,
+  withScope,
+} from '../../../src';
+import type { SpanLink } from '../../../src/types/link';
+import type { Span, SpanAttributes, SpanTimeInput, StreamedSpanJSON } from '../../../src/types/span';
+import type { SpanStatus } from '../../../src/types/spanStatus';
+import { _setSpanForScope } from '../../../src/utils/spanOnScope';
+import type { OpenTelemetrySdkTraceBaseSpan } from '../../../src/utils/spanUtils';
+import {
+  addChildSpanToSpan,
+  getActiveSpan,
+  getRootSpan,
+  getSpanDescendants,
+  spanIsSampled,
+  otelTimeInputToSeconds,
+  spanTimeInputToSeconds,
+  spanToStaticSpanJSON,
+  spanToJSON,
+  spanToTraceContext,
+  streamedSpanJsonToSerializedSpan,
+  TRACE_FLAG_NONE,
+  TRACE_FLAG_SAMPLED,
+  updateSpanName,
+} from '../../../src/utils/spanUtils';
+import { getDefaultTestClientOptions, TestClient } from '../../mocks/client';
+import { SENTRY_SEGMENT_NAME_SOURCE } from '@sentry/conventions/attributes';
+
+function createMockedOtelSpan({
+  spanId,
+  traceId,
+  isRemote,
+  attributes = {},
+  startTime = Date.now(),
+  name = 'test span',
+  status = { code: SPAN_STATUS_UNSET },
+  endTime = Date.now(),
+  parentSpanId,
+  links = undefined,
+}: {
+  spanId: string;
+  traceId: string;
+  attributes?: SpanAttributes;
+  startTime?: SpanTimeInput;
+  isRemote?: boolean;
+  name?: string;
+  status?: SpanStatus;
+  endTime?: SpanTimeInput;
+  parentSpanId?: string;
+  links?: SpanLink[];
+}): Span {
+  return {
+    spanContext: () => {
+      return {
+        spanId,
+        traceId,
+        isRemote,
+      };
+    },
+    attributes,
+    startTime,
+    name,
+    status,
+    endTime,
+    parentSpanId,
+    links,
+  } as OpenTelemetrySdkTraceBaseSpan;
+}
+
+describe('spanToTraceHeader', () => {
+  test('simple', () => {
+    const span = new SentrySpan();
+    expect(spanToTraceHeader(span)).toMatch(TRACEPARENT_REGEXP);
+  });
+  test('with sample', () => {
+    const span = new SentrySpan({ sampled: true });
+    expect(spanToTraceHeader(span)).toMatch(TRACEPARENT_REGEXP);
+  });
+});
+
+describe('spanToTraceContext', () => {
+  it('works with a minimal span', () => {
+    const span = new SentrySpan({ spanId: '1234', traceId: 'ABCD' });
+
+    expect(spanToTraceContext(span)).toEqual({
+      span_id: '1234',
+      trace_id: 'ABCD',
+    });
+  });
+
+  it('works with a span with parentSpanId', () => {
+    const span = new SentrySpan({
+      spanId: '1234',
+      traceId: 'ABCD',
+      parentSpanId: '5678',
+    });
+
+    expect(spanToTraceContext(span)).toEqual({
+      span_id: '1234',
+      trace_id: 'ABCD',
+      parent_span_id: '5678',
+    });
+  });
+
+  it('works with a local OTEL span', () => {
+    const span = createMockedOtelSpan({
+      spanId: '1234',
+      traceId: 'ABCD',
+      isRemote: false,
+    });
+
+    expect(spanToTraceContext(span)).toEqual({
+      span_id: '1234',
+      trace_id: 'ABCD',
+    });
+  });
+
+  it('works with a local OTEL span with parentSpanId', () => {
+    const span = createMockedOtelSpan({
+      spanId: '1234',
+      traceId: 'ABCD',
+      isRemote: false,
+      parentSpanId: 'XYZ',
+    });
+
+    expect(spanToTraceContext(span)).toEqual({
+      parent_span_id: 'XYZ',
+      span_id: '1234',
+      trace_id: 'ABCD',
+    });
+  });
+
+  it('works with a remote OTEL span', () => {
+    const span = createMockedOtelSpan({
+      spanId: '1234',
+      traceId: 'ABCD',
+      isRemote: true,
+    });
+
+    expect(spanToTraceContext(span)).toEqual({
+      parent_span_id: '1234',
+      span_id: expect.stringMatching(/^[0-9a-f]{16}$/),
+      trace_id: 'ABCD',
+    });
+  });
+
+  it('works with a remote OTEL span with parentSpanId', () => {
+    const span = createMockedOtelSpan({
+      spanId: '1234',
+      traceId: 'ABCD',
+      isRemote: true,
+      parentSpanId: 'XYZ',
+    });
+
+    expect(spanToTraceContext(span)).toEqual({
+      parent_span_id: '1234',
+      span_id: expect.stringMatching(/^[0-9a-f]{16}$/),
+      trace_id: 'ABCD',
+    });
+  });
+});
+
+describe('convertSpanLinksForEnvelope', () => {
+  it('returns undefined for undefined input', () => {
+    expect(convertSpanLinksForEnvelope(undefined)).toBeUndefined();
+  });
+
+  it('returns undefined for empty array input', () => {
+    expect(convertSpanLinksForEnvelope([])).toBeUndefined();
+  });
+
+  it('converts a single span link to a flattened envelope item', () => {
+    const links: SpanLink[] = [
+      {
+        context: {
+          spanId: 'span1',
+          traceId: 'trace1',
+          traceFlags: TRACE_FLAG_SAMPLED,
+        },
+        attributes: {
+          'sentry.link.type': 'previous_trace',
+        },
+      },
+    ];
+
+    const result = convertSpanLinksForEnvelope(links);
+
+    result?.forEach(item => expect(item).not.toHaveProperty('context'));
+    expect(result).toEqual([
+      {
+        span_id: 'span1',
+        trace_id: 'trace1',
+        sampled: true,
+        attributes: {
+          'sentry.link.type': 'previous_trace',
+        },
+      },
+    ]);
+  });
+
+  it('converts multiple span links to a flattened envelope item', () => {
+    const links: SpanLink[] = [
+      {
+        context: {
+          spanId: 'span1',
+          traceId: 'trace1',
+          traceFlags: TRACE_FLAG_SAMPLED,
+        },
+        attributes: {
+          'sentry.link.type': 'previous_trace',
+        },
+      },
+      {
+        context: {
+          spanId: 'span2',
+          traceId: 'trace2',
+          traceFlags: TRACE_FLAG_NONE,
+        },
+        attributes: {
+          'sentry.link.type': 'another_trace',
+        },
+      },
+    ];
+
+    const result = convertSpanLinksForEnvelope(links);
+
+    result?.forEach(item => expect(item).not.toHaveProperty('context'));
+    expect(result).toEqual([
+      {
+        span_id: 'span1',
+        trace_id: 'trace1',
+        sampled: true,
+        attributes: {
+          'sentry.link.type': 'previous_trace',
+        },
+      },
+      {
+        span_id: 'span2',
+        trace_id: 'trace2',
+        sampled: false,
+        attributes: {
+          'sentry.link.type': 'another_trace',
+        },
+      },
+    ]);
+  });
+
+  it('handles span links without attributes', () => {
+    const links: SpanLink[] = [
+      {
+        context: {
+          spanId: 'span1',
+          traceId: 'trace1',
+          traceFlags: TRACE_FLAG_SAMPLED,
+        },
+      },
+    ];
+
+    const result = convertSpanLinksForEnvelope(links);
+
+    result?.forEach(item => expect(item).not.toHaveProperty('context'));
+    expect(result).toEqual([
+      {
+        span_id: 'span1',
+        trace_id: 'trace1',
+        sampled: true,
+      },
+    ]);
+  });
+});
+
+describe('spanTimeInputToSeconds', () => {
+  it('works with undefined', () => {
+    const now = timestampInSeconds();
+    expect(spanTimeInputToSeconds(undefined)).toBeGreaterThanOrEqual(now);
+  });
+
+  it('works with a timestamp in seconds', () => {
+    const timestamp = timestampInSeconds();
+    expect(spanTimeInputToSeconds(timestamp)).toEqual(timestamp);
+  });
+
+  it('works with a timestamp in milliseconds', () => {
+    const timestamp = Date.now();
+    expect(spanTimeInputToSeconds(timestamp)).toEqual(timestamp / 1000);
+  });
+
+  it('works with a Date object', () => {
+    const timestamp = new Date();
+    expect(spanTimeInputToSeconds(timestamp)).toEqual(timestamp.getTime() / 1000);
+  });
+
+  it('works with a simple array', () => {
+    const seconds = Math.floor(timestampInSeconds());
+    const timestamp: [number, number] = [seconds, 0];
+    expect(spanTimeInputToSeconds(timestamp)).toEqual(seconds);
+  });
+
+  it('works with a array with nanoseconds', () => {
+    const seconds = Math.floor(timestampInSeconds());
+    const timestamp: [number, number] = [seconds, 9000];
+    expect(spanTimeInputToSeconds(timestamp)).toEqual(seconds + 0.000009);
+  });
+});
+
+describe('otelTimeInputToSeconds', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.resetModules();
+  });
+
+  it('treats epoch milliseconds as milliseconds', () => {
+    const timestamp = Date.now();
+    expect(otelTimeInputToSeconds(timestamp)).toEqual(timestamp / 1000);
+  });
+
+  it('treats small numbers as `performance.now()` milliseconds', () => {
+    const origin = browserPerformanceTimeOrigin()!;
+    expect(otelTimeInputToSeconds(1_234.5)).toEqual((origin + 1_234.5) / 1000);
+  });
+
+  it('treats `performance.now()` milliseconds after a long uptime as relative', () => {
+    // 30 days of uptime, which overlaps with the range of epoch seconds
+    const performanceNow = 30 * 24 * 60 * 60 * 1000;
+    const origin = browserPerformanceTimeOrigin()!;
+    expect(otelTimeInputToSeconds(performanceNow)).toEqual((origin + performanceNow) / 1000);
+  });
+
+  it('treats a `performance.now()` value that is still in the future as relative', () => {
+    const performanceNow = performance.now() + 25;
+    const origin = browserPerformanceTimeOrigin()!;
+    expect(otelTimeInputToSeconds(performanceNow)).toEqual((origin + performanceNow) / 1000);
+  });
+
+  it('falls back to the current time if the Performance API is unavailable', async () => {
+    vi.stubGlobal('performance', undefined);
+    const { otelTimeInputToSeconds } = await import('../../../src/utils/spanUtils');
+
+    const before = Date.now() / 1000;
+    const seconds = otelTimeInputToSeconds(1_234.5);
+    expect(seconds).toBeGreaterThanOrEqual(before);
+    expect(seconds).toBeLessThanOrEqual(Date.now() / 1000);
+  });
+});
+
+describe('spanToStaticSpanJSON', () => {
+  describe('SentrySpan', () => {
+    it('works with a simple span', () => {
+      const span = new SentrySpan();
+      expect(spanToStaticSpanJSON(span)).toEqual({
+        span_id: span.spanContext().spanId,
+        trace_id: span.spanContext().traceId,
+        origin: 'manual',
+        start_timestamp: span['_startTime'],
+        status: 'ok',
+        data: {
+          'sentry.origin': 'manual',
+        },
+      });
+    });
+
+    it('works with a full span', () => {
+      const span = new SentrySpan({
+        name: 'test name',
+        op: 'test op',
+        parentSpanId: '1234',
+        spanId: '5678',
+        traceId: 'abcd',
+        startTimestamp: 123,
+        attributes: {
+          [SENTRY_ORIGIN]: 'auto',
+        },
+      });
+      span.setStatus({ code: SPAN_STATUS_OK });
+      span.end(456);
+
+      expect(spanToStaticSpanJSON(span)).toEqual({
+        description: 'test name',
+        op: 'test op',
+        parent_span_id: '1234',
+        span_id: '5678',
+        status: 'ok',
+        trace_id: 'abcd',
+        origin: 'auto',
+        start_timestamp: 123,
+        timestamp: 456,
+        data: {
+          'sentry.op': 'test op',
+          'sentry.origin': 'auto',
+        },
+      });
+    });
+  });
+
+  describe('OpenTelemetry Span', () => {
+    it('works with a simple span', () => {
+      const span = createMockedOtelSpan({
+        spanId: 'SPAN-1',
+        traceId: 'TRACE-1',
+        name: 'test span',
+        startTime: 123,
+        endTime: [0, 0],
+        attributes: {},
+        status: { code: SPAN_STATUS_UNSET },
+      });
+
+      expect(spanToStaticSpanJSON(span)).toEqual({
+        span_id: 'SPAN-1',
+        trace_id: 'TRACE-1',
+        start_timestamp: 123,
+        description: 'test span',
+        data: {},
+        status: 'ok',
+      });
+    });
+
+    it('works with a full span', () => {
+      const span = createMockedOtelSpan({
+        spanId: 'SPAN-1',
+        traceId: 'TRACE-1',
+        name: 'test span',
+        startTime: 123,
+        endTime: 456,
+        attributes: {
+          attr1: 'value1',
+          attr2: 2,
+          [SENTRY_OP]: 'test op',
+          [SENTRY_ORIGIN]: 'auto',
+        },
+        status: { code: SPAN_STATUS_ERROR, message: 'unknown_error' },
+      });
+
+      expect(spanToStaticSpanJSON(span)).toEqual({
+        span_id: 'SPAN-1',
+        trace_id: 'TRACE-1',
+        start_timestamp: 123,
+        timestamp: 456,
+        description: 'test span',
+        op: 'test op',
+        origin: 'auto',
+        data: {
+          attr1: 'value1',
+          attr2: 2,
+          [SENTRY_OP]: 'test op',
+          [SENTRY_ORIGIN]: 'auto',
+        },
+        status: 'unknown_error',
+      });
+    });
+  });
+
+  describe('spanToJSON', () => {
+    describe('SentrySpan', () => {
+      it('converts a minimal span', () => {
+        const span = new SentrySpan();
+        expect(spanToJSON(span)).toEqual({
+          span_id: expect.stringMatching(/^[0-9a-f]{16}$/),
+          trace_id: expect.stringMatching(/^[0-9a-f]{32}$/),
+          name: '',
+          start_timestamp: expect.any(Number),
+          end_timestamp: undefined,
+          status: 'ok',
+          is_segment: true,
+          attributes: {
+            [SENTRY_ORIGIN]: 'manual',
+          },
+        });
+      });
+
+      it('converts a full span', () => {
+        const span = new SentrySpan({
+          op: 'test op',
+          name: 'test name',
+          parentSpanId: '1234',
+          spanId: '5678',
+          traceId: 'abcd',
+          startTimestamp: 123,
+          attributes: {
+            [SENTRY_ORIGIN]: 'auto',
+            attr1: 'value1',
+            attr2: 2,
+            attr3: true,
+          },
+          links: [
+            {
+              context: {
+                spanId: 'span1',
+                traceId: 'trace1',
+                traceFlags: TRACE_FLAG_SAMPLED,
+              },
+              attributes: {
+                'sentry.link.type': 'previous_trace',
+              },
+            },
+          ],
+        });
+        span.setStatus({ code: SPAN_STATUS_OK });
+        span.setAttribute('attr4', [1, 2, 3]);
+        span.end(456);
+
+        expect(spanToJSON(span)).toEqual({
+          name: 'test name',
+          parent_span_id: '1234',
+          span_id: '5678',
+          trace_id: 'abcd',
+          start_timestamp: 123,
+          end_timestamp: 456,
+          status: 'ok',
+          is_segment: true,
+          attributes: {
+            attr1: 'value1',
+            attr2: 2,
+            attr3: true,
+            attr4: [1, 2, 3],
+            [SENTRY_OP]: 'test op',
+            [SENTRY_ORIGIN]: 'auto',
+          },
+          links: [
+            {
+              span_id: 'span1',
+              trace_id: 'trace1',
+              sampled: true,
+              attributes: {
+                [SENTRY_LINK_TYPE]: 'previous_trace',
+              },
+            },
+          ],
+        });
+      });
+      it('preserves an error status message as the sentry.status.message attribute', () => {
+        const span = new SentrySpan({ name: 'test name' });
+        span.setStatus({ code: SPAN_STATUS_ERROR, message: 'Connection Refused' });
+
+        const json = spanToJSON(span);
+        expect(json.status).toBe('error');
+        expect(json.attributes?.[SENTRY_STATUS_MESSAGE]).toBe('Connection Refused');
+      });
+
+      it('does not set a status message for ok spans', () => {
+        const span = new SentrySpan({ name: 'test name' });
+        span.setStatus({ code: SPAN_STATUS_OK });
+
+        const json = spanToJSON(span);
+        expect(json.status).toBe('ok');
+        expect(json.attributes?.[SENTRY_STATUS_MESSAGE]).toBeUndefined();
+      });
+
+      it('does not set a status message for error spans without a message', () => {
+        const span = new SentrySpan({ name: 'test name' });
+        span.setStatus({ code: SPAN_STATUS_ERROR });
+
+        const json = spanToJSON(span);
+        expect(json.status).toBe('error');
+        expect(json.attributes?.[SENTRY_STATUS_MESSAGE]).toBeUndefined();
+      });
+
+      it('treats a cancelled status as ok and does not set a status message', () => {
+        const span = new SentrySpan({ name: 'test name' });
+        span.setStatus({ code: SPAN_STATUS_ERROR, message: 'cancelled' });
+
+        const json = spanToJSON(span);
+        expect(json.status).toBe('ok');
+        expect(json.attributes?.[SENTRY_STATUS_MESSAGE]).toBeUndefined();
+      });
+
+      it('does not overwrite an explicitly set sentry.status.message attribute', () => {
+        const span = new SentrySpan({
+          name: 'test name',
+          attributes: { [SENTRY_STATUS_MESSAGE]: 'explicit message' },
+        });
+        span.setStatus({ code: SPAN_STATUS_ERROR, message: 'Connection Refused' });
+
+        const json = spanToJSON(span);
+        expect(json.attributes?.[SENTRY_STATUS_MESSAGE]).toBe('explicit message');
+      });
+    });
+    describe('OpenTelemetry Span', () => {
+      it('converts a simple span', () => {
+        const span = createMockedOtelSpan({
+          spanId: 'SPAN-1',
+          traceId: 'TRACE-1',
+          name: 'test span',
+          startTime: 123,
+          endTime: [0, 0],
+          attributes: {},
+          status: { code: SPAN_STATUS_UNSET },
+        });
+
+        expect(spanToJSON(span)).toEqual({
+          span_id: 'SPAN-1',
+          trace_id: 'TRACE-1',
+          parent_span_id: undefined,
+          start_timestamp: 123,
+          end_timestamp: undefined,
+          name: 'test span',
+          is_segment: true,
+          status: 'ok',
+          attributes: {},
+        });
+      });
+
+      it('converts a full span', () => {
+        const span = createMockedOtelSpan({
+          spanId: 'SPAN-1',
+          traceId: 'TRACE-1',
+          parentSpanId: 'PARENT-1',
+          name: 'test span',
+          startTime: 123,
+          endTime: 456,
+          attributes: {
+            attr1: 'value1',
+            attr2: 2,
+            [SENTRY_OP]: 'test op',
+            [SENTRY_ORIGIN]: 'auto',
+          },
+          links: [
+            {
+              context: {
+                spanId: 'span1',
+                traceId: 'trace1',
+                traceFlags: TRACE_FLAG_SAMPLED,
+              },
+              attributes: {
+                [SENTRY_LINK_TYPE]: 'previous_trace',
+              },
+            },
+          ],
+          status: { code: SPAN_STATUS_ERROR, message: 'unknown_error' },
+        });
+
+        expect(spanToJSON(span)).toEqual({
+          span_id: 'SPAN-1',
+          trace_id: 'TRACE-1',
+          parent_span_id: 'PARENT-1',
+          start_timestamp: 123,
+          end_timestamp: 456,
+          name: 'test span',
+          is_segment: true,
+          status: 'error',
+          attributes: {
+            attr1: 'value1',
+            attr2: 2,
+            [SENTRY_OP]: 'test op',
+            [SENTRY_ORIGIN]: 'auto',
+            [SENTRY_STATUS_MESSAGE]: 'unknown_error',
+          },
+          links: [
+            {
+              span_id: 'span1',
+              trace_id: 'trace1',
+              sampled: true,
+              attributes: {
+                [SENTRY_LINK_TYPE]: 'previous_trace',
+              },
+            },
+          ],
+        });
+      });
+
+      it('preserves a custom error status message as the sentry.status.message attribute', () => {
+        const span = createMockedOtelSpan({
+          spanId: 'SPAN-1',
+          traceId: 'TRACE-1',
+          name: 'test span',
+          startTime: 123,
+          endTime: 456,
+          attributes: {},
+          status: { code: SPAN_STATUS_ERROR, message: 'Connection Refused' },
+        });
+
+        const json = spanToJSON(span);
+        expect(json.status).toBe('error');
+        expect(json.attributes?.[SENTRY_STATUS_MESSAGE]).toBe('Connection Refused');
+      });
+
+      it('does not set a status message for ok/unset spans', () => {
+        const span = createMockedOtelSpan({
+          spanId: 'SPAN-1',
+          traceId: 'TRACE-1',
+          name: 'test span',
+          startTime: 123,
+          endTime: 456,
+          attributes: {},
+          status: { code: SPAN_STATUS_UNSET },
+        });
+
+        const json = spanToJSON(span);
+        expect(json.status).toBe('ok');
+        expect(json.attributes?.[SENTRY_STATUS_MESSAGE]).toBeUndefined();
+      });
+    });
+  });
+
+  describe('streamedSpanJsonToSerializedSpan', () => {
+    it('converts a streamed span JSON with links to a serialized span', () => {
+      const spanJson: StreamedSpanJSON = {
+        name: 'test name',
+        parent_span_id: '1234',
+        span_id: '5678',
+        trace_id: 'abcd',
+        start_timestamp: 123,
+        end_timestamp: 456,
+        status: 'ok',
+        is_segment: true,
+        attributes: {
+          attr1: 'value1',
+          attr2: 2,
+          attr3: true,
+          attr4: [1, 2, 3],
+          [SENTRY_OP]: 'test op',
+          [SENTRY_ORIGIN]: 'auto',
+        },
+        links: [
+          {
+            span_id: 'span1',
+            trace_id: 'trace1',
+            sampled: true,
+            attributes: {
+              [SENTRY_LINK_TYPE]: 'previous_trace',
+            },
+          },
+        ],
+      };
+
+      expect(streamedSpanJsonToSerializedSpan(spanJson)).toEqual({
+        name: 'test name',
+        parent_span_id: '1234',
+        span_id: '5678',
+        trace_id: 'abcd',
+        start_timestamp: 123,
+        end_timestamp: 456,
+        status: 'ok',
+        is_segment: true,
+        attributes: {
+          attr1: { type: 'string', value: 'value1' },
+          attr2: { type: 'integer', value: 2 },
+          attr3: { type: 'boolean', value: true },
+          attr4: { type: 'array', value: [1, 2, 3] },
+          [SENTRY_OP]: { type: 'string', value: 'test op' },
+          [SENTRY_ORIGIN]: { type: 'string', value: 'auto' },
+        },
+        links: [
+          {
+            span_id: 'span1',
+            trace_id: 'trace1',
+            sampled: true,
+            attributes: {
+              [SENTRY_LINK_TYPE]: { type: 'string', value: 'previous_trace' },
+            },
+          },
+        ],
+      });
+    });
+  });
+
+  it('returns minimal object for unknown span implementation', () => {
+    const span = {
+      // This is the minimal interface we require from a span
+      spanContext: () => ({
+        spanId: 'SPAN-1',
+        traceId: 'TRACE-1',
+      }),
+    };
+
+    expect(spanToStaticSpanJSON(span as unknown as Span)).toEqual({
+      status: 'ok',
+      span_id: 'SPAN-1',
+      trace_id: 'TRACE-1',
+      start_timestamp: 0,
+      data: {},
+    });
+  });
+});
+
+describe('spanIsSampled', () => {
+  test('sampled', () => {
+    const span = new SentrySpan({ sampled: true });
+    expect(spanIsSampled(span)).toBe(true);
+  });
+
+  test('not sampled', () => {
+    const span = new SentrySpan({ sampled: false });
+    expect(spanIsSampled(span)).toBe(false);
+  });
+});
+
+// `end_timestamp` is what call sites use to tell an open span from an ended one, so it must stay
+// unset until the span actually ends — across all span implementations.
+describe('spanToJSON end_timestamp', () => {
+  test('SentrySpan', () => {
+    const span = new SentrySpan({ name: 'test' });
+    expect(spanToJSON(span).end_timestamp).toBeUndefined();
+
+    span.end();
+    expect(spanToJSON(span).end_timestamp).toBeDefined();
+  });
+
+  test('unsampled SentrySpan', () => {
+    const span = new SentrySpan({ name: 'test', sampled: false });
+    expect(spanToJSON(span).end_timestamp).toBeUndefined();
+
+    span.end();
+    expect(spanToJSON(span).end_timestamp).toBeDefined();
+  });
+
+  test('OpenTelemetry span', () => {
+    const openSpan = createMockedOtelSpan({ spanId: 'SPAN-1', traceId: 'TRACE-1', endTime: [0, 0] });
+    expect(spanToJSON(openSpan).end_timestamp).toBeUndefined();
+
+    const endedSpan = createMockedOtelSpan({ spanId: 'SPAN-1', traceId: 'TRACE-1', endTime: 456 });
+    expect(spanToJSON(endedSpan).end_timestamp).toBe(456);
+  });
+
+  test('SentryNonRecordingSpan', () => {
+    expect(spanToJSON(new SentryNonRecordingSpan()).end_timestamp).toBeUndefined();
+  });
+});
+
+describe('getRootSpan', () => {
+  beforeEach(() => {
+    const client = new TestClient(getDefaultTestClientOptions({ tracesSampleRate: 1 }));
+    setCurrentClient(client);
+  });
+
+  it('returns the root span of a span that is a root span', () => {
+    const root = new SentrySpan({ name: 'test' });
+
+    expect(getRootSpan(root)).toBe(root);
+  });
+
+  it('returns the root span of a child span', () => {
+    startSpan({ name: 'outer' }, root => {
+      startSpan({ name: 'inner' }, inner => {
+        expect(getRootSpan(inner)).toBe(root);
+        startSpan({ name: 'inner2' }, inner2 => {
+          expect(getRootSpan(inner2)).toBe(root);
+
+          const inactiveSpan = startInactiveSpan({ name: 'inactive' });
+          expect(getRootSpan(inactiveSpan)).toBe(root);
+        });
+      });
+    });
+  });
+});
+
+describe('getActiveSpan', () => {
+  beforeEach(() => {
+    const client = new TestClient(getDefaultTestClientOptions({ tracesSampleRate: 1 }));
+    setCurrentClient(client);
+  });
+
+  it('returns undefined if no span is active on the current scope', () => {
+    expect(getActiveSpan()).toBeUndefined();
+  });
+
+  it('returns the span active on the current scope', () => {
+    startSpan({ name: 'test' }, span => {
+      expect(getActiveSpan()).toBe(span);
+    });
+  });
+
+  it('returns the span for the passed-in scope instead of the current scope', () => {
+    const span = new SentrySpan({ name: 'test' });
+    const scope = new Scope();
+    _setSpanForScope(scope, span);
+
+    expect(getActiveSpan(scope)).toBe(span);
+  });
+
+  it('returns the span of the passed-in scope even when a different span is active on the current scope', () => {
+    const scopeSpan = new SentrySpan({ name: 'scope-span' });
+    const scope = new Scope();
+    _setSpanForScope(scope, scopeSpan);
+
+    startSpan({ name: 'active-span' }, activeSpan => {
+      expect(getActiveSpan()).toBe(activeSpan);
+      expect(getActiveSpan(scope)).toBe(scopeSpan);
+    });
+  });
+
+  it('returns undefined if the passed-in scope has no span', () => {
+    const scope = new Scope();
+
+    startSpan({ name: 'active-span' }, () => {
+      expect(getActiveSpan(scope)).toBeUndefined();
+    });
+  });
+
+  it('reads the span from the current scope when no scope is passed in', () => {
+    const span = new SentrySpan({ name: 'test' });
+
+    withScope(scope => {
+      _setSpanForScope(scope, span);
+      expect(scope).toBe(getCurrentScope());
+      expect(getActiveSpan()).toBe(span);
+    });
+  });
+});
+
+describe('addChildSpanToSpan', () => {
+  it('does not track children on an unsampled span', () => {
+    const parent = new SentrySpan({ name: 'parent', sampled: false });
+    const child = new SentrySpan({ name: 'child', sampled: false });
+
+    addChildSpanToSpan(parent, child);
+
+    expect(getRootSpan(child)).toBe(parent);
+    expect((parent as unknown as { _sentryChildSpans?: Set<Span> })._sentryChildSpans).toBeUndefined();
+  });
+
+  it('does not track children on a segment span that stopped recording', () => {
+    const parent = new SentrySpan({ name: 'parent', sampled: true });
+    parent.end();
+
+    const child = new SentrySpan({ name: 'child', sampled: true });
+    addChildSpanToSpan(parent, child);
+
+    // the child that was not tracked can still find its root span
+    expect(getRootSpan(child)).toBe(parent);
+    expect(getSpanDescendants(parent)).toEqual([parent]);
+  });
+
+  it('keeps tracking children on an ended span while its segment span is still recording', () => {
+    const segment = new SentrySpan({ name: 'segment', sampled: true });
+    const parent = new SentrySpan({ name: 'parent', sampled: true });
+    addChildSpanToSpan(segment, parent);
+    parent.end();
+
+    const child = new SentrySpan({ name: 'child', sampled: true });
+    addChildSpanToSpan(parent, child);
+
+    // the segment span is still open, so its transaction has not been assembled yet
+    expect(getSpanDescendants(segment)).toEqual([segment, parent, child]);
+  });
+
+  it('stops tracking children on an ended span once its segment span has ended', () => {
+    const segment = new SentrySpan({ name: 'segment', sampled: true });
+    const parent = new SentrySpan({ name: 'parent', sampled: true });
+    addChildSpanToSpan(segment, parent);
+    parent.end();
+    segment.end();
+
+    const child = new SentrySpan({ name: 'child', sampled: true });
+    addChildSpanToSpan(parent, child);
+
+    // the child that was not tracked can still find its root span
+    expect(getRootSpan(child)).toBe(segment);
+    expect(getSpanDescendants(segment)).toEqual([segment, parent]);
+  });
+
+  it('keeps tracking children on a still-recording span after its segment span ended', () => {
+    const segment = new SentrySpan({ name: 'segment', sampled: true });
+    const lateChild = new SentrySpan({ name: 'late child', sampled: true });
+    addChildSpanToSpan(segment, lateChild);
+    segment.end();
+
+    const grandChild = new SentrySpan({ name: 'grandchild', sampled: true });
+    addChildSpanToSpan(lateChild, grandChild);
+
+    // a late child that outlives its segment is re-emitted as its own orphan transaction with its
+    // subtree, so the subtree must keep collecting
+    expect(getSpanDescendants(lateChild)).toEqual([lateChild, grandChild]);
+  });
+});
+
+describe('updateSpanName', () => {
+  it('updates the span name and source', () => {
+    const span = new SentrySpan({ name: 'old-name', attributes: { [SENTRY_SEGMENT_NAME_SOURCE]: 'url' } });
+    updateSpanName(span, 'new-name');
+    const spanJSON = spanToJSON(span);
+    expect(spanJSON.name).toBe('new-name');
+    expect(spanJSON.attributes[SENTRY_SEGMENT_NAME_SOURCE]).toBe('custom');
+  });
+});

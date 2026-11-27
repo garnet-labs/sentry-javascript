@@ -1,0 +1,373 @@
+import { afterEach, beforeEach, describe, expect, it, test, vi } from 'vitest';
+import {
+  getClient,
+  registerExternalPropagationContext,
+  SEMANTIC_ATTRIBUTE_SENTRY_SAMPLE_RATE,
+  setCurrentClient,
+} from '../../../src';
+import { DEFAULT_ENVIRONMENT } from '../../../src/constants';
+import { Scope } from '../../../src/scope';
+import {
+  getDynamicSamplingContextFromSpan,
+  SentryNonRecordingSpan,
+  SentrySpan,
+  setCapturedScopesOnSpan,
+} from '../../../src/tracing';
+import { startInactiveSpan } from '../../../src/tracing/trace';
+import { freezeDscOnSpan, getDynamicSamplingContextFromClient } from '../../../src/tracing/dynamicSamplingContext';
+import type { Span, SpanContextData } from '../../../src/types/span';
+import type { TransactionSource } from '../../../src/types/transaction';
+import { getDefaultTestClientOptions, TestClient } from '../../mocks/client';
+import { SENTRY_SEGMENT_NAME_SOURCE } from '@sentry/conventions/attributes';
+
+describe('getDynamicSamplingContextFromSpan', () => {
+  beforeEach(() => {
+    const options = getDefaultTestClientOptions({ tracesSampleRate: 1.0, release: '1.0.1' });
+    const client = new TestClient(options);
+    setCurrentClient(client);
+    client.init();
+  });
+
+  afterEach(() => {
+    vi.resetAllMocks();
+  });
+
+  test('uses frozen DSC from span', () => {
+    const rootSpan = new SentrySpan({
+      name: 'tx',
+      sampled: true,
+    });
+
+    freezeDscOnSpan(rootSpan, { environment: 'myEnv' });
+
+    const dynamicSamplingContext = getDynamicSamplingContextFromSpan(rootSpan);
+
+    expect(dynamicSamplingContext).toStrictEqual({ environment: 'myEnv' });
+  });
+
+  test('uses frozen DSC from traceState', () => {
+    const rootSpan = {
+      spanContext() {
+        return {
+          traceId: '1234',
+          spanId: '12345',
+          traceFlags: 0,
+          traceState: {
+            get(key: string) {
+              if (key === 'sentry.dsc') {
+                return 'sentry-environment=myEnv2';
+              } else {
+                return undefined;
+              }
+            },
+          } as unknown as SpanContextData['traceState'],
+        };
+      },
+    } as Span;
+
+    const dynamicSamplingContext = getDynamicSamplingContextFromSpan(rootSpan);
+
+    expect(dynamicSamplingContext).toStrictEqual({ environment: 'myEnv2' });
+  });
+
+  test('preserves incoming DSC for ignored segment spans with a negative sampling decision', () => {
+    const traceId = '12345678901234567890123456789012';
+    const scope = new Scope();
+    scope.setPropagationContext({
+      traceId,
+      parentSpanId: '1234567890123456',
+      sampled: true,
+      dsc: {
+        trace_id: traceId,
+        sample_rate: '1',
+        sampled: 'true',
+        public_key: 'public',
+        sample_rand: '0.5',
+      },
+      sampleRand: 0.5,
+    });
+    const rootSpan = new SentryNonRecordingSpan({ dropReason: 'ignored', traceId });
+    setCapturedScopesOnSpan(rootSpan, scope, scope);
+
+    const dynamicSamplingContext = getDynamicSamplingContextFromSpan(rootSpan);
+
+    expect(dynamicSamplingContext).toEqual({
+      trace_id: traceId,
+      sample_rate: '1',
+      sampled: 'false',
+      public_key: 'public',
+      sample_rand: '0.5',
+    });
+  });
+
+  test('returns a new DSC, if no DSC was provided during rootSpan creation (via attributes)', () => {
+    const rootSpan = startInactiveSpan({ name: 'tx' });
+
+    // Setting the attribute should overwrite the computed values
+    rootSpan.setAttribute(SEMANTIC_ATTRIBUTE_SENTRY_SAMPLE_RATE, 0.56);
+    rootSpan.setAttribute(SENTRY_SEGMENT_NAME_SOURCE, 'route');
+
+    const dynamicSamplingContext = getDynamicSamplingContextFromSpan(rootSpan);
+
+    expect(dynamicSamplingContext).toStrictEqual({
+      public_key: undefined,
+      org_id: undefined,
+      release: '1.0.1',
+      environment: 'production',
+      sampled: 'true',
+      sample_rate: '0.56',
+      trace_id: expect.stringMatching(/^[a-f0-9]{32}$/),
+      transaction: 'tx',
+      sample_rand: expect.any(String),
+    });
+  });
+
+  test('returns a new DSC, if no DSC was provided during rootSpan creation (via deprecated metadata)', () => {
+    const rootSpan = startInactiveSpan({
+      name: 'tx',
+    });
+
+    const dynamicSamplingContext = getDynamicSamplingContextFromSpan(rootSpan);
+
+    expect(dynamicSamplingContext).toStrictEqual({
+      public_key: undefined,
+      org_id: undefined,
+      release: '1.0.1',
+      environment: 'production',
+      sampled: 'true',
+      sample_rate: '1',
+      trace_id: expect.stringMatching(/^[a-f0-9]{32}$/),
+      transaction: 'tx',
+      sample_rand: expect.any(String),
+    });
+  });
+
+  test('returns a new DSC, if no DSC was provided during rootSpan creation (via new Txn and deprecated metadata)', () => {
+    const rootSpan = new SentrySpan({
+      name: 'tx',
+      attributes: {
+        [SEMANTIC_ATTRIBUTE_SENTRY_SAMPLE_RATE]: 0.56,
+        [SENTRY_SEGMENT_NAME_SOURCE]: 'route',
+      },
+      sampled: true,
+    });
+
+    const dynamicSamplingContext = getDynamicSamplingContextFromSpan(rootSpan);
+
+    expect(dynamicSamplingContext).toStrictEqual({
+      public_key: undefined,
+      org_id: undefined,
+      release: '1.0.1',
+      environment: 'production',
+      sampled: 'true',
+      sample_rate: '0.56',
+      trace_id: expect.stringMatching(/^[a-f0-9]{32}$/),
+      transaction: 'tx',
+      sample_rand: undefined, // this is a bit funky admittedly
+    });
+  });
+
+  describe('Including rootSpan name in DSC', () => {
+    test('is not included if rootSpan source is url', () => {
+      const rootSpan = new SentrySpan({
+        name: 'tx',
+        attributes: {
+          [SENTRY_SEGMENT_NAME_SOURCE]: 'url',
+          [SEMANTIC_ATTRIBUTE_SENTRY_SAMPLE_RATE]: 0.56,
+        },
+      });
+
+      const dsc = getDynamicSamplingContextFromSpan(rootSpan);
+      expect(dsc.transaction).toBeUndefined();
+    });
+
+    test.each([
+      ['is included if rootSpan source is parameterized route/url', 'route'],
+      ['is included if rootSpan source is a custom name', 'custom'],
+    ] as const)('%s', (_: string, source: TransactionSource) => {
+      const rootSpan = startInactiveSpan({
+        name: 'tx',
+        attributes: {
+          [SENTRY_SEGMENT_NAME_SOURCE]: source,
+        },
+      });
+
+      rootSpan.setAttribute(SENTRY_SEGMENT_NAME_SOURCE, source);
+
+      const dsc = getDynamicSamplingContextFromSpan(rootSpan);
+
+      expect(dsc.transaction).toEqual('tx');
+    });
+  });
+
+  it("doesn't return the sampled flag in the DSC if in Tracing without Performance mode", () => {
+    const rootSpan = new SentrySpan({
+      name: 'tx',
+      sampled: undefined,
+    });
+
+    // Simulate TwP mode by deleting the tracesSampleRate option set in beforeEach
+    delete getClient()?.getOptions().tracesSampleRate;
+
+    const dynamicSamplingContext = getDynamicSamplingContextFromSpan(rootSpan);
+
+    expect(dynamicSamplingContext).toStrictEqual({
+      public_key: undefined,
+      org_id: undefined,
+      release: '1.0.1',
+      environment: 'production',
+      trace_id: expect.stringMatching(/^[a-f0-9]{32}$/),
+      transaction: 'tx',
+    });
+  });
+
+  it('derives the DSC from the span when an external propagation context is active', () => {
+    const options = getDefaultTestClientOptions({ tracesSampleRate: undefined, release: '1.0.1' });
+    const client = new TestClient(options);
+    setCurrentClient(client);
+    client.init();
+
+    // The scope yields no DSC while riding an external (e.g. OpenTelemetry) trace, but a Sentry span
+    // means we are head of its trace, so the DSC comes from the span rather than being left empty.
+    registerExternalPropagationContext(() => ({
+      traceId: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      spanId: 'bbbbbbbbbbbbbbbb',
+    }));
+
+    try {
+      const rootSpan = new SentryNonRecordingSpan({ traceId: 'cccccccccccccccccccccccccccccccc' });
+      setCapturedScopesOnSpan(rootSpan, new Scope(), new Scope());
+
+      expect(getDynamicSamplingContextFromSpan(rootSpan)).toMatchObject({
+        trace_id: 'cccccccccccccccccccccccccccccccc',
+      });
+    } finally {
+      registerExternalPropagationContext(() => undefined);
+    }
+  });
+});
+
+describe('getDynamicSamplingContextFromClient', () => {
+  const TRACE_ID = '4b25bc58f14243d8b208d1e22a054164';
+  let client: TestClient;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    vi.resetAllMocks();
+  });
+
+  it('creates DSC with basic client information', () => {
+    client = new TestClient(
+      getDefaultTestClientOptions({
+        release: '1.0.0',
+        environment: 'test-env',
+        dsn: 'https://public@sentry.example.com/1',
+      }),
+    );
+
+    const dsc = getDynamicSamplingContextFromClient(TRACE_ID, client);
+
+    expect(dsc).toEqual({
+      trace_id: TRACE_ID,
+      release: '1.0.0',
+      environment: 'test-env',
+      public_key: 'public',
+      org_id: undefined,
+    });
+  });
+
+  it('uses DEFAULT_ENVIRONMENT when environment is not specified', () => {
+    client = new TestClient(
+      getDefaultTestClientOptions({
+        release: '1.0.0',
+        dsn: 'https://public@sentry.example.com/1',
+      }),
+    );
+
+    const dsc = getDynamicSamplingContextFromClient(TRACE_ID, client);
+
+    expect(dsc.environment).toBe(DEFAULT_ENVIRONMENT);
+  });
+
+  it('uses orgId from options when specified', () => {
+    client = new TestClient(
+      getDefaultTestClientOptions({
+        orgId: '00222111',
+        dsn: 'https://public@sentry.example.com/1',
+      }),
+    );
+
+    const dsc = getDynamicSamplingContextFromClient(TRACE_ID, client);
+
+    expect(dsc.org_id).toBe('00222111');
+  });
+
+  it('infers orgId from DSN host when not explicitly provided', () => {
+    client = new TestClient(
+      getDefaultTestClientOptions({
+        dsn: 'https://public@o123456.sentry.io/1',
+      }),
+    );
+
+    const dsc = getDynamicSamplingContextFromClient(TRACE_ID, client);
+
+    expect(dsc.org_id).toBe('123456');
+  });
+
+  it('prioritizes explicit orgId over inferred from DSN', () => {
+    client = new TestClient(
+      getDefaultTestClientOptions({
+        orgId: '1234560',
+        dsn: 'https://public@my-org.sentry.io/1',
+      }),
+    );
+
+    const dsc = getDynamicSamplingContextFromClient(TRACE_ID, client);
+
+    expect(dsc.org_id).toBe('1234560');
+  });
+
+  it('handles orgId passed as number', () => {
+    client = new TestClient(
+      getDefaultTestClientOptions({
+        dsn: 'https://public@my-org.sentry.io/1',
+        orgId: 123456,
+      }),
+    );
+
+    const dsc = getDynamicSamplingContextFromClient(TRACE_ID, client);
+
+    expect(dsc.org_id).toBe('123456');
+  });
+
+  it('handles missing DSN gracefully', () => {
+    client = new TestClient(
+      getDefaultTestClientOptions({
+        release: '1.0.0',
+      }),
+    );
+
+    const dsc = getDynamicSamplingContextFromClient(TRACE_ID, client);
+
+    expect(dsc.public_key).toBeUndefined();
+    expect(dsc.org_id).toBeUndefined();
+  });
+
+  it('emits createDsc event with the generated DSC', () => {
+    client = new TestClient(
+      getDefaultTestClientOptions({
+        release: '1.0.0',
+        dsn: 'https://public@sentry.example.com/1',
+      }),
+    );
+
+    const emitSpy = vi.spyOn(client, 'emit');
+
+    const dsc = getDynamicSamplingContextFromClient(TRACE_ID, client);
+
+    expect(emitSpy).toHaveBeenCalledWith('createDsc', dsc);
+  });
+});

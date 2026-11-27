@@ -1,0 +1,88 @@
+import * as SentryReact from '@sentry/react';
+import { SDK_VERSION } from '@sentry/react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { init } from '../../src/client';
+
+const reactInit = vi.spyOn(SentryReact, 'init');
+
+describe('TanStack Start React Client SDK', () => {
+  describe('init', () => {
+    beforeEach(() => {
+      vi.clearAllMocks();
+      vi.unstubAllGlobals();
+      SentryReact.getCurrentScope().setClient(undefined);
+    });
+
+    it('Adds TanStack Start React client metadata to the SDK options', () => {
+      expect(reactInit).not.toHaveBeenCalled();
+
+      init({
+        dsn: 'https://public@dsn.ingest.sentry.io/1337',
+      });
+
+      const expectedMetadata = {
+        _metadata: {
+          sdk: {
+            name: 'sentry.javascript.tanstackstart-react',
+            version: SDK_VERSION,
+            packages: [
+              { name: 'npm:@sentry/tanstackstart-react', version: SDK_VERSION },
+              { name: 'npm:@sentry/react', version: SDK_VERSION },
+            ],
+            settings: {
+              infer_ip: 'auto',
+            },
+          },
+        },
+      };
+
+      expect(reactInit).toHaveBeenCalledTimes(1);
+      expect(reactInit).toHaveBeenLastCalledWith(expect.objectContaining(expectedMetadata));
+    });
+
+    it('returns client from init', () => {
+      expect(init({})).not.toBeUndefined();
+    });
+
+    it('sets ignoreSpans to filter low-quality spans', () => {
+      init({ dsn: 'https://public@dsn.ingest.sentry.io/1337' });
+
+      expect(reactInit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          ignoreSpans: expect.arrayContaining([
+            /\/node_modules\//,
+            /\/favicon\.ico/,
+            /\/@id\//,
+            /\/@react-refresh/,
+            /\/@tanstack-start\//,
+            /\/@fs\//,
+            /\/@vite\//,
+          ]),
+        }),
+      );
+    });
+
+    it('preserves user-defined ignoreSpans', () => {
+      init({
+        dsn: 'https://public@dsn.ingest.sentry.io/1337',
+        ignoreSpans: [/custom-pattern/],
+      });
+
+      expect(reactInit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          ignoreSpans: expect.arrayContaining([/custom-pattern/, /\/favicon\.ico/]),
+        }),
+      );
+    });
+
+    it('applies the managed tunnel route when no runtime tunnel is provided', () => {
+      vi.stubGlobal('__SENTRY_TANSTACKSTART_TUNNEL_ROUTE__', '/managed-tunnel');
+
+      init({
+        dsn: 'https://public@dsn.ingest.sentry.io/1337',
+      });
+
+      expect(reactInit).toHaveBeenLastCalledWith(expect.objectContaining({ tunnel: '/managed-tunnel' }));
+    });
+  });
+});

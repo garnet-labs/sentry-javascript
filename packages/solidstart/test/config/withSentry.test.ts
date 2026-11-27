@@ -1,0 +1,279 @@
+import type { Nitro } from 'nitropack';
+import type { Plugin } from 'vite';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { withSentry } from '../../src/config';
+
+const userDefinedNitroRollupBeforeHookMock = vi.fn();
+const userDefinedNitroCloseHookMock = vi.fn();
+const addInstrumentationFileToBuildMock = vi.fn();
+const addSentryTopImportMock = vi.fn();
+
+vi.mock('../../src/config/addInstrumentation', () => ({
+  addInstrumentationFileToBuild: (...args: unknown[]) => addInstrumentationFileToBuildMock(...args),
+  addSentryTopImport: (...args: unknown[]) => addSentryTopImportMock(...args),
+}));
+
+// Mirror the real plugin's contract: `buildTimeInstrumentation: false` yields the inert variant.
+const orchestrionRollupMock = vi.fn((options?: { buildTimeInstrumentation?: boolean }) => ({
+  name: options?.buildTimeInstrumentation === false ? 'sentry-orchestrion-disabled' : 'sentry-orchestrion-plugin',
+}));
+const commonJSInteropOptionsMock = {
+  requireReturnsDefault: vi.fn(),
+  ignoreTryCatch: vi.fn(),
+};
+vi.mock('@sentry/server-utils/orchestrion/rollup', () => ({
+  sentryOrchestrionPlugin: (options?: { buildTimeInstrumentation?: boolean }) => orchestrionRollupMock(options),
+  sentryCommonJSInteropPlugin: () => ({ name: 'sentry-commonjs-interop' }),
+  commonJSInteropOptions: () => commonJSInteropOptionsMock,
+}));
+vi.mock('@sentry/server-utils/orchestrion/config', () => ({
+  INSTRUMENTED_MODULE_NAMES: ['mysql', 'ioredis'],
+}));
+
+beforeEach(() => {
+  vi.clearAllMocks();
+});
+
+describe('withSentry()', () => {
+  const solidStartConfig = {
+    middleware: './src/middleware.ts',
+    server: {
+      hooks: {
+        close: userDefinedNitroCloseHookMock,
+        'rollup:before': userDefinedNitroRollupBeforeHookMock,
+      },
+    },
+  };
+  const nitroOptions: Nitro = {
+    options: {
+      buildDir: '/path/to/buildDir',
+      output: {
+        serverDir: '/path/to/serverDir',
+      },
+      preset: 'vercel',
+    },
+  };
+  const rollupConfig = { plugins: [] };
+
+  function callSentryNitroModule(config: ReturnType<typeof withSentry>): { hookFn: (...args: unknown[]) => unknown } {
+    const modules = (config?.server as { modules?: unknown[] })?.modules || [];
+    const sentryModule = modules[modules.length - 1] as (nitro: Nitro) => void;
+    let hookFn: (...args: unknown[]) => unknown = () => {};
+    const fakeNitro = {
+      ...nitroOptions,
+      hooks: {
+        hook: (_name: string, fn: (...args: unknown[]) => unknown) => {
+          hookFn = fn;
+        },
+      },
+    } as unknown as Nitro;
+    sentryModule(fakeNitro);
+    return { hookFn };
+  }
+
+  it('registers a nitro module that hooks into rollup:before to add the instrumentation file', async () => {
+    const config = withSentry(solidStartConfig, {});
+    const { hookFn } = callSentryNitroModule(config);
+    await hookFn(nitroOptions, rollupConfig);
+    expect(addInstrumentationFileToBuildMock).toHaveBeenCalledWith(nitroOptions);
+  });
+
+  it('registers the managed tunnel plugin through server.plugins and keeps user plugins', () => {
+    const config = withSentry({ server: { plugins: ['./user-plugin.ts'] } }, {});
+
+    expect((config?.server as { plugins?: string[] }).plugins).toEqual([
+      './user-plugin.ts',
+      // Vitest serves the source file, the built package the transpiled one.
+      expect.stringMatching(/\/nitro\/tunnelPlugin\.[jt]s$/),
+    ]);
+  });
+
+  it('does not override user-defined hooks in server.hooks', () => {
+    const config = withSentry(solidStartConfig, {});
+    expect(config?.server.hooks?.['rollup:before']).toBe(userDefinedNitroRollupBeforeHookMock);
+    expect(config?.server.hooks?.close).toBe(userDefinedNitroCloseHookMock);
+  });
+
+  it('adds the instrumentation file as top level import when configured as top-level-import', async () => {
+    const config = withSentry(solidStartConfig, { autoInjectServerSentry: 'top-level-import' });
+    const { hookFn } = callSentryNitroModule(config);
+    await hookFn(nitroOptions, rollupConfig);
+    expect(addSentryTopImportMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        options: {
+          buildDir: '/path/to/buildDir',
+          output: {
+            serverDir: '/path/to/serverDir',
+          },
+          preset: 'vercel',
+        },
+      }),
+    );
+  });
+
+  it('does not add the instrumentation file as top level import if autoInjectServerSentry is undefined', async () => {
+    const config = withSentry(solidStartConfig, { autoInjectServerSentry: undefined });
+    const { hookFn } = callSentryNitroModule(config);
+    await hookFn(nitroOptions, rollupConfig);
+    expect(addSentryTopImportMock).not.toHaveBeenCalled();
+  });
+
+  it('adds the sentry solidstart vite plugin', () => {
+    const config = withSentry(solidStartConfig, {
+      project: 'project',
+      org: 'org',
+      authToken: 'token',
+    });
+    const names = config?.vite.plugins.flat().map((plugin: Plugin) => plugin.name);
+    expect(names).toEqual([
+      'sentry-solidstart-tunnel-base-path',
+      'sentry-solidstart-build-instrumentation-file',
+      'sentry-vite-plugin',
+      'sentry-vite-upload-staging',
+      'sentry-solidstart-update-source-map-setting',
+    ]);
+  });
+
+  it('extends the passed in vite config object', () => {
+    const config = withSentry(
+      {
+        ...solidStartConfig,
+        vite: {
+          plugins: [{ name: 'my-test-plugin' }],
+        },
+      },
+      {
+        project: 'project',
+        org: 'org',
+        authToken: 'token',
+      },
+    );
+
+    const names = config?.vite.plugins.flat().map((plugin: Plugin) => plugin.name);
+    expect(names).toEqual([
+      'sentry-solidstart-tunnel-base-path',
+      'sentry-solidstart-build-instrumentation-file',
+      'sentry-vite-plugin',
+      'sentry-vite-upload-staging',
+      'sentry-solidstart-update-source-map-setting',
+      'my-test-plugin',
+    ]);
+  });
+
+  it('extends the passed in vite function config', () => {
+    const config = withSentry(
+      {
+        ...solidStartConfig,
+        vite() {
+          return { plugins: [{ name: 'my-test-plugin' }] };
+        },
+      },
+      {
+        project: 'project',
+        org: 'org',
+        authToken: 'token',
+      },
+    );
+
+    const names = config
+      ?.vite()
+      .plugins.flat()
+      .map((plugin: Plugin) => plugin.name);
+    expect(names).toEqual([
+      'sentry-solidstart-tunnel-base-path',
+      'sentry-solidstart-build-instrumentation-file',
+      'sentry-vite-plugin',
+      'sentry-vite-upload-staging',
+      'sentry-solidstart-update-source-map-setting',
+      'my-test-plugin',
+    ]);
+  });
+
+  it('preserves existing server modules', () => {
+    const existingModule = vi.fn();
+    const config = withSentry(
+      {
+        ...solidStartConfig,
+        server: {
+          ...solidStartConfig.server,
+          modules: [existingModule],
+        },
+      },
+      {},
+    );
+    const modules = (config?.server as { modules?: unknown[] })?.modules || [];
+    expect(modules).toHaveLength(2);
+    expect(modules[0]).toBe(existingModule);
+    expect(typeof modules[1]).toBe('function');
+  });
+
+  describe('orchestrion build-time instrumentation', () => {
+    it('pushes the orchestrion plugin into the rollup config by default', async () => {
+      const config = withSentry(solidStartConfig, {});
+      const { hookFn } = callSentryNitroModule(config);
+      const plugins: Array<{ name: string }> = [];
+      await hookFn(nitroOptions, { plugins });
+      expect(orchestrionRollupMock).toHaveBeenCalledWith({ buildTimeInstrumentation: undefined });
+      expect(plugins.map(plugin => plugin.name)).toEqual(['sentry-orchestrion-plugin', 'sentry-commonjs-interop']);
+    });
+
+    it('force-inlines the instrumented modules into server.externals by default', () => {
+      const config = withSentry(solidStartConfig, {});
+      const externals = (config?.server as { externals?: { inline?: string[] } })?.externals;
+      expect(externals?.inline).toEqual(['mysql', 'ioredis', 'standard-as-callback']);
+    });
+
+    it('preserves and dedupes existing inline externals', () => {
+      const config = withSentry(
+        {
+          ...solidStartConfig,
+          server: {
+            ...solidStartConfig.server,
+            externals: { inline: ['ioredis', 'custom-dependency'] },
+          },
+        } as Parameters<typeof withSentry>[0],
+        {},
+      );
+      const externals = (config?.server as { externals?: { inline?: string[] } })?.externals;
+      expect(externals?.inline).toEqual(['ioredis', 'custom-dependency', 'mysql', 'standard-as-callback']);
+    });
+
+    it('sets the CommonJS interop options for the inlined drivers by default', () => {
+      const config = withSentry(solidStartConfig, {});
+      const commonJS = (config?.server as { commonJS?: Record<string, unknown> })?.commonJS;
+      expect(commonJS).toEqual(commonJSInteropOptionsMock);
+    });
+
+    it('preserves user-provided CommonJS options', () => {
+      const userRequireReturnsDefault = vi.fn();
+      const config = withSentry(
+        {
+          ...solidStartConfig,
+          server: {
+            ...solidStartConfig.server,
+            commonJS: { requireReturnsDefault: userRequireReturnsDefault },
+          },
+        } as Parameters<typeof withSentry>[0],
+        {},
+      );
+      const commonJS = (config?.server as { commonJS?: Record<string, unknown> })?.commonJS;
+      expect(commonJS).toEqual({
+        requireReturnsDefault: userRequireReturnsDefault,
+        ignoreTryCatch: commonJSInteropOptionsMock.ignoreTryCatch,
+      });
+    });
+
+    it('adds an inert orchestrion plugin and skips externals when buildTimeInstrumentation is false', async () => {
+      const config = withSentry(solidStartConfig, { buildTimeInstrumentation: false });
+      const { hookFn } = callSentryNitroModule(config);
+      const plugins: Array<{ name: string }> = [];
+      await hookFn(nitroOptions, { plugins });
+      expect(orchestrionRollupMock).not.toHaveBeenCalled();
+      expect(plugins).toHaveLength(0);
+      const externals = (config?.server as { externals?: { inline?: string[] } })?.externals;
+      expect(externals).toBeUndefined();
+      const commonJS = (config?.server as { commonJS?: Record<string, unknown> })?.commonJS;
+      expect(commonJS).toBeUndefined();
+    });
+  });
+});

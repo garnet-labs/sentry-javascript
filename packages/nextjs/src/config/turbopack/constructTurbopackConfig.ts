@@ -1,0 +1,219 @@
+import { debug, escapeStringForRegex } from '@sentry/core';
+import * as path from 'path';
+import { getInstrumentedModuleNames } from '@sentry/server-utils/orchestrion/config';
+import {
+  getOrchestrionLoaderPath,
+  getSentryInstrumentations,
+  resolveOrchestrionRuntimeRequest,
+  serializeInstrumentations,
+} from '@sentry/server-utils/orchestrion/webpack';
+import type { VercelCronsConfig } from '../../common/types';
+import { getBuildLogger } from '../buildLogger';
+import type { RouteManifest } from '../manifest/types';
+import type {
+  JSONValue,
+  NextConfigObject,
+  SentryBuildOptions,
+  TurbopackMatcherWithRule,
+  TurbopackOptions,
+} from '../types';
+import { supportsNativeDebugIds, supportsTurbopackRuleCondition } from '../util';
+import { getTunnelRouteInjectedValues } from '../withSentryConfig/tunnel';
+import { generateValueInjectionRules } from './generateValueInjectionRules';
+
+/**
+ * Construct a Turbopack config object from a Next.js config object and a Turbopack options object.
+ *
+ * @param userNextConfig - The Next.js config object.
+ * @param userSentryOptions - The Sentry build options object.
+ * @param routeManifest - The route manifest object.
+ * @param nextJsVersion - The Next.js version.
+ * @param vercelCronsConfig - The Vercel crons configuration from vercel.json.
+ * @returns The Turbopack config object.
+ */
+export function constructTurbopackConfig({
+  userNextConfig,
+  userSentryOptions,
+  routeManifest,
+  nextJsVersion,
+  vercelCronsConfig,
+}: {
+  userNextConfig: NextConfigObject;
+  userSentryOptions?: SentryBuildOptions;
+  routeManifest?: RouteManifest;
+  nextJsVersion?: string;
+  vercelCronsConfig?: VercelCronsConfig;
+}): TurbopackOptions {
+  // If sourcemaps are disabled, we don't need to enable native debug ids as this will add build time.
+  const shouldEnableNativeDebugIds =
+    (supportsNativeDebugIds(nextJsVersion ?? '') && userNextConfig?.turbopack?.debugIds) ??
+    userSentryOptions?.sourcemaps?.disable !== true;
+
+  const newConfig: TurbopackOptions = {
+    ...userNextConfig.turbopack,
+    ...(shouldEnableNativeDebugIds ? { debugIds: true } : {}),
+  };
+
+  const valueInjectionRules = generateValueInjectionRules({
+    routeManifest,
+    nextJsVersion,
+    tunnelRouteValues: getTunnelRouteInjectedValues(userNextConfig, userSentryOptions),
+    vercelCronsConfig,
+  });
+
+  for (const { matcher, rule } of valueInjectionRules) {
+    newConfig.rules = safelyAddTurbopackRule(newConfig.rules, { matcher, rule });
+  }
+
+  // Tag modules so thirdPartyErrorFilterIntegration can identify first-party code. Dependencies
+  // are tagged by default to match webpack's BannerPlugin, which injects metadata into all chunks.
+  // Opting out with `applicationKeyExcludeDependencies` can leave dependency-only chunks untagged.
+  // The injected code is wrapped in a try-catch IIFE, so it is safe even for dependencies with
+  // strict initialization order. Next.js build polyfills are excluded because they contain
+  // non-standard syntax that causes parse errors when Turbopack re-parses the loader output.
+  // Server and edge modules are skipped because only the browser reads these tags.
+  const applicationKey = userSentryOptions?.applicationKey;
+  if (applicationKey && nextJsVersion && supportsTurbopackRuleCondition(nextJsVersion)) {
+    newConfig.rules = safelyAddTurbopackRule(newConfig.rules, {
+      matcher: '*.{ts,tsx,js,jsx,mjs,cjs}',
+      rule: {
+        condition: {
+          all: [
+            'browser',
+            { not: { path: /next\/dist\/build\/polyfills/ } },
+            ...(userSentryOptions?.applicationKeyExcludeDependencies ? [{ not: 'foreign' as const }] : []),
+          ],
+        },
+        loaders: [
+          {
+            loader: path.resolve(__dirname, '..', 'loaders', 'moduleMetadataInjectionLoader.js'),
+            options: {
+              applicationKey,
+            },
+          },
+        ],
+      },
+    });
+  }
+
+  // Add component annotation loader for react component name annotation in Turbopack builds.
+  // This is only added when annotation is enabled AND the Next.js version supports the
+  // `condition` field in Turbopack rules (Next.js 16+).
+  // Typed as the unified option so reads below resolve to the non-deprecated declarations.
+  const reactComponentAnnotation: NonNullable<SentryBuildOptions['reactComponentAnnotation']> = {
+    ...userSentryOptions?.reactComponentAnnotation,
+    // eslint-disable-next-line typescript/no-deprecated
+    ...userSentryOptions?._experimental?.turbopackReactComponentAnnotation,
+  };
+  if (reactComponentAnnotation.enabled) {
+    if (nextJsVersion && supportsTurbopackRuleCondition(nextJsVersion)) {
+      newConfig.rules = safelyAddTurbopackRule(newConfig.rules, {
+        matcher: '*.{tsx,jsx}',
+        rule: {
+          condition: { not: 'foreign' },
+          loaders: [
+            {
+              loader: path.resolve(__dirname, '..', 'loaders', 'componentAnnotationLoader.js'),
+              options: {
+                ignoredComponents: reactComponentAnnotation.ignoredComponents ?? [],
+              },
+            },
+          ],
+        },
+      });
+    } else {
+      // Without this warning the option silently no-ops, which is indistinguishable from
+      // annotation being broken.
+      getBuildLogger(userSentryOptions?.silent).warn(
+        `[@sentry/nextjs] \`reactComponentAnnotation\` is enabled but React component annotation requires Next.js 16+ on Turbopack builds${
+          nextJsVersion ? ` (detected ${nextJsVersion})` : ''
+        }. Your components will not be annotated.`,
+      );
+    }
+  }
+
+  newConfig.rules = maybeAddOrchestrionRule(newConfig.rules, userSentryOptions, nextJsVersion);
+
+  return newConfig;
+}
+
+/**
+ * Adds the orchestrion code-transform loader rule unless build-time instrumentation is turned off.
+ */
+function maybeAddOrchestrionRule(
+  rules: TurbopackOptions['rules'],
+  userSentryOptions: SentryBuildOptions | undefined,
+  nextJsVersion: string | undefined,
+): TurbopackOptions['rules'] {
+  if (
+    userSentryOptions?.buildTimeInstrumentation === false ||
+    !nextJsVersion ||
+    !supportsTurbopackRuleCondition(nextJsVersion)
+  ) {
+    return rules;
+  }
+
+  // The loader's transform splices an import of `@sentry/server-utils` (the module-injected helper
+  // plus the module's subscriber factory) into each instrumented module. Turbopack rejects
+  // absolute-path imports ("server relative imports are not implemented yet"), and under isolated
+  // installs (pnpm) the bare specifier emitted inside a bundled package doesn't resolve from that
+  // package's location — so pass the entry's absolute on-disk path and let the loader derive a
+  // per-file RELATIVE specifier, which Turbopack resolves from the importing file and bundles at
+  // build time.
+  const importHelperPath = resolveOrchestrionRuntimeRequest('@sentry/server-utils');
+
+  // Turbopack runs webpack loaders out of process, one round trip per matched file. The transform
+  // only ever touches files of the instrumented packages, so limit the rule to those instead of
+  // paying that round trip for every server-side module (all of node_modules included).
+  const instrumentedPackages = getInstrumentedModuleNames().map(escapeStringForRegex);
+  const instrumentedPackagePath = new RegExp(`node_modules/(?:${instrumentedPackages.join('|')})/`);
+
+  return safelyAddTurbopackRule(rules, {
+    matcher: '*.{js,mjs,cjs}',
+    rule: {
+      condition: { all: ['node', { path: instrumentedPackagePath }] },
+      loaders: [
+        {
+          loader: getOrchestrionLoaderPath(),
+          // Turbopack JSON-serializes loader options, so a RegExp `filePath` must be encoded first.
+          options: {
+            instrumentations: serializeInstrumentations(getSentryInstrumentations()) as unknown as JSONValue[],
+            ...(importHelperPath ? { importHelperPath } : {}),
+          },
+        },
+      ],
+    },
+  });
+}
+
+/**
+ * Safely add a Turbopack rule to the existing rules.
+ *
+ * @param existingRules - The existing rules.
+ * @param matcher - The matcher for the rule.
+ * @param rule - The rule to add.
+ * @returns The updated rules object.
+ */
+export function safelyAddTurbopackRule(
+  existingRules: TurbopackOptions['rules'],
+  { matcher, rule }: TurbopackMatcherWithRule,
+): TurbopackOptions['rules'] {
+  if (!existingRules) {
+    return {
+      [matcher]: rule,
+    };
+  }
+
+  // If the rule already exists, we don't want to mess with it.
+  if (existingRules[matcher]) {
+    debug.log(
+      `[@sentry/nextjs] - Turbopack rule already exists for ${matcher}. Please remove it from your Next.js config in order for Sentry to work properly.`,
+    );
+    return existingRules;
+  }
+
+  return {
+    ...existingRules,
+    [matcher]: rule,
+  };
+}

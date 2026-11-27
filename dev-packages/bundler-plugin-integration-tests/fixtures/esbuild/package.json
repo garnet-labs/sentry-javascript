@@ -1,0 +1,10 @@
+{
+  "name": "esbuild-integration-tests",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "esbuild": "0.28.0",
+    "@sentry/bundler-plugins": "11.12.0"
+  }
+}

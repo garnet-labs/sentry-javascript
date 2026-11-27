@@ -1,0 +1,290 @@
+import { SENTRY_SEGMENT_NAME_SOURCE, SENTRY_OP, SENTRY_ORIGIN, URL_PATH } from '@sentry/conventions/attributes';
+import type { Client } from '@sentry/core';
+import * as SentryCore from '@sentry/core';
+import * as SentrySvelte from '@sentry/svelte';
+import type { Load } from '@sveltejs/kit';
+import { redirect } from '@sveltejs/kit';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { wrapLoadWithSentry } from '../../src/client/load';
+import { createTrackedLoadEvent } from '../utils';
+
+const mockCaptureException = vi.spyOn(SentrySvelte, 'captureException').mockImplementation(() => 'xx');
+
+const mockStartSpan = vi.fn();
+
+vi.mock('@sentry/core/browser', async () => {
+  const original = (await vi.importActual('@sentry/core/browser')) as any;
+  return {
+    ...original,
+    startSpan: (...args: unknown[]) => {
+      mockStartSpan(...args);
+      return original.startSpan(...args);
+    },
+  };
+});
+
+function getById(_id?: string) {
+  throw new Error('error');
+}
+
+const MOCK_LOAD_ARGS: any = {
+  params: { id: '123' },
+  route: {
+    id: '/users/[id]',
+  },
+  url: new URL('http://localhost:3000/users/123'),
+};
+
+describe('wrapLoadWithSentry', () => {
+  beforeEach(() => {
+    mockCaptureException.mockClear();
+    mockStartSpan.mockClear();
+  });
+
+  it('calls captureException', async () => {
+    async function load({ params }: Parameters<Load>[0]): Promise<ReturnType<Load>> {
+      return {
+        post: getById(params.id),
+      };
+    }
+
+    const wrappedLoad = wrapLoadWithSentry(load);
+    const res = wrappedLoad(MOCK_LOAD_ARGS);
+    await expect(res).rejects.toThrow();
+
+    expect(mockCaptureException).toHaveBeenCalledTimes(1);
+  });
+
+  it("doesn't call captureException for thrown `Redirect`s", async () => {
+    async function load(_: Parameters<Load>[0]): Promise<ReturnType<Load>> {
+      throw redirect(300, 'other/route');
+    }
+
+    const wrappedLoad = wrapLoadWithSentry(load);
+    const res = wrappedLoad(MOCK_LOAD_ARGS);
+    await expect(res).rejects.toThrow();
+
+    expect(mockCaptureException).not.toHaveBeenCalled();
+  });
+
+  it.each([400, 404, 499])("doesn't call captureException for thrown `HttpError`s with status %s", async status => {
+    async function load(_: Parameters<Load>[0]): Promise<ReturnType<Load>> {
+      throw { status, body: 'error' };
+    }
+
+    const wrappedLoad = wrapLoadWithSentry(load);
+    const res = wrappedLoad(MOCK_LOAD_ARGS);
+    await expect(res).rejects.toThrow();
+
+    expect(mockCaptureException).not.toHaveBeenCalled();
+  });
+
+  it.each([500, 501, 599])('calls captureException for thrown `HttpError`s with status %s', async status => {
+    async function load(_: Parameters<Load>[0]): Promise<ReturnType<Load>> {
+      throw { status, body: 'error' };
+    }
+
+    const wrappedLoad = wrapLoadWithSentry(load);
+    const res = wrappedLoad(MOCK_LOAD_ARGS);
+    await expect(res).rejects.toThrow();
+
+    expect(mockCaptureException).toHaveBeenCalledTimes(1);
+  });
+
+  describe('calls trace function', async () => {
+    it('creates a load span', async () => {
+      async function load({ params }: Parameters<Load>[0]): Promise<ReturnType<Load>> {
+        return {
+          post: params.id,
+        };
+      }
+
+      const wrappedLoad = wrapLoadWithSentry(load);
+      await wrappedLoad(MOCK_LOAD_ARGS);
+
+      expect(mockStartSpan).toHaveBeenCalledTimes(1);
+      expect(mockStartSpan).toHaveBeenCalledWith(
+        {
+          attributes: {
+            [SENTRY_OP]: 'function',
+            'code.function.name': 'load',
+            [SENTRY_ORIGIN]: 'auto.function.sveltekit',
+            [SENTRY_SEGMENT_NAME_SOURCE]: 'route',
+            'url.path': '/users/123',
+            'url.template': '/users/[id]',
+          },
+          name: '/users/[id]',
+        },
+        expect.any(Function),
+      );
+    });
+
+    it("falls back to the raw URL if `even.route.id` isn't available", async () => {
+      async function load({ params }: Parameters<Load>[0]): Promise<ReturnType<Load>> {
+        return {
+          post: params.id,
+        };
+      }
+      const wrappedLoad = wrapLoadWithSentry(load);
+
+      const event = { ...MOCK_LOAD_ARGS };
+      delete event.route.id;
+
+      await wrappedLoad(MOCK_LOAD_ARGS);
+
+      expect(mockStartSpan).toHaveBeenCalledTimes(1);
+      expect(mockStartSpan).toHaveBeenCalledWith(
+        {
+          attributes: {
+            [SENTRY_OP]: 'function',
+            'code.function.name': 'load',
+            [SENTRY_ORIGIN]: 'auto.function.sveltekit',
+            [SENTRY_SEGMENT_NAME_SOURCE]: 'url',
+            'url.path': '/users/123',
+          },
+          name: '/users/123',
+        },
+        expect.any(Function),
+      );
+    });
+
+    it('uses untrack when present (SvelteKit 2+) to get route id without triggering invalidation', async () => {
+      const routeIdFromUntrack = '/users/[id]';
+      const untrack = vi.fn(<T>(fn: () => T) => fn());
+      const eventWithUntrack = {
+        params: MOCK_LOAD_ARGS.params,
+        route: { id: routeIdFromUntrack },
+        url: MOCK_LOAD_ARGS.url,
+        untrack,
+      };
+
+      async function load({ params }: Parameters<Load>[0]): Promise<ReturnType<Load>> {
+        return { post: params.id };
+      }
+
+      const wrappedLoad = wrapLoadWithSentry(load);
+      await wrappedLoad(eventWithUntrack);
+
+      expect(untrack).toHaveBeenCalledTimes(2);
+      expect(mockStartSpan).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: routeIdFromUntrack,
+          attributes: expect.objectContaining({
+            [SENTRY_SEGMENT_NAME_SOURCE]: 'route',
+          }),
+        }),
+        expect.any(Function),
+      );
+    });
+
+    it("doesn't add route or url dependencies to the load function when untrack is present", async () => {
+      const { event, trackedReads } = createTrackedLoadEvent({
+        params: { id: '123' },
+        route: { id: '/users/[id]' },
+        url: new URL('http://localhost:3000/users/123'),
+      });
+
+      const wrappedLoad = wrapLoadWithSentry(async () => ({}));
+      await wrappedLoad(event);
+
+      expect(trackedReads).toEqual([]);
+      expect(mockStartSpan).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: '/users/[id]',
+          attributes: expect.objectContaining({ [URL_PATH]: '/users/123' }),
+        }),
+        expect.any(Function),
+      );
+    });
+
+    describe('with span streaming enabled', () => {
+      beforeEach(() => {
+        vi.spyOn(SentryCore, 'getClient').mockImplementation(
+          () => ({ getOptions: () => ({ traceLifecycle: 'stream' }) }) as unknown as Client,
+        );
+      });
+
+      afterEach(() => {
+        vi.mocked(SentryCore.getClient).mockRestore();
+      });
+
+      // `MOCK_LOAD_ARGS.route` is mutated by the tests above, so build a fresh event here.
+      const getLoadArgs = (): any => ({
+        params: { id: '123' },
+        route: { id: '/users/[id]' },
+        url: new URL('http://localhost:3000/users/123'),
+      });
+
+      it('names the span after the load function and keeps the route in the description', async () => {
+        const wrappedLoad = wrapLoadWithSentry(async () => ({}));
+        await wrappedLoad(getLoadArgs());
+
+        expect(mockStartSpan).toHaveBeenCalledWith(
+          {
+            attributes: {
+              [SENTRY_OP]: 'function',
+              'code.function.name': 'load',
+              [SENTRY_ORIGIN]: 'auto.function.sveltekit',
+              [SENTRY_SEGMENT_NAME_SOURCE]: 'route',
+              'url.path': '/users/123',
+              'url.template': '/users/[id]',
+              'sentry.description': '/users/[id]',
+            },
+            name: 'load',
+          },
+          expect.any(Function),
+        );
+      });
+
+      it("keeps the raw URL as description if `event.route.id` isn't available", async () => {
+        const wrappedLoad = wrapLoadWithSentry(async () => ({}));
+        await wrappedLoad({ ...getLoadArgs(), route: {} });
+
+        expect(mockStartSpan).toHaveBeenCalledWith(
+          {
+            attributes: {
+              [SENTRY_OP]: 'function',
+              'code.function.name': 'load',
+              [SENTRY_ORIGIN]: 'auto.function.sveltekit',
+              [SENTRY_SEGMENT_NAME_SOURCE]: 'url',
+              'url.path': '/users/123',
+              'sentry.description': '/users/123',
+            },
+            name: 'load',
+          },
+          expect.any(Function),
+        );
+      });
+    });
+  });
+
+  it('adds an exception mechanism', async () => {
+    async function load({ params }: Parameters<Load>[0]): Promise<ReturnType<Load>> {
+      return {
+        post: getById(params.id),
+      };
+    }
+
+    const wrappedLoad = wrapLoadWithSentry(load);
+    const res = wrappedLoad(MOCK_LOAD_ARGS);
+    await expect(res).rejects.toThrow();
+
+    expect(mockCaptureException).toHaveBeenCalledTimes(1);
+    expect(mockCaptureException).toHaveBeenCalledWith(expect.any(Error), {
+      mechanism: { handled: false, type: 'auto.function.sveltekit.load' },
+    });
+  });
+
+  it("doesn't wrap load more than once if the wrapper was applied multiple times", async () => {
+    async function load({ params }: Parameters<Load>[0]): Promise<ReturnType<Load>> {
+      return {
+        post: params.id,
+      };
+    }
+
+    const wrappedLoad = wrapLoadWithSentry(wrapLoadWithSentry(load));
+    await wrappedLoad(MOCK_LOAD_ARGS);
+
+    expect(mockStartSpan).toHaveBeenCalledTimes(1);
+  });
+});
