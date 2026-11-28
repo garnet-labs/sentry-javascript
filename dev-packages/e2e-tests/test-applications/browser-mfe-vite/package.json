@@ -1,0 +1,20 @@
+{
+  "name": "browser-mfe-vite",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "pnpm build:mfes && pnpm build:shell",
+    "build:mfes": "cd apps/mfe-header && pnpm build && cd ../mfe-one && pnpm build",
+    "build:shell": "cd apps/shell && pnpm build",
+    "preview": "concurrently \"cd apps/mfe-header && pnpm preview\" \"cd apps/mfe-one && pnpm preview\" \"cd apps/shell && pnpm preview\"",
+    "test": "playwright test",
+    "test:build": "pnpm install && pnpm build",
+    "test:assert": "pnpm test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.64.1",
+    "@sentry-internal/test-utils": "file:../../packed/sentry-internal-test-utils-packed.tgz",
+    "concurrently": "^8.2.2"
+  }
+}

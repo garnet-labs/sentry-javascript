@@ -1,0 +1,86 @@
+import { expect, it } from 'vitest';
+import {
+  GEN_AI_AGENT_NAME,
+  GEN_AI_INPUT_MESSAGES,
+  GEN_AI_OPERATION_NAME,
+  GEN_AI_PIPELINE_NAME,
+  GEN_AI_RESPONSE_MODEL,
+  GEN_AI_RESPONSE_STREAMING,
+  GEN_AI_USAGE_INPUT_TOKENS,
+  GEN_AI_USAGE_OUTPUT_TOKENS,
+  GEN_AI_USAGE_TOTAL_TOKENS,
+} from '@sentry/conventions/attributes';
+import { createRunner } from '../../../runner';
+import { getSpanOp, getSpansFromEnvelope } from '../../../spanUtils';
+
+// These tests are not exhaustive because the instrumentation is
+// already tested in the node integration tests and we merely
+// want to test that the instrumentation does not break in our
+// cloudflare SDK.
+
+it('traces langgraph invoke and stream operations', async ({ signal }) => {
+  const runner = createRunner(__dirname)
+    .ignore('event')
+    .expect(envelope => {
+      const spans = getSpansFromEnvelope(envelope);
+      const segmentSpan = spans.find(span => span.is_segment);
+      expect(segmentSpan?.name).toBe('GET /');
+
+      const genAiSpans = spans.filter(span => getSpanOp(span)?.startsWith('gen_ai.'));
+      expect(genAiSpans).toHaveLength(2);
+      expect(genAiSpans.map(span => span.name)).toEqual([
+        'invoke_agent weather_assistant',
+        'invoke_agent weather_assistant',
+      ]);
+
+      const streamAgentSpan = genAiSpans.find(span => span.attributes[GEN_AI_RESPONSE_STREAMING]);
+      expect(streamAgentSpan!.status).toBe('ok');
+      expect(streamAgentSpan!.attributes[GEN_AI_RESPONSE_STREAMING]).toEqual({ type: 'boolean', value: true });
+      expect(streamAgentSpan!.attributes[GEN_AI_INPUT_MESSAGES]).toEqual({
+        type: 'string',
+        value: '[{"role":"user","content":"Stream the weather in SF"}]',
+      });
+      expect(streamAgentSpan!.attributes[GEN_AI_RESPONSE_MODEL]).toEqual({ type: 'string', value: 'mock-model' });
+
+      const invokeAgentSpan = genAiSpans.find(span => !span.attributes[GEN_AI_RESPONSE_STREAMING]);
+      expect(invokeAgentSpan).toBeDefined();
+      expect(invokeAgentSpan!.status).toBe('ok');
+      expect(invokeAgentSpan!.attributes[GEN_AI_OPERATION_NAME]).toEqual({
+        type: 'string',
+        value: 'invoke_agent',
+      });
+      expect(invokeAgentSpan!.attributes['sentry.op']).toEqual({ type: 'string', value: 'gen_ai.invoke_agent' });
+      expect(invokeAgentSpan!.attributes['sentry.origin']).toEqual({ type: 'string', value: 'auto.ai.langgraph' });
+      expect(invokeAgentSpan!.attributes[GEN_AI_AGENT_NAME]).toEqual({
+        type: 'string',
+        value: 'weather_assistant',
+      });
+      expect(invokeAgentSpan!.attributes[GEN_AI_PIPELINE_NAME]).toEqual({
+        type: 'string',
+        value: 'weather_assistant',
+      });
+      expect(invokeAgentSpan!.attributes[GEN_AI_INPUT_MESSAGES]).toEqual({
+        type: 'string',
+        value: '[{"role":"user","content":"What is the weather in SF?"}]',
+      });
+      expect(invokeAgentSpan!.attributes[GEN_AI_RESPONSE_MODEL]).toEqual({
+        type: 'string',
+        value: 'mock-model',
+      });
+      expect(invokeAgentSpan!.attributes[GEN_AI_USAGE_INPUT_TOKENS]).toEqual({
+        type: 'integer',
+        value: 20,
+      });
+      expect(invokeAgentSpan!.attributes[GEN_AI_USAGE_OUTPUT_TOKENS]).toEqual({
+        type: 'integer',
+        value: 10,
+      });
+      expect(invokeAgentSpan!.attributes[GEN_AI_USAGE_TOTAL_TOKENS]).toEqual({
+        type: 'integer',
+        value: 30,
+      });
+    })
+    .start(signal);
+  await runner.makeRequest('get', '/');
+  await runner.completed();
+});

@@ -1,0 +1,565 @@
+/* eslint-disable max-lines */
+import type { AgnosticRouteObject } from '@remix-run/router';
+import { isDeferredData, isRouteErrorResponse } from '@remix-run/router';
+import type {
+  ActionFunction,
+  ActionFunctionArgs,
+  AppLoadContext,
+  CreateRequestHandlerFunction,
+  HandleDocumentRequestFunction,
+  LoaderFunction,
+  LoaderFunctionArgs,
+  RequestHandler,
+  ServerBuild,
+} from '@remix-run/server-runtime';
+import type { RequestEventData, Span, TransactionSource, WrappedFunction } from '@sentry/core';
+import {
+  continueTrace,
+  debug,
+  fill,
+  getActiveSpan,
+  getClient,
+  getRootSpan,
+  getTraceData,
+  hasSpansEnabled,
+  hasSpanStreamingEnabled,
+  HTTP_SPAN_NAME_FALLBACK,
+  httpHeadersToSpanAttributes,
+  setHttpStatus,
+  spanToJSON,
+  startSpan,
+  winterCGHeadersToDict,
+  winterCGRequestToRequestData,
+  withIsolationScope,
+  filterCollectedUrl,
+} from '@sentry/core';
+import { isNodeEnv, loadModule } from '@sentry/core/server';
+import { DEBUG_BUILD } from '../utils/debug-build';
+import { createRoutes, getTransactionName, isCloudflareEnv } from '../utils/utils';
+import { extractData, isResponse, json } from '../utils/vendor/response';
+import { captureRemixServerException, errorHandleDataFunction } from './errors';
+import { generateSentryServerTimingHeader, injectServerTimingHeaderValue } from './serverTimingTracePropagation';
+import {
+  CODE_FUNCTION_NAME,
+  ROUTER_NAVIGATION_ROUTE_ID,
+  SENTRY_DESCRIPTION,
+  SENTRY_SEGMENT_NAME_SOURCE,
+  HTTP_ROUTE,
+  SENTRY_OP,
+  URL_FULL,
+  URL_PATH,
+  SENTRY_ORIGIN,
+} from '@sentry/conventions/attributes';
+import { FUNCTION, HTTP_SERVER } from '@sentry/conventions/op';
+
+type AppData = unknown;
+type RemixRequest = Parameters<RequestHandler>[0];
+type ServerRouteManifest = ServerBuild['routes'];
+type DataFunction = LoaderFunction | ActionFunction;
+type DataFunctionArgs = LoaderFunctionArgs | ActionFunctionArgs;
+
+const redirectStatusCodes = new Set([301, 302, 303, 307, 308]);
+function isRedirectResponse(response: Response): boolean {
+  return redirectStatusCodes.has(response.status);
+}
+
+function isCatchResponse(response: Response): boolean {
+  return response.headers.get('X-Remix-Catch') != null;
+}
+
+/**
+ * Sentry utility to be used in place of `handleError` function of Remix v2
+ * Remix Docs: https://remix.run/docs/en/main/file-conventions/entry.server#handleerror
+ *
+ * Should be used in `entry.server` like:
+ *
+ * export const handleError = Sentry.sentryHandleError
+ */
+export function sentryHandleError(err: unknown, { request }: DataFunctionArgs): void {
+  // We are skipping thrown responses here as they are handled by
+  // `captureRemixServerException` at loader / action level
+  // We don't want to capture them twice.
+  // This function is only for capturing unhandled server-side exceptions.
+  // https://remix.run/docs/en/main/file-conventions/entry.server#thrown-responses
+  if (isResponse(err) || isRouteErrorResponse(err)) {
+    return;
+  }
+
+  captureRemixServerException(err, 'remix.server.handleError', request).then(null, e => {
+    DEBUG_BUILD && debug.warn('Failed to capture Remix Server exception.', e);
+  });
+}
+
+/**
+ * Sentry wrapper for Remix's `handleError` function.
+ * Remix Docs: https://remix.run/docs/en/main/file-conventions/entry.server#handleerror
+ */
+export function wrapHandleErrorWithSentry(
+  origHandleError: (err: unknown, args: { request: unknown }) => void,
+): (err: unknown, args: { request: unknown }) => void {
+  return function (this: unknown, err: unknown, args: { request: unknown }): void {
+    // This is expected to be void but just in case it changes in the future.
+    const res = origHandleError.call(this, err, args);
+
+    sentryHandleError(err, args as DataFunctionArgs);
+
+    return res;
+  };
+}
+
+function getTraceAndBaggage(): {
+  sentryTrace?: string;
+  sentryBaggage?: string;
+} {
+  if (isNodeEnv() || isCloudflareEnv()) {
+    const traceData = getTraceData();
+
+    return {
+      sentryTrace: traceData['sentry-trace'],
+      sentryBaggage: traceData.baggage,
+    };
+  }
+
+  return {};
+}
+
+function makeWrappedDocumentRequestFunction(instrumentTracing?: boolean) {
+  return function (origDocumentRequestFunction: HandleDocumentRequestFunction): HandleDocumentRequestFunction {
+    return async function (this: unknown, request: Request, ...args: unknown[]): Promise<Response> {
+      const serverTimingHeader = generateSentryServerTimingHeader();
+
+      let response: Response;
+
+      if (instrumentTracing) {
+        const activeSpan = getActiveSpan();
+        const rootSpan = activeSpan && getRootSpan(activeSpan);
+        const client = getClient();
+
+        const description = (rootSpan ? spanToJSON(rootSpan).name : undefined) || '<unknown>';
+        const name = client && hasSpanStreamingEnabled(client) ? 'documentRequest' : description;
+
+        response = await startSpan(
+          {
+            name,
+            onlyIfParent: true,
+            attributes: {
+              method: request.method,
+              [URL_FULL]: filterCollectedUrl(request.url),
+              [SENTRY_ORIGIN]: 'auto.function.remix',
+              [SENTRY_OP]: FUNCTION,
+              [SENTRY_DESCRIPTION]: description,
+              [CODE_FUNCTION_NAME]: 'documentRequest',
+            },
+          },
+          () => {
+            return origDocumentRequestFunction.call(this, request, ...args);
+          },
+        );
+      } else {
+        response = await origDocumentRequestFunction.call(this, request, ...args);
+      }
+
+      if (serverTimingHeader && response instanceof Response) {
+        return injectServerTimingHeaderValue(response, serverTimingHeader);
+      }
+
+      return response;
+    };
+  };
+}
+
+/**
+ * Updates the root span name with the parameterized route name.
+ * This is necessary for runtimes like Cloudflare Workers/Hydrogen where
+ * the request handler is not wrapped by Remix's wrapRequestHandler.
+ */
+function updateSpanWithRoute(args: DataFunctionArgs, build: ServerBuild): void {
+  try {
+    const activeSpan = getActiveSpan();
+    const rootSpan = activeSpan && getRootSpan(activeSpan);
+
+    if (!rootSpan) {
+      return;
+    }
+
+    const routes = createRoutes(build.routes);
+    const url = new URL(args.request.url);
+    const [transactionName, source] = getTransactionName(routes, url);
+
+    // Preserve the HTTP method prefix if the span already has one
+    const method = args.request.method.toUpperCase();
+    const currentSpanName = spanToJSON(rootSpan).name;
+    const newSpanName = currentSpanName?.startsWith(method) ? `${method} ${transactionName}` : transactionName;
+
+    // Without a matched route `getTransactionName` falls back to the raw pathname, which would undo the
+    // low-cardinality name the span starts with under span streaming.
+    const client = getClient();
+    const isUnparameterizedStreamedSpan = source !== 'route' && !!client && hasSpanStreamingEnabled(client);
+    if (!isUnparameterizedStreamedSpan) {
+      rootSpan.updateName(newSpanName);
+    }
+    rootSpan.setAttribute(SENTRY_SEGMENT_NAME_SOURCE, source);
+    if (source === 'route') {
+      rootSpan.setAttribute(HTTP_ROUTE, transactionName);
+    }
+  } catch (e) {
+    DEBUG_BUILD && debug.warn('Failed to update span name with route', e);
+  }
+}
+
+function makeWrappedDataFunction(
+  origFn: DataFunction,
+  id: string,
+  name: 'action' | 'loader',
+  instrumentTracing?: boolean,
+  build?: ServerBuild,
+): DataFunction {
+  return async function (this: unknown, args: DataFunctionArgs): Promise<Response | AppData> {
+    let res: Response | AppData;
+
+    if (instrumentTracing) {
+      // Update span name for Cloudflare Workers/Hydrogen environments
+      if (build) {
+        updateSpanWithRoute(args, build);
+      }
+
+      const client = getClient();
+
+      res = await startSpan(
+        {
+          // With span streaming, a `function` span is named after the function it wraps. The route
+          // module id stays on `router.navigation.route.id`.
+          name: client && hasSpanStreamingEnabled(client) ? name : id,
+          attributes: {
+            [SENTRY_ORIGIN]: 'auto.ui.remix',
+            [SENTRY_OP]: FUNCTION,
+            [SENTRY_DESCRIPTION]: id,
+            [CODE_FUNCTION_NAME]: name,
+            [ROUTER_NAVIGATION_ROUTE_ID]: id,
+          },
+        },
+        (span: Span) => {
+          return errorHandleDataFunction.call(this, origFn, name, args, span);
+        },
+      );
+    } else {
+      res = await errorHandleDataFunction.call(this, origFn, name, args);
+    }
+
+    // Redirects bypass makeWrappedDocumentRequestFunction, so we inject Server-Timing here.
+    if (isResponse(res) && isRedirectResponse(res)) {
+      const serverTimingHeader = generateSentryServerTimingHeader();
+      if (serverTimingHeader) {
+        return injectServerTimingHeaderValue(res, serverTimingHeader);
+      }
+    }
+
+    return res;
+  };
+}
+
+const makeWrappedAction =
+  (id: string, instrumentTracing?: boolean, build?: ServerBuild) =>
+  (origAction: DataFunction): DataFunction => {
+    return makeWrappedDataFunction(origAction, id, 'action', instrumentTracing, build);
+  };
+
+const makeWrappedLoader =
+  (id: string, instrumentTracing?: boolean, build?: ServerBuild) =>
+  (origLoader: DataFunction): DataFunction => {
+    return makeWrappedDataFunction(origLoader, id, 'loader', instrumentTracing, build);
+  };
+
+function makeWrappedRootLoader(instrumentTracing?: boolean, build?: ServerBuild) {
+  return function (origLoader: DataFunction): DataFunction {
+    return async function (this: unknown, args: DataFunctionArgs): Promise<Response | AppData> {
+      // Update span name for Cloudflare Workers/Hydrogen environments
+      // The root loader always runs, even for routes that don't have their own loaders
+      if (instrumentTracing && build) {
+        updateSpanWithRoute(args, build);
+      }
+
+      const res = await origLoader.call(this, args);
+      const traceAndBaggage = getTraceAndBaggage();
+
+      if (isDeferredData(res)) {
+        res.data['sentryTrace'] = traceAndBaggage.sentryTrace;
+        res.data['sentryBaggage'] = traceAndBaggage.sentryBaggage;
+
+        return res;
+      }
+
+      if (isResponse(res)) {
+        // Note: `redirect` and `catch` responses do not have bodies to extract.
+        // We skip injection of trace and baggage in those cases.
+        // For `redirect`, a valid internal redirection target will have the trace and baggage injected.
+        if (isRedirectResponse(res) || isCatchResponse(res)) {
+          DEBUG_BUILD && debug.warn('Skipping injection of trace and baggage as the response does not have a body');
+          return res;
+        } else {
+          const data = await extractData(res);
+
+          if (typeof data === 'object') {
+            return json(
+              { ...data, ...traceAndBaggage },
+              {
+                headers: res.headers,
+                statusText: res.statusText,
+                status: res.status,
+              },
+            );
+          } else {
+            DEBUG_BUILD && debug.warn('Skipping injection of trace and baggage as the response body is not an object');
+            return res;
+          }
+        }
+      }
+
+      return { ...res, ...traceAndBaggage };
+    };
+  };
+}
+
+function wrapRequestHandler<T extends ServerBuild | (() => ServerBuild | Promise<ServerBuild>)>(
+  origRequestHandler: RequestHandler,
+  build: T,
+  options?: {
+    instrumentTracing?: boolean;
+  },
+): RequestHandler {
+  let resolvedBuild: ServerBuild | { build: ServerBuild };
+  let name: string;
+  let spanName: string;
+  let source: TransactionSource;
+
+  return async function (this: unknown, request: RemixRequest, loadContext?: AppLoadContext): Promise<Response> {
+    const upperCaseMethod = request.method.toUpperCase();
+    // We don't want to wrap OPTIONS and HEAD requests
+    if (upperCaseMethod === 'OPTIONS' || upperCaseMethod === 'HEAD') {
+      return origRequestHandler.call(this, request, loadContext);
+    }
+
+    let resolvedRoutes: AgnosticRouteObject[] | undefined;
+
+    if (options?.instrumentTracing) {
+      if (typeof build === 'function') {
+        resolvedBuild = await build();
+      } else {
+        resolvedBuild = build;
+      }
+
+      // check if the build is nested under `build` key
+      if ('build' in resolvedBuild) {
+        resolvedRoutes = createRoutes((resolvedBuild.build as ServerBuild).routes);
+      } else {
+        resolvedRoutes = createRoutes(resolvedBuild.routes);
+      }
+    }
+
+    return withIsolationScope(async isolationScope => {
+      const client = getClient();
+
+      let normalizedRequest: RequestEventData = {};
+
+      try {
+        normalizedRequest = winterCGRequestToRequestData(request);
+      } catch {
+        DEBUG_BUILD && debug.warn('Failed to normalize Remix request');
+      }
+
+      const url = new URL(request.url);
+      if (options?.instrumentTracing && resolvedRoutes) {
+        [name, source] = getTransactionName(resolvedRoutes, url);
+
+        // The scope's transaction name is what error events are grouped by, so it keeps the URL path.
+        isolationScope.setTransactionName(name);
+
+        // With span streaming, span names have to be low cardinality, so we can't fall back to the URL path.
+        spanName =
+          source === 'route' || !client || !hasSpanStreamingEnabled(client)
+            ? name
+            : request.method?.toUpperCase() || HTTP_SPAN_NAME_FALLBACK;
+
+        // Update the span name if we're running inside an existing span
+        const parentSpan = getActiveSpan();
+        if (parentSpan) {
+          const rootSpan = getRootSpan(parentSpan);
+          rootSpan?.updateName(spanName);
+          rootSpan?.setAttributes({
+            [SENTRY_SEGMENT_NAME_SOURCE]: source,
+            ...(source === 'route' && {
+              [HTTP_ROUTE]: name,
+            }),
+          });
+        }
+      }
+
+      isolationScope.setSDKProcessingMetadata({ normalizedRequest });
+
+      if (!client || !hasSpansEnabled(client.getOptions())) {
+        return origRequestHandler.call(this, request, loadContext);
+      }
+
+      return continueTrace(
+        {
+          sentryTrace: request.headers.get('sentry-trace') || '',
+          baggage: request.headers.get('baggage') || '',
+        },
+        async () => {
+          if (options?.instrumentTracing) {
+            const parentSpan = getActiveSpan();
+            const rootSpan = parentSpan && getRootSpan(parentSpan);
+            rootSpan?.updateName(spanName);
+            rootSpan?.setAttribute(SENTRY_SEGMENT_NAME_SOURCE, source);
+            return startSpan(
+              {
+                name: spanName,
+                attributes: {
+                  [SENTRY_ORIGIN]: 'auto.http.remix',
+                  [SENTRY_SEGMENT_NAME_SOURCE]: source,
+                  [SENTRY_OP]: HTTP_SERVER,
+                  [URL_FULL]: filterCollectedUrl(url.href),
+                  [URL_PATH]: url.pathname,
+                  method: request.method,
+                  ...(source === 'route' && {
+                    [HTTP_ROUTE]: name,
+                  }),
+                  ...httpHeadersToSpanAttributes(
+                    winterCGHeadersToDict(request.headers),
+                    client.getDataCollectionOptions(),
+                  ),
+                },
+              },
+              async span => {
+                const res = (await origRequestHandler.call(this, request, loadContext)) as Response;
+
+                if (isResponse(res)) {
+                  setHttpStatus(span, res.status);
+                }
+
+                return res;
+              },
+            );
+          }
+
+          return (await origRequestHandler.call(this, request, loadContext)) as Response;
+        },
+      );
+    });
+  };
+}
+
+function instrumentBuildCallback(
+  build: ServerBuild,
+  options?: {
+    instrumentTracing?: boolean;
+  },
+): ServerBuild {
+  const routes: ServerRouteManifest = build.routes;
+
+  const wrappedEntry = { ...build.entry, module: { ...build.entry.module } };
+
+  // Not keeping boolean flags like it's done for `requestHandler` functions,
+  // Because the build can change between build and runtime.
+  // So if there is a new `loader` or`action` or `documentRequest` after build.
+  // We should be able to wrap them, as they may not be wrapped before.
+  const defaultExport = wrappedEntry.module.default as undefined | WrappedFunction;
+  if (defaultExport && !defaultExport.__sentry_original__) {
+    fill(wrappedEntry.module, 'default', makeWrappedDocumentRequestFunction(options?.instrumentTracing));
+  }
+
+  for (const [id, route] of Object.entries(build.routes)) {
+    const wrappedRoute = { ...route, module: { ...route.module } };
+
+    // Entry module should have a loader function to provide `sentry-trace` and `baggage`
+    // They will be available for the root `meta` function as `data.sentryTrace` and `data.sentryBaggage`
+    if (!wrappedRoute.parentId) {
+      if (!wrappedRoute.module.loader) {
+        wrappedRoute.module.loader = () => ({});
+      }
+
+      if (!(wrappedRoute.module.loader as WrappedFunction).__sentry_original__) {
+        fill(wrappedRoute.module, 'loader', makeWrappedRootLoader(options?.instrumentTracing, build));
+      }
+    }
+
+    const routeAction = wrappedRoute.module.action as undefined | WrappedFunction;
+    if (routeAction && !routeAction.__sentry_original__) {
+      fill(wrappedRoute.module, 'action', makeWrappedAction(id, options?.instrumentTracing, build));
+    }
+
+    const routeLoader = wrappedRoute.module.loader as undefined | WrappedFunction;
+    if (routeLoader && !routeLoader.__sentry_original__) {
+      fill(wrappedRoute.module, 'loader', makeWrappedLoader(id, options?.instrumentTracing, build));
+    }
+
+    routes[id] = wrappedRoute;
+  }
+
+  const instrumentedBuild = { ...build, routes };
+
+  if (wrappedEntry) {
+    instrumentedBuild.entry = wrappedEntry;
+  }
+
+  return instrumentedBuild;
+}
+
+/**
+ * Instruments `remix` ServerBuild for performance tracing and error tracking.
+ */
+export function instrumentBuild<T extends ServerBuild | (() => ServerBuild | Promise<ServerBuild>)>(
+  build: T,
+  options?: {
+    instrumentTracing?: boolean;
+  },
+): T {
+  if (typeof build === 'function') {
+    return function () {
+      const resolvedBuild = build();
+
+      if (resolvedBuild instanceof Promise) {
+        return resolvedBuild.then(build => {
+          return instrumentBuildCallback(build, options);
+        });
+      } else {
+        return instrumentBuildCallback(resolvedBuild, options);
+      }
+    } as T;
+  } else {
+    return instrumentBuildCallback(build, options) as T;
+  }
+}
+
+export const makeWrappedCreateRequestHandler = (options?: { instrumentTracing?: boolean }) =>
+  function (origCreateRequestHandler: CreateRequestHandlerFunction): CreateRequestHandlerFunction {
+    return function (this: unknown, build, ...args: unknown[]): RequestHandler {
+      const newBuild = instrumentBuild(build, options);
+      const requestHandler = origCreateRequestHandler.call(this, newBuild, ...args);
+
+      return wrapRequestHandler(requestHandler, newBuild, options);
+    };
+  };
+
+/**
+ * Monkey-patch Remix's `createRequestHandler` from `@remix-run/server-runtime`
+ * which Remix Adapters (https://remix.run/docs/en/main/other-api/adapter) use underneath.
+ */
+export function instrumentServer(options?: { instrumentTracing?: boolean }): void {
+  const pkg = loadModule<{
+    createRequestHandler: CreateRequestHandlerFunction;
+  }>('@remix-run/server-runtime', module);
+
+  if (!pkg) {
+    DEBUG_BUILD && debug.warn('Remix SDK was unable to require `@remix-run/server-runtime` package.');
+
+    return;
+  }
+
+  // `init()` runs this again after `close()`, so skip a handler that is already wrapped.
+  if ((pkg.createRequestHandler as WrappedFunction).__sentry_original__) {
+    return;
+  }
+
+  fill(pkg, 'createRequestHandler', makeWrappedCreateRequestHandler(options));
+}

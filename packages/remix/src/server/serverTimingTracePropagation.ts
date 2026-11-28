@@ -1,0 +1,42 @@
+import { debug, getTraceServerTimingHeader } from '@sentry/core';
+import { isNodeEnv } from '@sentry/core/server';
+import { DEBUG_BUILD } from '../utils/debug-build';
+import { isCloudflareEnv } from '../utils/utils';
+
+/** Generate a Server-Timing header value containing Sentry trace context. */
+export function generateSentryServerTimingHeader(): string | null {
+  if (!isNodeEnv() && !isCloudflareEnv()) {
+    return null;
+  }
+
+  try {
+    return getTraceServerTimingHeader() || null;
+  } catch (e) {
+    DEBUG_BUILD && debug.warn('Failed to generate Server-Timing header', e);
+    return null;
+  }
+}
+
+/** @internal */
+export function injectServerTimingHeaderValue(response: Response, serverTimingValue: string): Response {
+  try {
+    const headers = new Headers(response.headers);
+    const existing = headers.get('Server-Timing');
+
+    // Avoid duplicate entries when manually injected in entry.server.tsx
+    if (existing?.includes('sentry-trace')) {
+      return response;
+    }
+
+    headers.set('Server-Timing', existing ? `${existing}, ${serverTimingValue}` : serverTimingValue);
+
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    });
+  } catch (e) {
+    DEBUG_BUILD && debug.warn('Failed to add Server-Timing header to response', e);
+    return response;
+  }
+}

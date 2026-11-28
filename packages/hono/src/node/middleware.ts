@@ -1,0 +1,44 @@
+import { consoleSandbox, debug, getClient } from '@sentry/core';
+import type { NodeOptions } from '@sentry/node';
+import { applyHonoPatches, createHonoRequestMiddleware, type SentryHonoMiddlewareOptions } from '@sentry/server-utils';
+import type { Env, Hono, MiddlewareHandler } from 'hono';
+
+export interface HonoNodeOptions extends NodeOptions {}
+
+/**
+ * Sentry middleware for Hono applications running in a Node.js environment.
+ *
+ * This middleware enhances your Hono application by automatically instrumenting incoming requests and outgoing responses.
+ * It also applies the necessary patches to ensure Sentry captures execution context correctly in Node.js.
+ *
+ * **Note:** You must initialize Sentry separately before using this middleware. Typically, this is done by calling `Sentry.init()` in an `instrument.ts` file and loading it via the Node `--import` flag.
+ */
+export const sentry = <E extends Env>(app: Hono<E>, options?: SentryHonoMiddlewareOptions): MiddlewareHandler => {
+  const sentryClient = getClient();
+  if (sentryClient === undefined) {
+    consoleSandbox(() => {
+      // eslint-disable-next-line no-console
+      console.warn(
+        '[@sentry/hono] Sentry is not initialized. Call `init()` from `@sentry/hono/node` in an `instrument.ts` file loaded via `--import` to set up Sentry for your application.',
+      );
+    });
+  } else {
+    const isInitializedWithHonoSdk = sentryClient.getOptions()._metadata?.sdk?.name === 'sentry.javascript.hono';
+
+    if (!isInitializedWithHonoSdk) {
+      consoleSandbox(() => {
+        // eslint-disable-next-line no-console
+        console.warn(
+          '[Sentry] Sentry was not initialized with `@sentry/hono/node`. Please import from `@sentry/hono/node` to ensure Hono-specific instrumentation is applied correctly.',
+        );
+      });
+    } else {
+      sentryClient.getOptions().debug &&
+        debug.log('Sentry is initialized, proceeding to set up Hono `sentry` middleware.');
+    }
+  }
+
+  applyHonoPatches(app);
+
+  return createHonoRequestMiddleware({ runtime: 'node', shouldHandleError: options?.shouldHandleError });
+};

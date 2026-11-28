@@ -1,0 +1,698 @@
+import { URL_FULL, URL_PATH } from '@sentry/conventions/attributes';
+import * as core from '@sentry/core';
+import * as coreServer from '@sentry/core/server';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  createSentryServerInstrumentation,
+  isInstrumentationApiUsed,
+} from '../../src/server/createServerInstrumentation';
+import * as serverBuildModule from '../../src/server/serverBuild';
+
+vi.mock('@sentry/core', async () => {
+  const actual = await vi.importActual('@sentry/core');
+  return {
+    ...actual,
+    startSpan: vi.fn(),
+    captureException: vi.fn(),
+    getActiveSpan: vi.fn(),
+    getRootSpan: vi.fn(),
+    getClient: vi.fn(),
+    updateSpanName: vi.fn(),
+    GLOBAL_OBJ: globalThis,
+    SEMANTIC_ATTRIBUTE_SENTRY_OP: 'sentry.op',
+    SEMANTIC_ATTRIBUTE_SENTRY_ORIGIN: 'sentry.origin',
+  };
+});
+
+vi.mock('@sentry/core/server', () => ({
+  flushIfServerless: vi.fn(),
+}));
+
+vi.mock('../../src/server/serverBuild', () => ({
+  getMiddlewareName: vi.fn(),
+}));
+
+describe('createSentryServerInstrumentation', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // Reset global flag
+    delete (globalThis as any).__sentryReactRouterServerInstrumentationUsed;
+  });
+
+  afterEach(() => {
+    delete (globalThis as any).__sentryReactRouterServerInstrumentationUsed;
+  });
+
+  it('should create a valid server instrumentation object', () => {
+    const instrumentation = createSentryServerInstrumentation();
+
+    expect(instrumentation).toBeDefined();
+    expect(typeof instrumentation.handler).toBe('function');
+    expect(typeof instrumentation.route).toBe('function');
+  });
+
+  it('should NOT set the global flag when created (only when React Router invokes the registration)', () => {
+    expect((globalThis as any).__sentryReactRouterServerInstrumentationUsed).toBeUndefined();
+
+    createSentryServerInstrumentation();
+
+    // Creating the instrumentation must not mark the API active - the flag should only flip once
+    // React Router actually invokes the registration callbacks.
+    expect((globalThis as any).__sentryReactRouterServerInstrumentationUsed).toBeUndefined();
+  });
+
+  describe('with span streaming enabled', () => {
+    beforeEach(() => {
+      (core.getClient as any).mockReturnValue({ getOptions: () => ({ traceLifecycle: 'stream' }) });
+    });
+
+    // `vi.clearAllMocks()` clears calls but not implementations, so this would leak into later tests.
+    afterEach(() => {
+      (core.getClient as any).mockReturnValue(undefined);
+    });
+
+    it('names an unparameterized root span after the request method', async () => {
+      const mockRequest = new Request('http://example.com/test-path');
+      const mockInstrument = vi.fn();
+      const mockRootSpan = { setAttributes: vi.fn() };
+
+      (core.getActiveSpan as any).mockReturnValue({});
+      (core.getRootSpan as any).mockReturnValue(mockRootSpan);
+
+      const instrumentation = createSentryServerInstrumentation();
+      instrumentation.handler?.({ instrument: mockInstrument });
+      const hooks = mockInstrument.mock.calls[0]![0];
+
+      await hooks.request(vi.fn().mockResolvedValue({ status: 'success', error: undefined }), {
+        request: mockRequest,
+        context: undefined,
+      });
+
+      expect(core.updateSpanName).toHaveBeenCalledWith(mockRootSpan, 'GET');
+    });
+
+    it('keeps the parameterized route once React Router matches one', async () => {
+      const { mockRootSpan } = await callMiddlewareHook({
+        middlewareName: undefined,
+        routeId: 'test-route',
+        routePath: '/users/:id',
+        url: 'http://example.com/users/123',
+      });
+
+      expect(core.updateSpanName).toHaveBeenCalledWith(mockRootSpan, 'GET /users/:id');
+    });
+
+    it.each([
+      ['loader', 'loader', '/users/:id'],
+      ['action', 'action', '/users/:id'],
+    ])('names the %s span after the function it wraps', async (hookName, functionName, pattern) => {
+      const mockCall = vi.fn().mockResolvedValue({ status: 'success', error: undefined });
+      const mockInstrument = vi.fn();
+
+      (core.startSpan as any).mockImplementation((_opts: any, fn: any) => fn());
+
+      const instrumentation = createSentryServerInstrumentation();
+      instrumentation.route?.({ id: 'test-route', index: false, path: '/test', instrument: mockInstrument });
+      const hooks = mockInstrument.mock.calls[0]![0];
+
+      await hooks[hookName](mockCall, {
+        request: { method: 'GET', url: 'http://example.com/users/123', headers: { get: () => null } },
+        params: { id: '123' },
+        unstable_pattern: pattern,
+        context: undefined,
+      });
+
+      expect(core.startSpan).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: functionName,
+          attributes: expect.objectContaining({
+            'code.function.name': functionName,
+            'sentry.description': pattern,
+          }),
+        }),
+        expect.any(Function),
+      );
+    });
+
+    it('keeps the raw pathname out of the span name for an unmatched route', async () => {
+      const mockCall = vi.fn().mockResolvedValue({ status: 'success', error: undefined });
+      const mockInstrument = vi.fn();
+
+      (core.startSpan as any).mockImplementation((_opts: any, fn: any) => fn());
+
+      const instrumentation = createSentryServerInstrumentation();
+      instrumentation.route?.({ id: 'test-route', index: false, path: '/test', instrument: mockInstrument });
+      const hooks = mockInstrument.mock.calls[0]![0];
+
+      await hooks.loader(mockCall, {
+        request: { method: 'GET', url: 'http://example.com/users/123', headers: { get: () => null } },
+        params: { id: '123' },
+        unstable_pattern: undefined,
+        context: undefined,
+      });
+
+      expect(core.startSpan).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: 'loader',
+          attributes: expect.objectContaining({ 'sentry.description': '/users/123' }),
+        }),
+        expect.any(Function),
+      );
+    });
+  });
+
+  it('should set the global flag when React Router invokes the handler registration', () => {
+    const instrumentation = createSentryServerInstrumentation();
+    expect((globalThis as any).__sentryReactRouterServerInstrumentationUsed).toBeUndefined();
+
+    instrumentation.handler?.({ instrument: vi.fn() });
+
+    expect((globalThis as any).__sentryReactRouterServerInstrumentationUsed).toBe(true);
+  });
+
+  it('should set the global flag when React Router invokes the route registration', () => {
+    const instrumentation = createSentryServerInstrumentation();
+    expect((globalThis as any).__sentryReactRouterServerInstrumentationUsed).toBeUndefined();
+
+    instrumentation.route?.({ id: 'test-route', index: false, path: '/test', instrument: vi.fn() });
+
+    expect((globalThis as any).__sentryReactRouterServerInstrumentationUsed).toBe(true);
+  });
+
+  it('should update root span with handler request attributes', async () => {
+    const mockRequest = new Request('http://example.com/test-path');
+    const mockHandleRequest = vi.fn().mockResolvedValue({ status: 'success', error: undefined });
+    const mockInstrument = vi.fn();
+    const mockSetAttributes = vi.fn();
+    const mockRootSpan = { setAttributes: mockSetAttributes };
+
+    (core.getActiveSpan as any).mockReturnValue({});
+    (core.getRootSpan as any).mockReturnValue(mockRootSpan);
+
+    const instrumentation = createSentryServerInstrumentation();
+    instrumentation.handler?.({ instrument: mockInstrument });
+
+    expect(mockInstrument).toHaveBeenCalled();
+    const hooks = mockInstrument.mock.calls[0]![0];
+
+    // Call the request hook with RequestHandlerInstrumentationInfo
+    await hooks.request(mockHandleRequest, { request: mockRequest, context: undefined });
+
+    // Should update the root span name and attributes
+    expect(core.updateSpanName).toHaveBeenCalledWith(mockRootSpan, 'GET /test-path');
+    expect(mockSetAttributes).toHaveBeenCalledWith({
+      'sentry.op': 'http.server',
+      'sentry.origin': 'auto.http.react_router.instrumentation_api',
+      'sentry.segment.name.source': 'url',
+      [URL_FULL]: 'http://example.com/test-path',
+      [URL_PATH]: '/test-path',
+    });
+    expect(mockHandleRequest).toHaveBeenCalled();
+    expect(coreServer.flushIfServerless).toHaveBeenCalled();
+  });
+
+  it('should create own root span when no active span exists', async () => {
+    const mockRequest = new Request('http://example.com/api/users');
+    const mockHandleRequest = vi.fn().mockResolvedValue({ status: 'success', error: undefined });
+    const mockInstrument = vi.fn();
+
+    // No active span exists
+    (core.getActiveSpan as any).mockReturnValue(undefined);
+    (core.startSpan as any).mockImplementation((_opts: any, fn: any) => fn());
+
+    const instrumentation = createSentryServerInstrumentation();
+    instrumentation.handler?.({ instrument: mockInstrument });
+
+    const hooks = mockInstrument.mock.calls[0]![0];
+
+    await hooks.request(mockHandleRequest, { request: mockRequest, context: undefined });
+
+    // Should create a new root span
+    expect(core.startSpan).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: 'GET /api/users',
+        attributes: expect.objectContaining({
+          'sentry.op': 'http.server',
+          'sentry.origin': 'auto.http.react_router.instrumentation_api',
+          'sentry.segment.name.source': 'url',
+          'http.request.method': 'GET',
+          'url.path': '/api/users',
+          'url.full': 'http://example.com/api/users',
+        }),
+      }),
+      expect.any(Function),
+    );
+    expect(mockHandleRequest).toHaveBeenCalled();
+    expect(coreServer.flushIfServerless).toHaveBeenCalled();
+  });
+
+  it('should capture errors and set span status when root span exists', async () => {
+    const mockRequest = new Request('http://example.com/api/users');
+    const mockError = new Error('Handler error');
+    const mockHandleRequest = vi.fn().mockResolvedValue({ status: 'error', error: mockError });
+    const mockInstrument = vi.fn();
+    const mockSetStatus = vi.fn();
+    const mockRootSpan = { setAttributes: vi.fn(), setStatus: mockSetStatus };
+
+    (core.getActiveSpan as any).mockReturnValue({});
+    (core.getRootSpan as any).mockReturnValue(mockRootSpan);
+
+    const instrumentation = createSentryServerInstrumentation();
+    instrumentation.handler?.({ instrument: mockInstrument });
+
+    const hooks = mockInstrument.mock.calls[0]![0];
+
+    await hooks.request(mockHandleRequest, { request: mockRequest, context: undefined });
+
+    expect(mockSetStatus).toHaveBeenCalledWith({ code: 2, message: 'internal_error' });
+    expect(core.captureException).toHaveBeenCalledWith(mockError, {
+      mechanism: {
+        type: 'react_router.request_handler',
+        handled: false,
+        data: { 'http.request.method': 'GET', 'url.full': '/api/users' },
+      },
+    });
+  });
+
+  it('should capture errors in handler when no root span exists', async () => {
+    const mockRequest = new Request('http://example.com/api/users');
+    const mockError = new Error('Handler error');
+    const mockHandleRequest = vi.fn().mockResolvedValue({ status: 'error', error: mockError });
+    const mockInstrument = vi.fn();
+    const mockSpan = { setStatus: vi.fn() };
+
+    (core.getActiveSpan as any).mockReturnValue(undefined);
+    (core.startSpan as any).mockImplementation((_opts: any, fn: any) => fn(mockSpan));
+
+    const instrumentation = createSentryServerInstrumentation();
+    instrumentation.handler?.({ instrument: mockInstrument });
+
+    const hooks = mockInstrument.mock.calls[0]![0];
+
+    await hooks.request(mockHandleRequest, { request: mockRequest, context: undefined });
+
+    expect(mockSpan.setStatus).toHaveBeenCalledWith({ code: 2, message: 'internal_error' });
+    expect(core.captureException).toHaveBeenCalledWith(mockError, {
+      mechanism: {
+        type: 'react_router.request_handler',
+        handled: false,
+        data: { 'http.request.method': 'GET', 'url.full': '/api/users' },
+      },
+    });
+  });
+
+  it('should handle invalid URL gracefully and still call handler', async () => {
+    // Create a request object with an invalid URL that will fail URL parsing
+    const mockRequest = { url: 'not-a-valid-url', method: 'GET' } as unknown as Request;
+    const mockHandleRequest = vi.fn().mockResolvedValue({ status: 'success', error: undefined });
+    const mockInstrument = vi.fn();
+
+    const instrumentation = createSentryServerInstrumentation();
+    instrumentation.handler?.({ instrument: mockInstrument });
+
+    const hooks = mockInstrument.mock.calls[0]![0];
+
+    await hooks.request(mockHandleRequest, { request: mockRequest, context: undefined });
+
+    // Handler should still be called even if URL parsing fails
+    expect(mockHandleRequest).toHaveBeenCalled();
+    expect(coreServer.flushIfServerless).toHaveBeenCalled();
+  });
+
+  it('should handle relative URLs by using a dummy base', async () => {
+    const mockRequest = { url: '/relative/path', method: 'GET' } as unknown as Request;
+    const mockHandleRequest = vi.fn().mockResolvedValue({ status: 'success', error: undefined });
+    const mockInstrument = vi.fn();
+    const mockSetAttributes = vi.fn();
+    const mockRootSpan = { setAttributes: mockSetAttributes };
+
+    (core.getActiveSpan as any).mockReturnValue({});
+    (core.getRootSpan as any).mockReturnValue(mockRootSpan);
+
+    const instrumentation = createSentryServerInstrumentation();
+    instrumentation.handler?.({ instrument: mockInstrument });
+
+    const hooks = mockInstrument.mock.calls[0]![0];
+
+    await hooks.request(mockHandleRequest, { request: mockRequest, context: undefined });
+
+    expect(core.updateSpanName).toHaveBeenCalledWith(mockRootSpan, 'GET /relative/path');
+  });
+
+  it('should instrument route loader with spans', async () => {
+    const mockCallLoader = vi.fn().mockResolvedValue({ status: 'success', error: undefined });
+    const mockInstrument = vi.fn();
+
+    (core.startSpan as any).mockImplementation((_opts: any, fn: any) => fn());
+    (core.getActiveSpan as any).mockReturnValue({});
+    (core.getRootSpan as any).mockReturnValue({ setAttributes: vi.fn() });
+
+    const instrumentation = createSentryServerInstrumentation();
+    instrumentation.route?.({
+      id: 'test-route',
+      index: false,
+      path: '/users/:id',
+      instrument: mockInstrument,
+    });
+
+    expect(mockInstrument).toHaveBeenCalled();
+    const hooks = mockInstrument.mock.calls[0]![0];
+
+    // Call the loader hook with RouteHandlerInstrumentationInfo
+    await hooks.loader(mockCallLoader, {
+      request: { method: 'GET', url: 'http://example.com/users/123', headers: { get: () => null } },
+      params: { id: '123' },
+      unstable_pattern: '/users/:id',
+      context: undefined,
+    });
+
+    expect(core.startSpan).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: '/users/:id',
+        attributes: expect.objectContaining({
+          'sentry.op': 'function',
+          'code.function.name': 'loader',
+          'sentry.origin': 'auto.function.react_router.instrumentation_api',
+        }),
+      }),
+      expect.any(Function),
+    );
+    expect(mockCallLoader).toHaveBeenCalled();
+    expect(core.updateSpanName).toHaveBeenCalled();
+  });
+
+  it('should instrument route action with spans', async () => {
+    const mockCallAction = vi.fn().mockResolvedValue({ status: 'success', error: undefined });
+    const mockInstrument = vi.fn();
+
+    (core.startSpan as any).mockImplementation((_opts: any, fn: any) => fn());
+    (core.getActiveSpan as any).mockReturnValue({});
+    (core.getRootSpan as any).mockReturnValue({ setAttributes: vi.fn() });
+
+    const instrumentation = createSentryServerInstrumentation();
+    instrumentation.route?.({
+      id: 'test-route',
+      index: false,
+      path: '/users/:id',
+      instrument: mockInstrument,
+    });
+
+    const hooks = mockInstrument.mock.calls[0]![0];
+
+    // Call the action hook with RouteHandlerInstrumentationInfo
+    await hooks.action(mockCallAction, {
+      request: { method: 'POST', url: 'http://example.com/users/123', headers: { get: () => null } },
+      params: { id: '123' },
+      unstable_pattern: '/users/:id',
+      context: undefined,
+    });
+
+    expect(core.startSpan).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: '/users/:id',
+        attributes: expect.objectContaining({
+          'sentry.op': 'function',
+          'code.function.name': 'action',
+          'sentry.origin': 'auto.function.react_router.instrumentation_api',
+        }),
+      }),
+      expect.any(Function),
+    );
+  });
+
+  async function callMiddlewareHook(options: {
+    middlewareName: string | undefined;
+    routeId: string;
+    routePath: string;
+    url: string;
+  }) {
+    const mockCallMiddleware = vi.fn().mockResolvedValue({ status: 'success', error: undefined });
+    const mockInstrument = vi.fn();
+    const mockSetAttributes = vi.fn();
+    const mockRootSpan = { setAttributes: mockSetAttributes };
+
+    vi.mocked(serverBuildModule.getMiddlewareName).mockReturnValue(options.middlewareName);
+
+    (core.startSpan as any).mockImplementation((_opts: any, fn: any) => fn());
+    (core.getActiveSpan as any).mockReturnValue({});
+    (core.getRootSpan as any).mockReturnValue(mockRootSpan);
+
+    const instrumentation = createSentryServerInstrumentation();
+    instrumentation.route?.({
+      id: options.routeId,
+      index: false,
+      path: options.routePath,
+      instrument: mockInstrument,
+    });
+
+    const hooks = mockInstrument.mock.calls[0]![0];
+
+    await hooks.middleware(mockCallMiddleware, {
+      request: { method: 'GET', url: options.url, headers: { get: () => null } },
+      params: {},
+      unstable_pattern: options.routePath,
+      context: undefined,
+    });
+
+    return { mockSetAttributes, mockRootSpan };
+  }
+
+  it('should instrument route middleware with spans (without function name)', async () => {
+    const { mockSetAttributes, mockRootSpan } = await callMiddlewareHook({
+      middlewareName: undefined,
+      routeId: 'test-route',
+      routePath: '/users/:id',
+      url: 'http://example.com/users/123',
+    });
+
+    expect(core.startSpan).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: 'middleware test-route',
+        attributes: expect.objectContaining({
+          'sentry.op': 'middleware',
+          'code.function.name': 'middleware',
+          'sentry.origin': 'auto.function.react_router.instrumentation_api',
+          'react_router.route.id': 'test-route',
+          'http.route': '/users/:id',
+          'react_router.middleware.index': 0,
+        }),
+      }),
+      expect.any(Function),
+    );
+
+    expect(core.updateSpanName).toHaveBeenCalledWith(mockRootSpan, 'GET /users/:id');
+    expect(mockSetAttributes).toHaveBeenCalledWith(
+      expect.objectContaining({
+        'http.route': '/users/:id',
+        'sentry.segment.name.source': 'route',
+      }),
+    );
+  });
+
+  it('should use middleware function name when available from serverBuild', async () => {
+    await callMiddlewareHook({
+      middlewareName: 'authMiddleware',
+      routeId: 'routes/protected',
+      routePath: '/protected',
+      url: 'http://example.com/protected',
+    });
+
+    expect(core.startSpan).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: 'middleware authMiddleware',
+        attributes: expect.objectContaining({
+          'sentry.op': 'middleware',
+          'code.function.name': 'middleware',
+          'react_router.route.id': 'routes/protected',
+          'http.route': '/protected',
+          'react_router.middleware.name': 'authMiddleware',
+          'react_router.middleware.index': 0,
+        }),
+      }),
+      expect.any(Function),
+    );
+  });
+
+  it('should increment middleware index for multiple middleware calls on same route', async () => {
+    const mockCallMiddleware = vi.fn().mockResolvedValue({ status: 'success', error: undefined });
+    const mockInstrument = vi.fn();
+    const routeId = 'routes/multi-middleware';
+
+    vi.mocked(serverBuildModule.getMiddlewareName).mockReturnValue(undefined);
+
+    const startSpanCalls: any[] = [];
+    (core.startSpan as any).mockImplementation((opts: any, fn: any) => {
+      startSpanCalls.push(opts);
+      return fn();
+    });
+    // The per-request middleware counter is keyed by the (stable) root span, so the 3 calls increment.
+    const mockRootSpan = { setAttributes: vi.fn() };
+    (core.getActiveSpan as any).mockReturnValue(mockRootSpan);
+    (core.getRootSpan as any).mockReturnValue(mockRootSpan);
+
+    const instrumentation = createSentryServerInstrumentation();
+    instrumentation.route?.({
+      id: routeId,
+      index: false,
+      path: '/multi-middleware',
+      instrument: mockInstrument,
+    });
+
+    const hooks = mockInstrument.mock.calls[0]![0];
+    const requestInfo = {
+      request: { method: 'GET', url: 'http://example.com/multi-middleware', headers: { get: () => null } },
+      params: {},
+      unstable_pattern: '/multi-middleware',
+      context: undefined,
+    };
+
+    await hooks.middleware(mockCallMiddleware, requestInfo);
+    await hooks.middleware(mockCallMiddleware, requestInfo);
+    await hooks.middleware(mockCallMiddleware, requestInfo);
+
+    // Filter to only middleware spans
+    const middlewareSpans = startSpanCalls.filter(opts => opts.attributes?.['code.function.name'] === 'middleware');
+
+    expect(middlewareSpans).toHaveLength(3);
+    expect(middlewareSpans[0].attributes['react_router.middleware.index']).toBe(0);
+    expect(middlewareSpans[1].attributes['react_router.middleware.index']).toBe(1);
+    expect(middlewareSpans[2].attributes['react_router.middleware.index']).toBe(2);
+  });
+
+  it('should instrument lazy route loading with spans', async () => {
+    const mockCallLazy = vi.fn().mockResolvedValue({ status: 'success', error: undefined });
+    const mockInstrument = vi.fn();
+
+    (core.startSpan as any).mockImplementation((_opts: any, fn: any) => fn());
+
+    const instrumentation = createSentryServerInstrumentation();
+    instrumentation.route?.({
+      id: 'test-route',
+      index: false,
+      path: '/users/:id',
+      instrument: mockInstrument,
+    });
+
+    const hooks = mockInstrument.mock.calls[0]![0];
+
+    // Call the lazy hook - info is undefined for lazy loading
+    await hooks.lazy(mockCallLazy, undefined);
+
+    expect(core.startSpan).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: 'Lazy Route Load',
+        attributes: expect.objectContaining({
+          'sentry.op': 'function',
+          'code.function.name': 'lazy',
+          'sentry.origin': 'auto.function.react_router.instrumentation_api',
+        }),
+      }),
+      expect.any(Function),
+    );
+    expect(mockCallLazy).toHaveBeenCalled();
+  });
+
+  it('should capture errors when captureErrors is true (default)', async () => {
+    const mockError = new Error('Test error');
+    // React Router returns an error result, not a rejection
+    const mockCallLoader = vi.fn().mockResolvedValue({ status: 'error', error: mockError });
+    const mockInstrument = vi.fn();
+    const mockSpan = { setStatus: vi.fn() };
+
+    (core.startSpan as any).mockImplementation((_opts: any, fn: any) => fn(mockSpan));
+    (core.getActiveSpan as any).mockReturnValue({});
+    (core.getRootSpan as any).mockReturnValue({ setAttributes: vi.fn() });
+
+    const instrumentation = createSentryServerInstrumentation();
+    instrumentation.route?.({
+      id: 'test-route',
+      index: false,
+      path: '/test',
+      instrument: mockInstrument,
+    });
+
+    const hooks = mockInstrument.mock.calls[0]![0];
+
+    await hooks.loader(mockCallLoader, {
+      request: { method: 'GET', url: 'http://example.com/test', headers: { get: () => null } },
+      params: {},
+      unstable_pattern: '/test',
+      context: undefined,
+    });
+
+    expect(core.captureException).toHaveBeenCalledWith(mockError, {
+      mechanism: {
+        type: 'react_router.loader',
+        handled: false,
+        data: { 'http.request.method': 'GET', 'url.full': '/test' },
+      },
+    });
+
+    // Should also set span status to error for actual Error instances
+    expect(mockSpan.setStatus).toHaveBeenCalledWith({ code: 2, message: 'internal_error' });
+  });
+
+  it('should not capture errors when captureErrors is false', async () => {
+    const mockError = new Error('Test error');
+    // React Router returns an error result, not a rejection
+    const mockCallLoader = vi.fn().mockResolvedValue({ status: 'error', error: mockError });
+    const mockInstrument = vi.fn();
+    const mockSpan = { setStatus: vi.fn() };
+
+    (core.startSpan as any).mockImplementation((_opts: any, fn: any) => fn(mockSpan));
+    (core.getActiveSpan as any).mockReturnValue({});
+    (core.getRootSpan as any).mockReturnValue({ setAttributes: vi.fn() });
+
+    const instrumentation = createSentryServerInstrumentation({ captureErrors: false });
+    instrumentation.route?.({
+      id: 'test-route',
+      index: false,
+      path: '/test',
+      instrument: mockInstrument,
+    });
+
+    const hooks = mockInstrument.mock.calls[0]![0];
+
+    await hooks.loader(mockCallLoader, {
+      request: { method: 'GET', url: 'http://example.com/test', headers: { get: () => null } },
+      params: {},
+      unstable_pattern: '/test',
+      context: undefined,
+    });
+
+    expect(core.captureException).not.toHaveBeenCalled();
+
+    // Span status should still be set for Error instances (reflects actual state)
+    expect(mockSpan.setStatus).toHaveBeenCalledWith({ code: 2, message: 'internal_error' });
+  });
+});
+
+describe('isInstrumentationApiUsed', () => {
+  beforeEach(() => {
+    delete (globalThis as any).__sentryReactRouterServerInstrumentationUsed;
+  });
+
+  afterEach(() => {
+    delete (globalThis as any).__sentryReactRouterServerInstrumentationUsed;
+  });
+
+  it('should return false when flag is not set', () => {
+    expect(isInstrumentationApiUsed()).toBe(false);
+  });
+
+  it('should return true when flag is set', () => {
+    (globalThis as any).__sentryReactRouterServerInstrumentationUsed = true;
+    expect(isInstrumentationApiUsed()).toBe(true);
+  });
+
+  it('should return true only after React Router invokes the instrumentation registration', () => {
+    expect(isInstrumentationApiUsed()).toBe(false);
+
+    const instrumentation = createSentryServerInstrumentation();
+    // Not active yet - React Router has not invoked the registration callbacks.
+    expect(isInstrumentationApiUsed()).toBe(false);
+
+    instrumentation.handler?.({ instrument: vi.fn() });
+    expect(isInstrumentationApiUsed()).toBe(true);
+  });
+});

@@ -1,0 +1,295 @@
+import type { Integration } from '@sentry/core';
+import {
+  getClient,
+  getGlobalScope,
+  getMainCarrier,
+  getTunnelPath,
+  GLOBAL_OBJ,
+  shouldIgnoreSpan,
+  withIsolationScope,
+} from '@sentry/core';
+import { setAsyncLocalStorageAsyncContextStrategy } from '@sentry/server-utils';
+import * as SentryVercelEdge from '@sentry/vercel-edge';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  _INTERNAL_resetTunnelDefaults,
+  handleTunnelRequestIfMatched,
+  serveTunnelIntegration,
+} from '@sentry/core/server';
+import { TRANSACTION_ATTR_SHOULD_DROP_TRANSACTION } from '../src/common/span-attributes-with-logic-attached';
+import { init } from '../src/edge';
+
+// normally this is set as part of the build process, so mock it here
+(GLOBAL_OBJ as typeof GLOBAL_OBJ & { _sentryRewriteFramesDistDir: string })._sentryRewriteFramesDistDir = '.next';
+
+const vercelEdgeInit = vi.spyOn(SentryVercelEdge, 'init');
+
+const TEST_DSN = 'https://public@dsn.ingest.sentry.io/1337';
+
+function findIntegrationByName(integrations: Integration[] = [], name: string): Integration | undefined {
+  return integrations.find(integration => integration.name === name);
+}
+
+describe('Edge init()', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    SentryVercelEdge.getCurrentScope().setClient(undefined);
+    vi.clearAllMocks();
+    vi.unstubAllGlobals();
+
+    getMainCarrier().__SENTRY__ = undefined;
+
+    delete (process as { turbopack?: boolean }).turbopack;
+
+    delete (GLOBAL_OBJ as typeof GLOBAL_OBJ & { _sentryRelease?: string })._sentryRelease;
+  });
+
+  it('inits the Vercel Edge SDK', () => {
+    expect(vercelEdgeInit).toHaveBeenCalledTimes(0);
+    init({});
+    expect(vercelEdgeInit).toHaveBeenCalledTimes(1);
+    expect(vercelEdgeInit).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        _metadata: {
+          sdk: {
+            name: 'sentry.javascript.nextjs',
+            version: expect.any(String),
+            packages: [
+              {
+                name: 'npm:@sentry/nextjs',
+                version: expect.any(String),
+              },
+              {
+                name: 'npm:@sentry/vercel-edge',
+                version: expect.any(String),
+              },
+            ],
+          },
+        },
+        // Integrations are tested separately, and we can't be more specific here without depending on the order in
+        // which integrations appear in the array, which we can't guarantee.
+        defaultIntegrations: expect.any(Array),
+      }),
+    );
+  });
+
+  it('skips init on Cloudflare Workers in a request of `withSentry` from `@sentry/cloudflare`', () => {
+    vi.stubGlobal('navigator', { userAgent: 'Cloudflare-Workers' });
+    setAsyncLocalStorageAsyncContextStrategy();
+
+    withIsolationScope(() => init({}));
+
+    expect(vercelEdgeInit).not.toHaveBeenCalled();
+  });
+
+  it('stores the release on Cloudflare Workers in a request of `withSentry` from `@sentry/cloudflare`', () => {
+    vi.stubGlobal('navigator', { userAgent: 'Cloudflare-Workers' });
+    setAsyncLocalStorageAsyncContextStrategy();
+
+    withIsolationScope(() => init({ release: '1.2.3' }));
+
+    expect((GLOBAL_OBJ as typeof GLOBAL_OBJ & { _sentryRelease?: string })._sentryRelease).toBe('1.2.3');
+  });
+
+  it('sets the `turbopack` tag on Cloudflare Workers in a request of `withSentry` from `@sentry/cloudflare`', () => {
+    vi.stubGlobal('navigator', { userAgent: 'Cloudflare-Workers' });
+    setAsyncLocalStorageAsyncContextStrategy();
+    (process as { turbopack?: boolean }).turbopack = true;
+
+    withIsolationScope(() => init({}));
+
+    expect(getGlobalScope().getScopeData().tags.turbopack).toBe(true);
+  });
+
+  describe('managed tunnel', () => {
+    const globalWithInjectedValues = GLOBAL_OBJ as typeof GLOBAL_OBJ & {
+      _sentryBasePath?: string;
+      _sentryTunnelRoute?: string;
+    };
+    const post = (path: string): Request =>
+      new Request(`https://example.com${path}`, { method: 'POST', body: '{}', headers: { 'content-length': '2' } });
+
+    afterEach(() => {
+      delete globalWithInjectedValues._sentryBasePath;
+      delete globalWithInjectedValues._sentryTunnelRoute;
+      _INTERNAL_resetTunnelDefaults();
+    });
+
+    it('serves the fixed path of the `tunnelRoute` without `serveTunnelIntegration`', () => {
+      globalWithInjectedValues._sentryBasePath = '/docs';
+      globalWithInjectedValues._sentryTunnelRoute = '/docs/monitoring';
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('{}'));
+
+      init({ dsn: TEST_DSN });
+
+      expect(handleTunnelRequestIfMatched(post('/docs/monitoring'))).toBeInstanceOf(Promise);
+      expect(handleTunnelRequestIfMatched(post(`/docs${getTunnelPath(TEST_DSN)}`))).toBeUndefined();
+      fetchSpy.mockRestore();
+    });
+
+    it("serves the path derived from the DSN under the app's `basePath` for `tunnelRoute: true`", () => {
+      globalWithInjectedValues._sentryBasePath = '/docs';
+      globalWithInjectedValues._sentryTunnelRoute = 'true';
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('{}'));
+
+      init({ dsn: TEST_DSN });
+
+      expect(handleTunnelRequestIfMatched(post(`/docs${getTunnelPath(TEST_DSN)}`))).toBeInstanceOf(Promise);
+      fetchSpy.mockRestore();
+    });
+
+    it.each([
+      ['`tunnelRoute: true`', () => ({ tunnelRoute: 'true', integrations: [] })],
+      ['`serveTunnelIntegration`', () => ({ tunnelRoute: undefined, integrations: [serveTunnelIntegration()] })],
+    ])('ignores the Next.js request spans of the tunnel path derived from the DSN with %s', (_description, setUp) => {
+      const { tunnelRoute, integrations } = setUp();
+      globalWithInjectedValues._sentryBasePath = '/docs';
+      globalWithInjectedValues._sentryTunnelRoute = tunnelRoute;
+
+      init({ dsn: TEST_DSN, integrations });
+
+      const ignoreSpans = getClient()?.getOptions().ignoreSpans;
+      // Next.js sets only `http.target` at span start, e.g. for a proxy that runs outside of the server on Vercel.
+      const isIgnored = (spanType: string, target: string): boolean =>
+        shouldIgnoreSpan(
+          {
+            description: 'middleware POST',
+            op: 'http.server',
+            attributes: { 'next.span_type': spanType, 'http.target': target },
+          },
+          ignoreSpans,
+        );
+      const tunnelPath = `/docs${getTunnelPath(TEST_DSN)}`;
+      expect(isIgnored('Middleware.execute', tunnelPath)).toBe(true);
+      expect(isIgnored('Next.request', `${tunnelPath}/`)).toBe(true);
+      expect(isIgnored('BaseServer.handleRequest', tunnelPath)).toBe(true);
+      expect(isIgnored('Next.request', '/docs/pricing')).toBe(false);
+    });
+
+    it("serves the tunnel of `serveTunnelIntegration` under the app's `basePath`", () => {
+      globalWithInjectedValues._sentryBasePath = '/docs';
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('{}'));
+
+      init({ dsn: TEST_DSN, integrations: [serveTunnelIntegration()] });
+
+      const tunnelPath = getTunnelPath(TEST_DSN);
+      expect(handleTunnelRequestIfMatched(post(`/docs${tunnelPath}`))).toBeInstanceOf(Promise);
+      expect(handleTunnelRequestIfMatched(post(`${tunnelPath}`))).toBeUndefined();
+      fetchSpy.mockRestore();
+    });
+  });
+
+  describe('integrations', () => {
+    // Options passed by `@sentry/nextjs`'s `init` to `@sentry/vercel-edge`'s `init` after modifying them
+    type ModifiedInitOptions = { integrations?: Integration[]; defaultIntegrations: Integration[] };
+
+    it('adds default integrations', () => {
+      init({});
+
+      const vercelEdgeInitOptions = vercelEdgeInit.mock.calls[0]?.[0] as ModifiedInitOptions;
+      const integrationNames = vercelEdgeInitOptions.defaultIntegrations.map(integration => integration.name);
+
+      expect(integrationNames).toContain('DistDirRewriteFrames');
+    });
+
+    it('supports passing unrelated integrations through options', () => {
+      init({ integrations: [SentryVercelEdge.dedupeIntegration()] });
+
+      const vercelEdgeInitOptions = vercelEdgeInit.mock.calls[0]?.[0] as ModifiedInitOptions;
+      const dedupeIntegration = findIntegrationByName(vercelEdgeInitOptions.integrations, 'Dedupe');
+
+      expect(dedupeIntegration).toBeDefined();
+    });
+  });
+
+  describe('ignoreSpans', () => {
+    function getIgnoreSpans(): NonNullable<SentryVercelEdge.VercelEdgeOptions['ignoreSpans']> {
+      const callArgs = vercelEdgeInit.mock.calls[0]?.[0] as SentryVercelEdge.VercelEdgeOptions;
+      return callArgs.ignoreSpans ?? [];
+    }
+
+    it('appends the TRANSACTION_ATTR_SHOULD_DROP_TRANSACTION attribute filter', () => {
+      init({});
+      const patterns = getIgnoreSpans();
+
+      expect(patterns).toContainEqual({
+        attributes: { [TRANSACTION_ATTR_SHOULD_DROP_TRANSACTION]: true },
+      });
+    });
+
+    it('preserves user-provided ignoreSpans entries', () => {
+      init({ ignoreSpans: ['user-pattern', /custom-regex/] });
+      const patterns = getIgnoreSpans();
+
+      expect(patterns).toContain('user-pattern');
+      expect(patterns.some(p => p instanceof RegExp && p.source === 'custom-regex')).toBe(true);
+    });
+  });
+
+  describe('environment option', () => {
+    const originalEnv = process.env.SENTRY_ENVIRONMENT;
+
+    afterEach(() => {
+      if (originalEnv !== undefined) {
+        process.env.SENTRY_ENVIRONMENT = originalEnv;
+      } else {
+        delete process.env.SENTRY_ENVIRONMENT;
+      }
+    });
+
+    it('uses environment from options when provided', () => {
+      delete process.env.SENTRY_ENVIRONMENT;
+
+      init({
+        dsn: 'https://public@dsn.ingest.sentry.io/1337',
+        environment: 'custom-env',
+      });
+
+      expect(vercelEdgeInit).toHaveBeenCalledTimes(1);
+      const callArgs = vercelEdgeInit.mock.calls[0]?.[0];
+      expect(callArgs?.environment).toBe('custom-env');
+    });
+
+    it('uses SENTRY_ENVIRONMENT env var when options.environment is not provided', () => {
+      process.env.SENTRY_ENVIRONMENT = 'env-from-variable';
+
+      init({
+        dsn: 'https://public@dsn.ingest.sentry.io/1337',
+      });
+
+      expect(vercelEdgeInit).toHaveBeenCalledTimes(1);
+      const callArgs = vercelEdgeInit.mock.calls[0]?.[0];
+      expect(callArgs?.environment).toBe('env-from-variable');
+    });
+
+    it('uses fallback environment when neither options.environment nor SENTRY_ENVIRONMENT is provided', () => {
+      delete process.env.SENTRY_ENVIRONMENT;
+
+      init({
+        dsn: 'https://public@dsn.ingest.sentry.io/1337',
+      });
+
+      expect(vercelEdgeInit).toHaveBeenCalledTimes(1);
+      const callArgs = vercelEdgeInit.mock.calls[0]?.[0];
+      // In test environment, it should be undefined since we only set it explicitly when SENTRY_ENVIRONMENT is present
+      // Note: The underlying vercel-edge SDK may set its own default
+      expect(callArgs?.environment).toBeDefined();
+    });
+
+    it('prioritizes options.environment over SENTRY_ENVIRONMENT env var', () => {
+      process.env.SENTRY_ENVIRONMENT = 'env-from-variable';
+
+      init({
+        dsn: 'https://public@dsn.ingest.sentry.io/1337',
+        environment: 'options-env',
+      });
+
+      expect(vercelEdgeInit).toHaveBeenCalledTimes(1);
+      const callArgs = vercelEdgeInit.mock.calls[0]?.[0];
+      expect(callArgs?.environment).toBe('options-env');
+    });
+  });
+});

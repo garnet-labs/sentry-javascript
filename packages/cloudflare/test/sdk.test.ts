@@ -1,0 +1,593 @@
+import * as SentryCore from '@sentry/core';
+import type { Envelope, Integration } from '@sentry/core';
+import { getClient, startSpan } from '@sentry/core';
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
+import type { CloudflareOptions } from '../src/client';
+import { CloudflareClient } from '../src/client';
+import { getDefaultIntegrations, init } from '../src/sdk';
+import { resetSdk } from './testUtils';
+import {
+  mysqlIntegration as exportedMysqlIntegration,
+  spanStreamingIntegration,
+  serveTunnelIntegration,
+} from '../src/';
+
+describe('init', () => {
+  beforeEach(() => {
+    resetSdk();
+  });
+
+  test('should call initAndBind with the correct options', () => {
+    const initAndBindSpy = vi.spyOn(SentryCore, 'initAndBind');
+    const client = init({});
+
+    expect(initAndBindSpy).toHaveBeenCalledWith(CloudflareClient, expect.any(Object));
+
+    expect(client).toBeDefined();
+    expect(client).toBeInstanceOf(CloudflareClient);
+  });
+
+  test('serves the managed tunnel with `serveTunnelIntegration`', () => {
+    const browserDsn = 'https://browser@o1.ingest.sentry.io/42';
+    init({
+      dsn: 'https://public@dsn.ingest.sentry.io/1337',
+      integrations: [serveTunnelIntegration({ allowedDsns: [browserDsn] })],
+    });
+
+    const options = getClient()?.getOptions();
+    expect(options?.tunnel).toBeUndefined();
+    expect(options?._managedTunnel).toEqual({ allowedDsns: [browserDsn] });
+  });
+
+  test('installs SpanStreaming integration by default', () => {
+    init({
+      dsn: 'https://public@dsn.ingest.sentry.io/1337',
+    });
+    const client = getClient();
+
+    expect(client?.getOptions()).toEqual(
+      expect.objectContaining({
+        integrations: expect.arrayContaining([expect.objectContaining({ name: 'SpanStreaming' })]),
+      }),
+    );
+  });
+
+  test("does not install SpanStreaming integration when traceLifecycle is 'static'", () => {
+    init({ dsn: 'https://public@dsn.ingest.sentry.io/1337', traceLifecycle: 'static' });
+    const client = getClient();
+
+    expect(client?.getOptions()).toEqual(
+      expect.objectContaining({
+        integrations: expect.not.arrayContaining([expect.objectContaining({ name: 'SpanStreaming' })]),
+      }),
+    );
+  });
+
+  test('installs Dedupe integration by default', () => {
+    init({ dsn: 'https://public@dsn.ingest.sentry.io/1337' });
+    const client = getClient();
+
+    expect(client?.getOptions()).toEqual(
+      expect.objectContaining({
+        integrations: expect.arrayContaining([expect.objectContaining({ name: 'Dedupe' })]),
+      }),
+    );
+  });
+
+  test('does not install Dedupe integration when enableDedupe is false', () => {
+    init({ dsn: 'https://public@dsn.ingest.sentry.io/1337', enableDedupe: false });
+    const client = getClient();
+
+    expect(client?.getOptions()).toEqual(
+      expect.objectContaining({
+        integrations: expect.not.arrayContaining([expect.objectContaining({ name: 'Dedupe' })]),
+      }),
+    );
+  });
+
+  test('does not leave a timer pending when a segment span ends', () => {
+    vi.useFakeTimers();
+    try {
+      init({ dsn: 'https://public@dsn.ingest.sentry.io/1337', tracesSampleRate: 0 });
+
+      startSpan({ name: 'alarm' }, () => undefined);
+
+      // A pending timer keeps a Durable Object invocation open until it fires.
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("doesn't add spanStreamingIntegration when tracing is excluded from the bundle", () => {
+    vi.stubGlobal('__SENTRY_TRACING__', false);
+    try {
+      const client = init({ dsn: 'https://public@dsn.ingest.sentry.io/1337' });
+      const integrations = client?.getOptions().integrations.filter(i => i.name === 'SpanStreaming');
+
+      expect(integrations).toEqual([]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  type MarkedIntegration = Integration & { _custom?: boolean };
+
+  test("doesn't add spanStreamingIntegration if user added it manually", () => {
+    const customSpanStreamingIntegration: MarkedIntegration = spanStreamingIntegration();
+    customSpanStreamingIntegration._custom = true;
+
+    const client = init({ integrations: [customSpanStreamingIntegration], traceLifecycle: 'stream' });
+    const integrations = client?.getOptions().integrations.filter(i => i.name === 'SpanStreaming');
+
+    expect(integrations?.length).toBe(1);
+    expect((integrations?.[0] as MarkedIntegration)?._custom).toBe(true);
+  });
+});
+
+describe('cacheClient', () => {
+  beforeEach(() => {
+    resetSdk();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const TEST_ENVELOPE = [
+    { event_id: 'aa3ff046696b4bc6b609ce6d28fde9e2', sent_at: '2023-05-31T12:00:00.000Z' },
+    [[{ type: 'event' }, { event_id: 'aa3ff046696b4bc6b609ce6d28fde9e2' }]],
+  ] as Envelope;
+
+  test('returns the same client for repeated init with identical options', () => {
+    const options = {
+      dsn: 'https://public@dsn.ingest.sentry.io/1337',
+    } as const;
+
+    const first = init({ ...options });
+    const second = init({ ...options });
+
+    expect(second).toBe(first);
+  });
+
+  test('returns the isolate client when later init options differ', () => {
+    const first = init({
+      dsn: 'https://public@dsn.ingest.sentry.io/1337',
+      tracesSampleRate: 0.5,
+    });
+    const second = init({
+      dsn: 'https://public@dsn.ingest.sentry.io/1337',
+      tracesSampleRate: 1,
+    });
+
+    expect(second).toBe(first);
+  });
+
+  test('warns when a later init passes a different DSN than the cached client', () => {
+    const warn = vi.spyOn(SentryCore.debug, 'warn').mockImplementation(() => undefined);
+
+    const first = init({ dsn: 'https://public@dsn.ingest.sentry.io/1337' });
+    expect(warn).not.toHaveBeenCalled();
+
+    init({ dsn: 'https://public@dsn.ingest.sentry.io/1337' });
+    expect(warn).not.toHaveBeenCalled();
+
+    const second = init({ dsn: 'https://other@dsn.ingest.sentry.io/4242' });
+    expect(second).toBe(first);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('different DSN'));
+  });
+
+  test('re-binds the cached client to the current scope on repeated init', () => {
+    const options = {
+      dsn: 'https://public@dsn.ingest.sentry.io/1337',
+    } as const;
+
+    const cached = init({ ...options });
+
+    // Simulate a competing init leaving a different client bound to the scope
+    SentryCore.getCurrentScope().setClient(undefined);
+    expect(getClient()).toBeUndefined();
+
+    const again = init({ ...options });
+    expect(again).toBe(cached);
+    expect(getClient()).toBe(cached);
+  });
+
+  test('sets up a new cached client after close()', async () => {
+    const options = {
+      dsn: 'https://public@dsn.ingest.sentry.io/1337',
+    } as const;
+
+    const first = init({ ...options });
+    await SentryCore.close();
+    const second = init({ ...options });
+
+    expect(second).not.toBe(first);
+    expect(second?.getOptions().enabled).not.toBe(false);
+    expect(getClient()).toBe(second);
+    expect(init({ ...options })).toBe(second);
+  });
+
+  test('sets up a new cached client while the cached client is closing', async () => {
+    const options = {
+      dsn: 'https://public@dsn.ingest.sentry.io/1337',
+    } as const;
+
+    const first = init({ ...options });
+    const closing = first!.close();
+    const second = init({ ...options });
+    await closing;
+
+    expect(second).not.toBe(first);
+    expect(second?.getOptions().enabled).not.toBe(false);
+    expect(init({ ...options })).toBe(second);
+  });
+
+  test('keeps the cached client when a client that is not cached closes', async () => {
+    const cached = init({ dsn: 'https://public@dsn.ingest.sentry.io/1337' });
+    const uncached = init({ dsn: 'https://public@dsn.ingest.sentry.io/1337', cacheClient: false });
+
+    await uncached?.close();
+
+    expect(init({ dsn: 'https://public@dsn.ingest.sentry.io/1337' })).toBe(cached);
+  });
+
+  test('caches a client without a DSN and reuses it', () => {
+    // A disabled (DSN-less) client is still created once per isolate, not per invocation.
+    const first = init({});
+    const second = init({});
+
+    expect(first).toBeDefined();
+    expect(second).toBe(first);
+    expect(first?.isCachedClient).toBe(true);
+  });
+
+  test('keeps the cached DSN-less client when a later init passes a DSN', () => {
+    // First init wins for the isolate, so an isolate whose first init had no DSN (a missing env
+    // var on one route) stays disabled. `cacheClient: false` is the escape hatch.
+    const first = init({});
+    const second = init({ dsn: 'https://public@dsn.ingest.sentry.io/1337' });
+
+    expect(second).toBe(first);
+    expect(second?.getOptions().dsn).toBeUndefined();
+    expect(second?.getTransport()).toBeUndefined();
+  });
+
+  test('flushes eagerly when an envelope is sent on a cached client', async () => {
+    // The eager drain fires the buffered fetch, so stub out the network
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('ok')));
+
+    const client = init({
+      dsn: 'https://public@dsn.ingest.sentry.io/1337',
+    });
+
+    const transport = client?.getTransport();
+    expect(transport).toBeDefined();
+
+    const flushSpy = vi.spyOn(transport!, 'flush');
+    await client!.sendEnvelope(TEST_ENVELOPE);
+
+    expect(flushSpy).toHaveBeenCalled();
+  });
+
+  test('does not warn about a repeated init when cacheClient is disabled', () => {
+    const originalWarn = SentryCore.originalConsoleMethods.warn;
+    const warn = vi.fn();
+    SentryCore.originalConsoleMethods.warn = warn;
+
+    try {
+      const first = init({ dsn: 'https://public@dsn.ingest.sentry.io/1337', cacheClient: false });
+      const second = init({ dsn: 'https://public@dsn.ingest.sentry.io/1337', cacheClient: false });
+
+      expect(second).not.toBe(first);
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      if (originalWarn) {
+        SentryCore.originalConsoleMethods.warn = originalWarn;
+      } else {
+        delete SentryCore.originalConsoleMethods.warn;
+      }
+    }
+  });
+
+  test('does not flush eagerly when cacheClient is disabled', async () => {
+    const client = init({ dsn: 'https://public@dsn.ingest.sentry.io/1337', cacheClient: false });
+
+    const transport = client?.getTransport();
+    expect(transport).toBeDefined();
+
+    const flushSpy = vi.spyOn(transport!, 'flush');
+    await client!.sendEnvelope(TEST_ENVELOPE);
+
+    expect(flushSpy).not.toHaveBeenCalled();
+  });
+
+  // Logs and metrics batch client-side and the idle drain timer is disabled for this
+  // runtime, so unlike an event a capture alone never produces an envelope. A cached
+  // client never reaches an invocation-boundary flush, so without an eager drain these
+  // are dropped entirely — and silently, since errors keep working.
+  describe('log and metric delivery', () => {
+    function initWithCapturingTransport(options: Partial<CloudflareOptions> = {}) {
+      const envelopes: Envelope[] = [];
+      const client = init({
+        dsn: 'https://public@dsn.ingest.sentry.io/1337',
+        enableLogs: true,
+        transport: () => ({
+          send: (envelope: Envelope) => {
+            envelopes.push(envelope);
+            return Promise.resolve({});
+          },
+          flush: () => Promise.resolve(true),
+        }),
+        ...options,
+      })!;
+
+      return { client, envelopes };
+    }
+
+    const itemTypes = (envelopes: Envelope[]): string[] =>
+      envelopes.map(envelope => (envelope[1]?.[0]?.[0] as { type: string })?.type);
+
+    test('delivers a log captured on a cached client without an explicit flush', async () => {
+      const { envelopes } = initWithCapturingTransport();
+
+      SentryCore.logger.info('detached log');
+      await vi.waitFor(() => expect(itemTypes(envelopes)).toContain('log'));
+    });
+
+    test('delivers a metric captured on a cached client without an explicit flush', async () => {
+      const { envelopes } = initWithCapturingTransport();
+
+      SentryCore.metrics.count('detached_metric', 1);
+      await vi.waitFor(() => expect(itemTypes(envelopes)).toContain('trace_metric'));
+    });
+
+    test('delivers each log captured outside an invocation in its own envelope', async () => {
+      const { envelopes } = initWithCapturingTransport();
+
+      for (let i = 0; i < 5; i++) {
+        SentryCore.logger.info(`burst ${i}`);
+      }
+
+      await vi.waitFor(() => expect(itemTypes(envelopes)).toContain('log'));
+      expect(itemTypes(envelopes).filter(type => type === 'log')).toHaveLength(5);
+    });
+
+    test('keeps batching logs until flush for a non-cached client', async () => {
+      const { client, envelopes } = initWithCapturingTransport({ cacheClient: false });
+
+      SentryCore.logger.info('batched log');
+      await new Promise(resolve => setTimeout(resolve, 10));
+      expect(envelopes).toHaveLength(0);
+
+      await client.flush(0);
+      expect(itemTypes(envelopes)).toContain('log');
+    });
+
+    test('flush() delivers buffered logs on a cached client', async () => {
+      const { client, envelopes } = initWithCapturingTransport();
+
+      SentryCore.logger.info('tail log');
+      await client.flush(0);
+
+      expect(itemTypes(envelopes)).toContain('log');
+    });
+  });
+
+  test('does not instrument ctx.waitUntil with the flush lock for cached clients', () => {
+    const waitUntil = vi.fn();
+    const context = { waitUntil, passThroughOnException: vi.fn() };
+
+    init({
+      dsn: 'https://public@dsn.ingest.sentry.io/1337',
+      ctx: context,
+    });
+
+    expect(context.waitUntil).toBe(waitUntil);
+  });
+
+  test('instruments ctx.waitUntil with the flush lock for non-cached clients', () => {
+    const waitUntil = vi.fn();
+    const context = { waitUntil, passThroughOnException: vi.fn() };
+
+    init({ dsn: 'https://public@dsn.ingest.sentry.io/1337', cacheClient: false, ctx: context });
+
+    expect(context.waitUntil).not.toBe(waitUntil);
+  });
+});
+
+describe('getDefaultIntegrations', () => {
+  afterEach(() => {
+    delete globalThis.__SENTRY_ORCHESTRION__;
+  });
+
+  test('does not add orchestrion channel integrations when none were registered', () => {
+    delete globalThis.__SENTRY_ORCHESTRION__;
+
+    const names = getDefaultIntegrations({}).map(i => i.name);
+
+    expect(names).not.toContain('Mysql');
+    expect(names).not.toContain('Postgres');
+    expect(names).not.toContain('LruMemoizer');
+  });
+
+  test('does not add orchestrion channel integrations when only the bundler marker is set', () => {
+    // The plugin's entry banner ran, but no instrumented module has loaded yet.
+    globalThis.__SENTRY_ORCHESTRION__ = { bundler: new Set() };
+
+    const names = getDefaultIntegrations({}).map(i => i.name);
+
+    expect(names).not.toContain('Mysql');
+    expect(names).not.toContain('Postgres');
+    expect(names).not.toContain('LruMemoizer');
+  });
+
+  test('adds orchestrion channel integrations registered on the marker by injected modules', async () => {
+    // Mirror what the snippet the vite plugin injects into each instrumented
+    // module does at runtime: import its factory and `.set` it on the marker map,
+    // keyed by module name (so a package split across files registers once).
+    const { mysqlIntegration, postgresIntegration, lruMemoizerIntegration } = await import('@sentry/server-utils');
+    globalThis.__SENTRY_ORCHESTRION__ = {
+      bundler: new Set(['mysql', 'pg', 'lru-memoizer']),
+      integrations: new Map([
+        ['mysql', mysqlIntegration],
+        ['pg', postgresIntegration],
+        ['lru-memoizer', lruMemoizerIntegration],
+      ]),
+    };
+
+    const names = getDefaultIntegrations({}).map(i => i.name);
+
+    expect(names).toContain('Mysql');
+    expect(names).toContain('Postgres');
+    expect(names).toContain('LruMemoizer');
+  });
+
+  test('installs an integration registered after init via the module-injected event', async () => {
+    resetSdk();
+    const { mysqlIntegration } = await import('@sentry/server-utils');
+    const client = init({});
+    expect(client?.getIntegrationByName('Mysql')).toBeUndefined();
+
+    // Mirror `orchestrionModuleInjected` for a driver that first evaluates
+    // after init: store the factory on the marker, then emit the event.
+    globalThis.__SENTRY_ORCHESTRION__ = {
+      bundler: new Set(['mysql']),
+      integrations: new Map([['mysql', mysqlIntegration]]),
+    };
+    client?.emit('orchestrion.module-injected', 'mysql');
+
+    expect(client?.getIntegrationByName('Mysql')).toBeDefined();
+  });
+
+  test('keeps a channel integration the user configured instead of the registered default', async () => {
+    resetSdk();
+    const { mysqlIntegration } = await import('@sentry/server-utils');
+    globalThis.__SENTRY_ORCHESTRION__ = {
+      bundler: new Set(['mysql']),
+      integrations: new Map([['mysql', mysqlIntegration]]),
+    };
+    const userInstance = exportedMysqlIntegration();
+
+    const client = init({ dsn: 'https://public@dsn.ingest.sentry.io/1337', integrations: [userInstance] });
+
+    expect(client?.getIntegrationByName('Mysql')).toBe(userInstance);
+  });
+
+  describe('when a channel integration module loads after init', () => {
+    const DSN = 'https://public@dsn.ingest.sentry.io/1337';
+
+    async function loadMysqlLate(client: CloudflareClient | undefined): Promise<void> {
+      const { mysqlIntegration } = await import('@sentry/server-utils');
+      globalThis.__SENTRY_ORCHESTRION__ = {
+        bundler: new Set(['mysql']),
+        integrations: new Map([['mysql', mysqlIntegration]]),
+      };
+      client?.emit('orchestrion.module-injected', 'mysql');
+    }
+
+    test('does not add it when the integrations function filtered it out', async () => {
+      resetSdk();
+      const client = init({
+        dsn: DSN,
+        integrations: defaults => defaults.filter(integration => integration.name !== 'Mysql'),
+      });
+
+      await loadMysqlLate(client);
+
+      expect(client?.getIntegrationByName('Mysql')).toBeUndefined();
+    });
+
+    test('adds it when the integrations function keeps it', async () => {
+      resetSdk();
+      const client = init({ dsn: DSN, integrations: defaults => defaults });
+
+      await loadMysqlLate(client);
+
+      expect(client?.getIntegrationByName('Mysql')).toBeDefined();
+    });
+
+    test('keeps the instance the integrations function configured', async () => {
+      resetSdk();
+      const client = init({
+        dsn: DSN,
+        integrations: defaults => [...defaults, exportedMysqlIntegration()],
+      });
+      const configured = client?.getIntegrationByName('Mysql');
+      expect(configured).toBeDefined();
+
+      await loadMysqlLate(client);
+
+      expect(client?.getIntegrationByName('Mysql')).toBe(configured);
+    });
+
+    test('does not add it and does not throw when the integrations function throws', async () => {
+      resetSdk();
+      let calls = 0;
+      const client = init({
+        dsn: DSN,
+        integrations: defaults => {
+          calls++;
+          if (calls > 1) {
+            throw new Error('integrations failed');
+          }
+          return defaults;
+        },
+      });
+
+      await expect(loadMysqlLate(client)).resolves.toBeUndefined();
+
+      expect(client?.getIntegrationByName('Mysql')).toBeUndefined();
+    });
+
+    test('adds it when a custom defaultIntegrations list extends the SDK defaults', async () => {
+      resetSdk();
+      const client = init({ dsn: DSN, defaultIntegrations: [], _extendsDefaultIntegrations: true });
+
+      await loadMysqlLate(client);
+
+      expect(client?.getIntegrationByName('Mysql')).toBeDefined();
+    });
+
+    test('does not add it when the integrations function filtered it out of a list that extends the SDK defaults', async () => {
+      resetSdk();
+      const client = init({
+        dsn: DSN,
+        defaultIntegrations: [],
+        _extendsDefaultIntegrations: true,
+        integrations: defaults => defaults.filter(integration => integration.name !== 'Mysql'),
+      });
+
+      await loadMysqlLate(client);
+
+      expect(client?.getIntegrationByName('Mysql')).toBeUndefined();
+    });
+
+    test.each([
+      ['false', false as const],
+      ['a custom list', [] as Integration[]],
+    ])('does not add it when defaultIntegrations is %s', async (_label, defaultIntegrations) => {
+      resetSdk();
+      const client = init({ dsn: DSN, defaultIntegrations });
+
+      await loadMysqlLate(client);
+
+      expect(client?.getIntegrationByName('Mysql')).toBeUndefined();
+    });
+  });
+
+  test('keeps a channel integration the user configured when its module loads after init', async () => {
+    resetSdk();
+    const { mysqlIntegration } = await import('@sentry/server-utils');
+    const userInstance = exportedMysqlIntegration();
+    const client = init({ dsn: 'https://public@dsn.ingest.sentry.io/1337', integrations: [userInstance] });
+
+    globalThis.__SENTRY_ORCHESTRION__ = {
+      bundler: new Set(['mysql']),
+      integrations: new Map([['mysql', mysqlIntegration]]),
+    };
+    client?.emit('orchestrion.module-injected', 'mysql');
+
+    expect(client?.getIntegrationByName('Mysql')).toBe(userInstance);
+  });
+});

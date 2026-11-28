@@ -1,0 +1,610 @@
+import { SENTRY_ORIGIN } from '@sentry/conventions/attributes';
+import * as SentryCore from '@sentry/core';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { instrumentEnv } from '../../src/instrumentations/worker/instrumentEnv';
+
+vi.mock('../../src/instrumentations/instrumentDurableObjectNamespace', () => ({
+  instrumentDurableObjectNamespace: vi.fn((namespace: unknown, propagateRpcTrace: boolean) => ({
+    __instrumented: true,
+    __original: namespace,
+    __propagateRpcTrace: propagateRpcTrace,
+  })),
+  STUB_NON_RPC_METHODS: new Set(['fetch', 'connect', 'dup']),
+}));
+
+import { instrumentDurableObjectNamespace } from '../../src/instrumentations/instrumentDurableObjectNamespace';
+
+describe('instrumentEnv', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('detects and instruments D1Database bindings', async () => {
+    const startSpanSpy = vi.spyOn(SentryCore, 'startSpan');
+    const mockStatement = {
+      bind: vi.fn(),
+      first: vi.fn().mockResolvedValue(null),
+      run: vi.fn().mockResolvedValue({ success: true, meta: { duration: 0, rows_read: 0, rows_written: 0 } }),
+      all: vi.fn().mockResolvedValue({ success: true, meta: { duration: 0, rows_read: 0, rows_written: 0 } }),
+      raw: vi.fn().mockResolvedValue([]),
+    };
+    const d1Database = {
+      prepare: vi.fn().mockReturnValue(mockStatement),
+      batch: vi.fn().mockResolvedValue([]),
+      exec: vi.fn().mockResolvedValue({ count: 0, duration: 0 }),
+      dump: vi.fn(),
+    };
+    const env = { DB: d1Database };
+    const instrumented = instrumentEnv(env);
+
+    const db = instrumented.DB as typeof d1Database;
+    await db.prepare('SELECT 1').first();
+
+    expect(startSpanSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'SELECT ?', attributes: expect.objectContaining({ 'sentry.op': 'db.query' }) }),
+      expect.any(Function),
+    );
+  });
+
+  it('caches instrumented D1 bindings across repeated access', () => {
+    const d1Database = {
+      prepare: vi.fn(),
+      batch: vi.fn(),
+      exec: vi.fn(),
+      dump: vi.fn(),
+    };
+    const env = { DB: d1Database };
+    const instrumented = instrumentEnv(env);
+
+    expect(instrumented.DB).toBe(instrumented.DB);
+  });
+
+  it('returns primitive values unchanged', () => {
+    const env = { SENTRY_DSN: 'https://key@sentry.io/123', PORT: 8080, DEBUG: true };
+    const instrumented = instrumentEnv(env);
+
+    expect(instrumented.SENTRY_DSN).toBe('https://key@sentry.io/123');
+    expect(instrumented.PORT).toBe(8080);
+    expect(instrumented.DEBUG).toBe(true);
+  });
+
+  it('passes through unknown object bindings unchanged', () => {
+    const unknownBinding = { someMethod: () => 'value' };
+    const env = { UNKNOWN: unknownBinding };
+    const instrumented = instrumentEnv(env);
+
+    expect(instrumented.UNKNOWN).toBe(unknownBinding);
+  });
+
+  it('instruments DurableObjectNamespace bindings without RPC propagation when the allowlist is empty', () => {
+    const doNamespace = {
+      idFromName: vi.fn(),
+      idFromString: vi.fn(),
+      get: vi.fn(),
+      newUniqueId: vi.fn(),
+    };
+    const env = { COUNTER: doNamespace };
+    const instrumented = instrumentEnv(env);
+
+    expect((instrumented.COUNTER as any).__instrumented).toBe(true);
+    expect(instrumentDurableObjectNamespace).toHaveBeenCalledWith(doNamespace, false);
+  });
+
+  it('enables RPC propagation only for the DurableObjectNamespace bindings named in the allowlist', () => {
+    const allowed = { idFromName: vi.fn(), idFromString: vi.fn(), get: vi.fn(), newUniqueId: vi.fn() };
+    const denied = { idFromName: vi.fn(), idFromString: vi.fn(), get: vi.fn(), newUniqueId: vi.fn() };
+    const env = { COUNTER: allowed, SESSIONS: denied };
+    const instrumented = instrumentEnv(env, { rpcTracePropagationBindings: ['COUNTER'] });
+
+    expect((instrumented.COUNTER as any).__instrumented).toBe(true);
+    expect((instrumented.SESSIONS as any).__instrumented).toBe(true);
+    expect(instrumentDurableObjectNamespace).toHaveBeenCalledWith(allowed, true);
+    expect(instrumentDurableObjectNamespace).toHaveBeenCalledWith(denied, false);
+  });
+
+  it('matches allowlisted binding names exactly rather than as substrings', () => {
+    const doNamespace = { idFromName: vi.fn(), idFromString: vi.fn(), get: vi.fn(), newUniqueId: vi.fn() };
+    const env = { MY_COUNTER: doNamespace };
+    instrumentEnv(env, { rpcTracePropagationBindings: ['COUNTER'] }).MY_COUNTER;
+
+    expect(instrumentDurableObjectNamespace).toHaveBeenCalledWith(doNamespace, false);
+  });
+
+  it('supports regular expressions in the allowlist', () => {
+    const doNamespace = { idFromName: vi.fn(), idFromString: vi.fn(), get: vi.fn(), newUniqueId: vi.fn() };
+    const env = { SVC_ORDERS: doNamespace };
+    instrumentEnv(env, { rpcTracePropagationBindings: [/^SVC_/] }).SVC_ORDERS;
+
+    expect(instrumentDurableObjectNamespace).toHaveBeenCalledWith(doNamespace, true);
+  });
+
+  it('caches instrumented bindings across repeated access', () => {
+    const doNamespace = {
+      idFromName: vi.fn(),
+      idFromString: vi.fn(),
+      get: vi.fn(),
+      newUniqueId: vi.fn(),
+    };
+    const env = { COUNTER: doNamespace };
+    const instrumented = instrumentEnv(env, { rpcTracePropagationBindings: [/.*/] });
+
+    const first = instrumented.COUNTER;
+    const second = instrumented.COUNTER;
+
+    expect(first).toBe(second);
+    expect(instrumentDurableObjectNamespace).toHaveBeenCalledTimes(1);
+  });
+
+  it('instruments multiple DO bindings independently', () => {
+    const doNamespace1 = {
+      idFromName: vi.fn(),
+      idFromString: vi.fn(),
+      get: vi.fn(),
+      newUniqueId: vi.fn(),
+    };
+    const doNamespace2 = {
+      idFromName: vi.fn(),
+      idFromString: vi.fn(),
+      get: vi.fn(),
+      newUniqueId: vi.fn(),
+    };
+    const env = { COUNTER: doNamespace1, SESSIONS: doNamespace2 };
+    const instrumented = instrumentEnv(env, { rpcTracePropagationBindings: [/.*/] });
+
+    instrumented.COUNTER;
+    instrumented.SESSIONS;
+
+    expect(instrumentDurableObjectNamespace).toHaveBeenCalledTimes(2);
+    expect(instrumentDurableObjectNamespace).toHaveBeenCalledWith(doNamespace1, true);
+    expect(instrumentDurableObjectNamespace).toHaveBeenCalledWith(doNamespace2, true);
+  });
+
+  it('wraps JSRPC bindings for fetch instrumentation even when the allowlist is empty', () => {
+    const rpcMethod = vi.fn();
+    const jsrpcProxy = new Proxy(
+      { fetch: vi.fn(), myRpcMethod: rpcMethod },
+      {
+        get(target, prop) {
+          if (prop in target) {
+            return Reflect.get(target, prop);
+          }
+          // JSRPC behavior: return truthy for any property
+          return () => {};
+        },
+      },
+    );
+    const env = { SERVICE: jsrpcProxy };
+    const instrumented = instrumentEnv(env);
+
+    const result = instrumented.SERVICE as { myRpcMethod: (arg: string) => void };
+    expect(result).not.toBe(jsrpcProxy);
+
+    result.myRpcMethod('arg1');
+    expect(rpcMethod).toHaveBeenCalledWith('arg1');
+  });
+
+  it('does not instrument JSRPC proxies as DurableObjectNamespace', () => {
+    const jsrpcProxy = new Proxy(
+      {},
+      {
+        get(_target, _prop) {
+          return () => {};
+        },
+      },
+    );
+    const env = { SERVICE: jsrpcProxy };
+    const instrumented = instrumentEnv(env);
+
+    instrumented.SERVICE;
+    expect(instrumentDurableObjectNamespace).not.toHaveBeenCalled();
+  });
+
+  it('returns null and undefined values unchanged', () => {
+    const env = { NULL_VAL: null, UNDEF_VAL: undefined } as Record<string, unknown>;
+    const instrumented = instrumentEnv(env);
+
+    expect(instrumented.NULL_VAL).toBeNull();
+    expect(instrumented.UNDEF_VAL).toBeUndefined();
+  });
+
+  it('wraps Queue bindings in a proxy', async () => {
+    const send = vi.fn().mockResolvedValue(undefined);
+    const sendBatch = vi.fn().mockResolvedValue(undefined);
+    const queue = { send, sendBatch };
+    const env = { MY_QUEUE: queue };
+    const instrumented = instrumentEnv(env);
+
+    const wrapped = instrumented.MY_QUEUE as typeof queue;
+    // Wrapped binding is a Proxy, not the original reference
+    expect(wrapped).not.toBe(queue);
+    // Calls are forwarded to the underlying queue
+    await wrapped.send('hello');
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0]?.[0]).toBe('hello');
+  });
+
+  it('propagates Queue trace context only to the configured bindings', async () => {
+    vi.spyOn(SentryCore, 'getTraceData').mockReturnValue({
+      'sentry-trace': '1234567890abcdef1234567890abcdef-1234567890abcdef-1',
+      baggage: 'sentry-release=1.0.0',
+    });
+    const billingSend = vi.fn().mockResolvedValue(undefined);
+    const otherSend = vi.fn().mockResolvedValue(undefined);
+    const instrumented = instrumentEnv(
+      {
+        BILLING_QUEUE: { send: billingSend, sendBatch: vi.fn() },
+        OTHER_QUEUE: { send: otherSend, sendBatch: vi.fn() },
+      },
+      { queueTracePropagationBindings: ['billing_queue'] },
+    );
+
+    await instrumented.BILLING_QUEUE.send({ invoiceId: 'inv_123' });
+    await instrumented.OTHER_QUEUE.send({ invoiceId: 'inv_456' });
+
+    expect(billingSend).toHaveBeenCalledExactlyOnceWith(
+      {
+        invoiceId: 'inv_123',
+        __sentry_queue_trace__: '1234567890abcdef1234567890abcdef-1234567890abcdef-1',
+      },
+      undefined,
+    );
+    expect(otherSend).toHaveBeenCalledExactlyOnceWith({ invoiceId: 'inv_456' }, undefined);
+  });
+
+  it('wraps Workers KV bindings in a proxy', async () => {
+    const get = vi.fn().mockResolvedValue('value');
+    const put = vi.fn().mockResolvedValue(undefined);
+    const list = vi.fn().mockResolvedValue({ keys: [], list_complete: true });
+    const getWithMetadata = vi.fn().mockResolvedValue({ value: 'value', metadata: null });
+    const kv = { get, put, list, getWithMetadata, delete: vi.fn() };
+    const env = { MY_KV: kv };
+    const instrumented = instrumentEnv(env);
+
+    const wrapped = instrumented.MY_KV;
+    expect(wrapped).not.toBe(kv);
+
+    await wrapped.get('test-key', 'json');
+    expect(get).toHaveBeenCalledWith('test-key', 'json');
+
+    await wrapped.put('test-key', 'value');
+    expect(put).toHaveBeenCalledWith('test-key', 'value');
+  });
+
+  it('caches the wrapped Workers KV binding across repeated access', () => {
+    const kv = { get: vi.fn(), put: vi.fn(), list: vi.fn(), getWithMetadata: vi.fn() };
+    const env = { MY_KV: kv };
+    const instrumented = instrumentEnv(env);
+
+    expect(instrumented.MY_KV).toBe(instrumented.MY_KV);
+  });
+
+  it('instruments Workers KV and R2 bindings as their own binding types', async () => {
+    const startSpanSpy = vi.spyOn(SentryCore, 'startSpan');
+    const kv = { get: vi.fn().mockResolvedValue(null), put: vi.fn(), list: vi.fn(), getWithMetadata: vi.fn() };
+    const r2 = {
+      head: vi.fn().mockResolvedValue(null),
+      get: vi.fn(),
+      put: vi.fn(),
+      list: vi.fn(),
+      createMultipartUpload: vi.fn(),
+    };
+    const instrumented = instrumentEnv({ MY_KV: kv, MY_BUCKET: r2 });
+
+    await instrumented.MY_KV.get('kv-key');
+    await instrumented.MY_BUCKET.head('r2-key');
+
+    expect(startSpanSpy).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ attributes: expect.objectContaining({ [SENTRY_ORIGIN]: 'auto.cache.cloudflare.kv' }) }),
+      expect.any(Function),
+    );
+    expect(startSpanSpy).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ attributes: expect.objectContaining({ [SENTRY_ORIGIN]: 'auto.faas.cloudflare.r2' }) }),
+      expect.any(Function),
+    );
+  });
+
+  it('caches the wrapped Queue binding across repeated access', () => {
+    const queue = { send: vi.fn(), sendBatch: vi.fn() };
+    const env = { MY_QUEUE: queue };
+    const instrumented = instrumentEnv(env);
+
+    expect(instrumented.MY_QUEUE).toBe(instrumented.MY_QUEUE);
+  });
+
+  it('wraps Queue bindings independently from DO bindings', () => {
+    const queue = { send: vi.fn(), sendBatch: vi.fn() };
+    const doNamespace = {
+      idFromName: vi.fn(),
+      idFromString: vi.fn(),
+      get: vi.fn(),
+      newUniqueId: vi.fn(),
+    };
+    const env = { MY_QUEUE: queue, COUNTER: doNamespace };
+    const instrumented = instrumentEnv(env, { rpcTracePropagationBindings: [/.*/] });
+
+    // Access both — DO instrumentation only fires on property access
+    expect(instrumented.MY_QUEUE).not.toBe(queue);
+    instrumented.COUNTER;
+    expect(instrumentDurableObjectNamespace).toHaveBeenCalledWith(doNamespace, true);
+  });
+
+  describe('Workers AI bindings', () => {
+    function createMockAiBinding() {
+      return {
+        run: vi.fn().mockResolvedValue({ response: 'Paris', usage: { prompt_tokens: 1, completion_tokens: 2 } }),
+        gateway: vi.fn(),
+        toMarkdown: vi.fn(),
+        models: vi.fn(),
+        autorag: vi.fn(),
+      };
+    }
+
+    it('detects and wraps AI bindings, forwarding run calls unchanged', async () => {
+      const ai = createMockAiBinding();
+      const env = { AI: ai };
+      const instrumented = instrumentEnv(env);
+
+      const wrapped = instrumented.AI as typeof ai;
+      expect(wrapped).not.toBe(ai);
+
+      const result = await wrapped.run('@cf/meta/llama-3.1-8b-instruct', { prompt: 'Hello' });
+
+      expect(ai.run).toHaveBeenCalledTimes(1);
+      expect(ai.run).toHaveBeenCalledWith('@cf/meta/llama-3.1-8b-instruct', { prompt: 'Hello' });
+      expect(result).toEqual({ response: 'Paris', usage: { prompt_tokens: 1, completion_tokens: 2 } });
+    });
+
+    it('caches the wrapped AI binding across repeated access', () => {
+      const ai = createMockAiBinding();
+      const env = { AI: ai };
+      const instrumented = instrumentEnv(env);
+
+      expect(instrumented.AI).toBe(instrumented.AI);
+    });
+
+    it('does not treat bindings with only a run method as AI bindings', () => {
+      const notAi = { run: vi.fn() };
+      const env = { RUNNER: notAi };
+      const instrumented = instrumentEnv(env);
+
+      expect(instrumented.RUNNER).toBe(notAi);
+    });
+  });
+
+  describe('mTLS Fetcher bindings', () => {
+    function createMtlsFetcherProxy(mockFetch: ReturnType<typeof vi.fn>) {
+      return new Proxy(
+        { fetch: mockFetch },
+        {
+          get(target, prop) {
+            if (prop in target) {
+              return Reflect.get(target, prop);
+            }
+            return () => {};
+          },
+        },
+      );
+    }
+
+    it('instruments mTLS Fetcher fetch when rpcTracePropagationBindings is empty', async () => {
+      vi.spyOn(SentryCore, '_INTERNAL_getTracingHeadersForFetchRequest').mockReturnValue({
+        'sentry-trace': '12345678901234567890123456789012-1234567890123456-1',
+      });
+
+      const mockFetch = vi.fn().mockResolvedValue(new Response('ok'));
+      const mtlsFetcher = createMtlsFetcherProxy(mockFetch);
+      const env = { MY_CERT: mtlsFetcher };
+      const instrumented = instrumentEnv(env);
+
+      expect(instrumented.MY_CERT).not.toBe(mtlsFetcher);
+
+      await instrumented.MY_CERT.fetch('https://example.com/api');
+
+      const [, init] = mockFetch.mock.calls[0]!;
+      expect(new Headers(init?.headers).get('sentry-trace')).toBe(
+        '12345678901234567890123456789012-1234567890123456-1',
+      );
+    });
+
+    it('preserves existing headers and response on mTLS Fetcher fetch', async () => {
+      vi.spyOn(SentryCore, '_INTERNAL_getTracingHeadersForFetchRequest').mockReturnValue({
+        Authorization: 'Bearer client-cert-token',
+        'sentry-trace': '12345678901234567890123456789012-1234567890123456-1',
+        baggage: 'sentry-environment=production',
+      });
+
+      const mockFetch = vi.fn().mockResolvedValue(new Response('mtls-response'));
+      const mtlsFetcher = createMtlsFetcherProxy(mockFetch);
+      const env = { MY_CERT: mtlsFetcher };
+      const instrumented = instrumentEnv(env, { rpcTracePropagationBindings: [/.*/] });
+
+      const response = await instrumented.MY_CERT.fetch('https://example.com/api', {
+        headers: { Authorization: 'Bearer client-cert-token' },
+      });
+
+      const [, init] = mockFetch.mock.calls[0]!;
+      const headers = new Headers(init?.headers);
+
+      expect(instrumented.MY_CERT).not.toBe(mtlsFetcher);
+      expect(headers.get('Authorization')).toBe('Bearer client-cert-token');
+      expect(headers.get('sentry-trace')).toBe('12345678901234567890123456789012-1234567890123456-1');
+      expect(await response.text()).toBe('mtls-response');
+    });
+  });
+
+  describe('JSRPC RPC method instrumentation', () => {
+    it('does not inject Sentry RPC meta by default (rpcTracePropagationBindings not set)', () => {
+      vi.spyOn(SentryCore, 'getTraceData').mockReturnValue({
+        'sentry-trace': '12345678901234567890123456789012-1234567890123456-1',
+        baggage: 'sentry-environment=production',
+      });
+
+      const rpcMethod = vi.fn().mockReturnValue('result');
+      const jsrpcProxy = new Proxy(
+        { fetch: vi.fn(), myRpcMethod: rpcMethod },
+        {
+          get(target, prop) {
+            if (prop in target) {
+              return Reflect.get(target, prop);
+            }
+            return () => {};
+          },
+        },
+      );
+      const env = { SERVICE: jsrpcProxy };
+      const instrumented = instrumentEnv(env);
+
+      instrumented.SERVICE.myRpcMethod('arg1', 42);
+
+      // Without rpcTracePropagationBindings, no metadata should be injected
+      expect(rpcMethod).toHaveBeenCalledWith('arg1', 42);
+    });
+
+    it('injects Sentry RPC meta when rpcTracePropagationBindings matches', () => {
+      vi.spyOn(SentryCore, 'getTraceData').mockReturnValue({
+        'sentry-trace': '12345678901234567890123456789012-1234567890123456-1',
+        baggage: 'sentry-environment=production',
+      });
+
+      const rpcMethod = vi.fn().mockReturnValue('result');
+      const jsrpcProxy = new Proxy(
+        { fetch: vi.fn(), myRpcMethod: rpcMethod },
+        {
+          get(target, prop) {
+            if (prop in target) {
+              return Reflect.get(target, prop);
+            }
+            return () => {};
+          },
+        },
+      );
+      const env = { SERVICE: jsrpcProxy };
+      const instrumented = instrumentEnv(env, { rpcTracePropagationBindings: [/.*/] });
+
+      instrumented.SERVICE.myRpcMethod('arg1', 42);
+
+      expect(rpcMethod).toHaveBeenCalledWith('arg1', 42, {
+        __sentry_rpc_meta__: {
+          'sentry-trace': '12345678901234567890123456789012-1234567890123456-1',
+          baggage: 'sentry-environment=production',
+        },
+      });
+    });
+
+    it('calls JSRPC connect with the underlying binding as `this`', () => {
+      const jsrpcTarget = {
+        fetch: vi.fn(),
+        connect(this: unknown, _address: string) {
+          if (this !== jsrpcProxy) {
+            throw new TypeError('Illegal invocation: function called with incorrect `this` reference.');
+          }
+          return 'socket';
+        },
+      };
+      const jsrpcProxy = new Proxy(jsrpcTarget, {
+        get(target, prop) {
+          if (prop in target) {
+            return Reflect.get(target, prop);
+          }
+          return () => {};
+        },
+      });
+      const env = { SERVICE: jsrpcProxy };
+      const instrumented = instrumentEnv(env, { rpcTracePropagationBindings: [/.*/] });
+
+      expect(instrumented.SERVICE.connect('127.0.0.1:9')).toBe('socket');
+    });
+
+    it('does not inject meta into JSRPC fetch calls', () => {
+      vi.spyOn(SentryCore, 'getTraceData').mockReturnValue({
+        'sentry-trace': 'abc-def-1',
+        baggage: 'sentry-baggage=value',
+      });
+
+      const mockFetch = vi.fn().mockResolvedValue(new Response('ok'));
+      const jsrpcProxy = new Proxy(
+        { fetch: mockFetch },
+        {
+          get(target, prop) {
+            if (prop in target) {
+              return Reflect.get(target, prop);
+            }
+            return () => {};
+          },
+        },
+      );
+      const env = { SERVICE: jsrpcProxy };
+      const instrumented = instrumentEnv(env, { rpcTracePropagationBindings: [/.*/] });
+
+      instrumented.SERVICE.fetch('https://example.com');
+
+      // fetch should use HTTP header injection, not trailing arg
+      const callArgs = mockFetch.mock.calls[0];
+      expect(callArgs).not.toContainEqual(expect.objectContaining({ __sentry: expect.anything() }));
+    });
+
+    it('does not inject meta into JSRPC RPC calls when no active trace', () => {
+      vi.spyOn(SentryCore, 'getTraceData').mockReturnValue({});
+
+      const rpcMethod = vi.fn().mockReturnValue('result');
+      const jsrpcProxy = new Proxy(
+        { fetch: vi.fn(), myRpcMethod: rpcMethod },
+        {
+          get(target, prop) {
+            if (prop in target) {
+              return Reflect.get(target, prop);
+            }
+            return () => {};
+          },
+        },
+      );
+      const env = { SERVICE: jsrpcProxy };
+      const instrumented = instrumentEnv(env, { rpcTracePropagationBindings: [/.*/] });
+
+      instrumented.SERVICE.myRpcMethod('arg1');
+
+      expect(rpcMethod).toHaveBeenCalledWith('arg1');
+    });
+
+    // A receiver without Sentry never strips the trailing metadata argument, so a caller has to be
+    // able to limit propagation to the bindings it knows are instrumented.
+    // See https://github.com/getsentry/sentry-javascript/issues/23233.
+    it('injects meta only into JSRPC calls on allowlisted bindings', () => {
+      vi.spyOn(SentryCore, 'getTraceData').mockReturnValue({
+        'sentry-trace': '12345678901234567890123456789012-1234567890123456-1',
+        baggage: 'sentry-environment=production',
+      });
+
+      const allowedMethod = vi.fn();
+      const deniedMethod = vi.fn();
+      const createJsrpcBinding = (rpcMethod: ReturnType<typeof vi.fn>) =>
+        new Proxy(
+          { fetch: vi.fn(), myRpcMethod: rpcMethod },
+          {
+            get(target, prop) {
+              if (prop in target) {
+                return Reflect.get(target, prop);
+              }
+              return () => {};
+            },
+          },
+        );
+
+      const env = { ORDERS: createJsrpcBinding(allowedMethod), EXTERNAL: createJsrpcBinding(deniedMethod) };
+      const instrumented = instrumentEnv(env, { rpcTracePropagationBindings: ['ORDERS'] });
+
+      instrumented.ORDERS.myRpcMethod('first');
+      instrumented.EXTERNAL.myRpcMethod('first');
+
+      expect(allowedMethod).toHaveBeenCalledWith('first', {
+        __sentry_rpc_meta__: {
+          'sentry-trace': '12345678901234567890123456789012-1234567890123456-1',
+          baggage: 'sentry-environment=production',
+        },
+      });
+      expect(deniedMethod).toHaveBeenCalledWith('first');
+    });
+  });
+});

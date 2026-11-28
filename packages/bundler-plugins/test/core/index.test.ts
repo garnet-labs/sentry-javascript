@@ -1,0 +1,221 @@
+import { createComponentNameAnnotateHooks, getDebugIdSnippet, isInitialChunk } from '../../src/core';
+import { getOxcParseAstAsync } from '../../src/core/component-annotation-oxc';
+import { containsOnlyImports } from '../../src/core/utils';
+import { describe, it, expect, vi } from 'vitest';
+
+describe('createComponentNameAnnotateHooks', () => {
+  it.each([
+    ['.tsx', '/project/src/shared/providers/AppProviders.tsx'],
+    ['.jsx', '/project/src/shared/providers/AppProviders.jsx'],
+  ])('preserves the full file path in the emitted source map (%s)', async (_ext, id) => {
+    const { transform } = createComponentNameAnnotateHooks([], false);
+    const code = 'export function AppProviders() {\n  return <div>hello</div>;\n}\n';
+
+    const result = await transform(code, id);
+
+    expect(result?.map).toMatchObject({ sources: [id] });
+  });
+
+  it('uses the given parser', async () => {
+    const getParseAstAsync = vi.fn(getOxcParseAstAsync);
+    const { transform } = createComponentNameAnnotateHooks([], false, { getParseAstAsync });
+
+    const result = await transform('export const App = () => <div />;', '/src/app.jsx');
+
+    expect(getParseAstAsync).toHaveBeenCalled();
+    expect(result?.code).toContain('data-sentry-component="App"');
+  });
+
+  it('falls back to oxc-parser when the given parser is unavailable', async () => {
+    const { transform } = createComponentNameAnnotateHooks([], false, { getParseAstAsync: async () => null });
+
+    const result = await transform('export const App = () => <div />;', '/src/app.jsx');
+
+    expect(result?.code).toContain('data-sentry-component="App"');
+  });
+
+  it('leaves files with syntax errors unchanged', async () => {
+    const { transform } = createComponentNameAnnotateHooks([], false);
+
+    await expect(transform('export const App = () => <div>;', '/src/app.jsx')).resolves.toBeNull();
+  });
+});
+
+describe('getDebugIdSnippet', () => {
+  it('returns the debugId injection snippet for a passed debugId', () => {
+    const snippet = getDebugIdSnippet('1234');
+    expect(snippet.code()).toMatchInlineSnapshot(
+      `"!function(){try{var e="undefined"!=typeof globalThis?globalThis:"undefined"!=typeof window?window:"undefined"!=typeof global?global:"undefined"!=typeof self?self:{};var n=(new e.Error).stack;n&&(e._sentryDebugIds=e._sentryDebugIds||{},e._sentryDebugIds[n]="1234",e._sentryDebugIdIdentifier="sentry-dbid-1234");}catch(e){}}();"`,
+    );
+  });
+
+  it('registers the debug ID when a later `const global` shadows the identifier', () => {
+    // A second bundling pass over an already-injected chunk can rewrite a free
+    // `global` into a `const` declared below the injection. Reading it from the
+    // top of the file hits the temporal dead zone, where `typeof` throws rather
+    // than returning "undefined".
+    const scope: { Error: ErrorConstructor; _sentryDebugIds?: Record<string, string> } = { Error };
+    // oxlint-disable-next-line typescript/no-implied-eval
+    const run = new Function('globalThis', `${getDebugIdSnippet('5678').code()}\nconst global = globalThis;`);
+
+    run(scope);
+
+    expect(Object.values(scope._sentryDebugIds ?? {})).toEqual(['5678']);
+  });
+});
+
+describe('isInitialChunk', () => {
+  const chunks = {
+    'entry.js': { fileName: 'entry.js', isEntry: true, imports: ['shared.js', 'external'] },
+    'shared.js': { fileName: 'shared.js', imports: ['vendor.js'] },
+    'vendor.js': { fileName: 'vendor.js', imports: ['shared.js'] },
+    'route.js': { fileName: 'route.js', imports: ['route-shared.js'] },
+    'route-shared.js': { fileName: 'route-shared.js', imports: [] },
+  };
+
+  it('marks entry chunks and chunks they reach through static imports as initial', () => {
+    expect(isInitialChunk(chunks['entry.js'], chunks)).toBe(true);
+    expect(isInitialChunk(chunks['shared.js'], chunks)).toBe(true);
+    expect(isInitialChunk(chunks['vendor.js'], chunks)).toBe(true);
+  });
+
+  it('does not mark chunks that only dynamic imports reach as initial', () => {
+    expect(isInitialChunk(chunks['route.js'], chunks)).toBe(false);
+    expect(isInitialChunk(chunks['route-shared.js'], chunks)).toBe(false);
+  });
+
+  it('treats every chunk as initial without a chunk graph', () => {
+    expect(isInitialChunk({ fileName: 'route.js' }, undefined)).toBe(true);
+  });
+});
+
+describe('containsOnlyImports', () => {
+  describe('should return true (import-only code)', () => {
+    it.each([
+      ['empty string', ''],
+      ['whitespace only', '   \n\t  '],
+      ['side effect import with single quotes', "import './module.js';"],
+      ['side effect import with double quotes', 'import "./module.js";'],
+      ['side effect import with backticks', 'import `./module.js`;'],
+      ['side effect import without semicolon', "import './module.js'"],
+      ['default import', "import foo from './module.js';"],
+      ['named import', "import { foo } from './module.js';"],
+      ['named import with alias', "import { foo as bar } from './module.js';"],
+      ['multiple named imports', "import { foo, bar, baz } from './module.js';"],
+      ['namespace import', "import * as utils from './utils.js';"],
+      ['default and named imports', "import React, { useState } from 'react';"],
+      ['re-export all', "export * from './module.js';"],
+      ['re-export named', "export { foo, bar } from './module.js';"],
+      ['re-export with alias', "export { foo as default } from './module.js';"],
+    ])('%s', (_, code) => {
+      expect(containsOnlyImports(code)).toBe(true);
+    });
+
+    it.each([
+      [
+        'multiple imports',
+        `
+import './polyfill.js';
+import { helper } from './utils.js';
+import config from './config.js';
+`,
+      ],
+      [
+        'imports with line comments',
+        `
+// This is a comment
+import './module.js';
+// Another comment
+`,
+      ],
+      [
+        'imports with block comments',
+        `
+/* Block comment */
+import './module.js';
+/* Multi
+   line
+   comment */
+`,
+      ],
+      ["'use strict' with imports", `"use strict";\nimport './module.js';`],
+      ["'use strict' with single quotes", `'use strict';\nimport './module.js';`],
+      [
+        'mixed imports, re-exports, and comments',
+        `
+"use strict";
+// Entry point facade
+import './polyfills.js';
+import { init } from './app.js';
+/* Re-export for external use */
+export * from './types.js';
+export { config } from './config.js';
+`,
+      ],
+    ])('%s', (_, code) => {
+      expect(containsOnlyImports(code)).toBe(true);
+    });
+  });
+
+  describe('should return false (contains substantial code)', () => {
+    it.each([
+      ['variable declaration', 'const x = 1;'],
+      ['let declaration', 'let y = 2;'],
+      ['var declaration', 'var z = 3;'],
+      ['function declaration', 'function foo() {}'],
+      ['arrow function', 'const fn = () => {};'],
+      ['class declaration', 'class MyClass {}'],
+      ['function call', "console.log('hello');"],
+      ['IIFE', '(function() {})();'],
+      ['expression statement', '1 + 1;'],
+      ['object literal', "({ foo: 'bar' });"],
+      ['export declaration (not re-export)', 'export const foo = 1;'],
+      ['export default expression', 'export default {};'],
+      ['export function', 'export function foo() {}'],
+      ['minified bundle code', `import{a as e}from"./chunk.js";var t=function(){return e()};t();`],
+    ])('%s', (_, code) => {
+      expect(containsOnlyImports(code)).toBe(false);
+    });
+
+    // Multi-line code snippets
+    it.each([
+      [
+        'import followed by code',
+        `
+import { init } from './app.js';
+init();
+`,
+      ],
+      [
+        'import with variable declaration',
+        `
+import './module.js';
+const config = { debug: true };
+`,
+      ],
+      [
+        'import with function declaration',
+        `
+import { helper } from './utils.js';
+function main() {
+  helper();
+}
+`,
+      ],
+      [
+        'real-world SPA bundle snippet',
+        `
+import { createApp } from 'vue';
+import App from './App.vue';
+import router from './router';
+
+const app = createApp(App);
+app.use(router);
+app.mount('#app');
+`,
+      ],
+    ])('%s', (_, code) => {
+      expect(containsOnlyImports(code)).toBe(false);
+    });
+  });
+});

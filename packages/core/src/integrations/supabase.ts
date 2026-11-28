@@ -1,0 +1,645 @@
+// Based on Kamil Ogórek's work on:
+// https://github.com/supabase-community/sentry-integration-js
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+/* eslint-disable max-lines */
+import { DB_OPERATION_NAME, DB_SYSTEM_NAME, SENTRY_OP, SENTRY_ORIGIN } from '@sentry/conventions/attributes';
+import { DB } from '@sentry/conventions/op';
+import { addBreadcrumb } from '../breadcrumbs';
+import { getClient } from '../currentScopes';
+import { DEBUG_BUILD } from '../debug-build';
+import { captureException } from '../exports';
+import { defineIntegration } from '../integration';
+import { setHttpStatus, SPAN_STATUS_ERROR, SPAN_STATUS_OK } from '../tracing';
+import { hasSpanStreamingEnabled } from '../tracing/spans/hasSpanStreamingEnabled';
+import { startSpanManual } from '../tracing/trace';
+import type { IntegrationFn } from '../types/integration';
+import type { WebFetchHeaders } from '../types/webfetchapi';
+import { debug } from '../utils/debug-logger';
+import { isObjectLike, isPlainObject } from '../utils/is';
+import { addExceptionMechanism } from '../utils/misc';
+
+const AUTH_OPERATIONS_TO_INSTRUMENT = [
+  'reauthenticate',
+  'signInAnonymously',
+  'signInWithOAuth',
+  'signInWithIdToken',
+  'signInWithOtp',
+  'signInWithPassword',
+  'signInWithSSO',
+  'signOut',
+  'signUp',
+  'verifyOtp',
+];
+
+const AUTH_ADMIN_OPERATIONS_TO_INSTRUMENT = [
+  'createUser',
+  'deleteUser',
+  'listUsers',
+  'getUserById',
+  'updateUserById',
+  'inviteUserByEmail',
+];
+
+export const FILTER_MAPPINGS = {
+  eq: 'eq',
+  neq: 'neq',
+  gt: 'gt',
+  gte: 'gte',
+  lt: 'lt',
+  lte: 'lte',
+  like: 'like',
+  'like(all)': 'likeAllOf',
+  'like(any)': 'likeAnyOf',
+  ilike: 'ilike',
+  'ilike(all)': 'ilikeAllOf',
+  'ilike(any)': 'ilikeAnyOf',
+  is: 'is',
+  in: 'in',
+  cs: 'contains',
+  cd: 'containedBy',
+  sr: 'rangeGt',
+  nxl: 'rangeGte',
+  sl: 'rangeLt',
+  nxr: 'rangeLte',
+  adj: 'rangeAdjacent',
+  ov: 'overlaps',
+  fts: '',
+  plfts: 'plain',
+  phfts: 'phrase',
+  wfts: 'websearch',
+  not: 'not',
+};
+
+export const DB_OPERATIONS_TO_INSTRUMENT = ['select', 'insert', 'upsert', 'update', 'delete'];
+
+type AuthOperationFn = (...args: unknown[]) => Promise<unknown>;
+type AuthOperationName = (typeof AUTH_OPERATIONS_TO_INSTRUMENT)[number];
+type AuthAdminOperationName = (typeof AUTH_ADMIN_OPERATIONS_TO_INSTRUMENT)[number];
+type PostgRESTQueryOperationFn = (...args: unknown[]) => PostgRESTFilterBuilder;
+
+export interface SupabaseClientInstance {
+  auth: {
+    admin: Record<AuthAdminOperationName, AuthOperationFn>;
+  } & Record<AuthOperationName, AuthOperationFn>;
+}
+
+export interface PostgRESTQueryBuilder {
+  [key: string]: PostgRESTQueryOperationFn;
+}
+
+/**
+ * `postgrest-js` stores the request headers as a plain object up to v1.19.x and as a `Headers`
+ * instance from v2.74.0 on (shipped with `supabase-js` 2.74.0), so we have to handle both shapes.
+ */
+export type PostgRESTHeaders = Record<string, string> | WebFetchHeaders;
+
+export interface PostgRESTFilterBuilder {
+  method: string;
+  headers: PostgRESTHeaders;
+  url: URL;
+  schema: string;
+  body: any;
+}
+
+export interface SupabaseResponse {
+  status?: number;
+  error?: {
+    message: string;
+    code?: string;
+    details?: unknown;
+  };
+}
+
+export interface SupabaseError extends Error {
+  code?: string;
+  details?: unknown;
+}
+
+export interface SupabaseBreadcrumb {
+  type: string;
+  category: string;
+  message: string;
+  data?: {
+    query?: string[];
+    body?: Record<string, unknown>;
+  };
+}
+
+export interface SupabaseClientConstructor {
+  prototype: {
+    from: (table: string) => PostgRESTQueryBuilder;
+  };
+}
+
+export interface PostgRESTProtoThenable {
+  then: <T>(
+    onfulfilled?: ((value: T) => T | PromiseLike<T>) | null,
+    onrejected?: ((reason: any) => T | PromiseLike<T>) | null,
+  ) => Promise<T>;
+}
+
+type SentryInstrumented<T> = T & {
+  __SENTRY_INSTRUMENTED__?: boolean;
+};
+
+function markAsInstrumented<T>(fn: T): void {
+  try {
+    (fn as SentryInstrumented<T>).__SENTRY_INSTRUMENTED__ = true;
+  } catch {
+    // ignore errors here
+  }
+}
+
+function isInstrumented<T>(fn: T): boolean | undefined {
+  try {
+    return (fn as SentryInstrumented<T>).__SENTRY_INSTRUMENTED__;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Plain-object bodies are copied into `plainBody`; array inserts (and other non-plain shapes) stay only on `rawBody`.
+ * Returns a payload suitable for span attributes / breadcrumbs when operation data collection is enabled.
+ */
+function getMutationBodyPayloadForTelemetry(rawBody: unknown, plainBody: Record<string, unknown>): unknown | undefined {
+  if (Object.keys(plainBody).length > 0) {
+    return plainBody;
+  }
+  if (Array.isArray(rawBody) && rawBody.length > 0) {
+    return rawBody;
+  }
+  return undefined;
+}
+
+/** True when the PostgREST builder carries a mutation body (for `insert(...)`, etc. in span descriptions). */
+function hasMutationBodyForDescription(rawBody: unknown, plainBody: Record<string, unknown>): boolean {
+  return getMutationBodyPayloadForTelemetry(rawBody, plainBody) !== undefined;
+}
+
+/**
+ * Reads a header off a PostgREST builder, regardless of whether it holds a plain object or a
+ * `Headers` instance. Lookup is case-insensitive because `Headers` lower-cases all of its keys.
+ * @param headers - The request headers
+ * @param name - The header name to look up
+ * @returns The header value, or `undefined` if it is not set
+ */
+export function getHeader(headers: PostgRESTHeaders | undefined, name: string): string | undefined {
+  if (!headers) {
+    return undefined;
+  }
+
+  if (typeof (headers as WebFetchHeaders).get === 'function') {
+    return (headers as WebFetchHeaders).get(name) ?? undefined;
+  }
+
+  const plainHeaders = headers as Record<string, string>;
+  const lowerCaseName = name.toLowerCase();
+  const key = Object.keys(plainHeaders).find(headerName => headerName.toLowerCase() === lowerCaseName);
+
+  return key !== undefined ? plainHeaders[key] : undefined;
+}
+
+/**
+ * Extracts the database operation type from the HTTP method and headers
+ * @param method - The HTTP method of the request
+ * @param headers - The request headers
+ * @returns The database operation type ('select', 'insert', 'upsert', 'update', or 'delete')
+ */
+export function extractOperation(method: string, headers: PostgRESTHeaders = {}): string {
+  switch (method) {
+    case 'GET':
+    case 'QUERY': {
+      return 'select';
+    }
+    case 'POST': {
+      if (getHeader(headers, 'Prefer')?.includes('resolution=')) {
+        return 'upsert';
+      } else {
+        return 'insert';
+      }
+    }
+    case 'PATCH': {
+      return 'update';
+    }
+    case 'DELETE': {
+      return 'delete';
+    }
+    default: {
+      return '<unknown-op>';
+    }
+  }
+}
+
+/**
+ * Translates Supabase filter parameters into readable method names for tracing
+ * @param key - The filter key from the URL search parameters
+ * @param query - The filter value from the URL search parameters
+ * @returns A string representation of the filter as a method call
+ */
+export function translateFiltersIntoMethods(key: string, query: string): string {
+  if (query === '' || query === '*') {
+    return 'select(*)';
+  }
+
+  if (key === 'select') {
+    return `select(${query})`;
+  }
+
+  if (key === 'or' || key.endsWith('.or')) {
+    return `${key}${query}`;
+  }
+
+  const [filter, ...value] = query.split('.');
+
+  let method;
+  // Handle optional `configPart` of the filter
+  if (filter?.startsWith('fts')) {
+    method = 'textSearch';
+  } else if (filter?.startsWith('plfts')) {
+    method = 'textSearch[plain]';
+  } else if (filter?.startsWith('phfts')) {
+    method = 'textSearch[phrase]';
+  } else if (filter?.startsWith('wfts')) {
+    method = 'textSearch[websearch]';
+  } else {
+    method = (filter && FILTER_MAPPINGS[filter as keyof typeof FILTER_MAPPINGS]) || 'filter';
+  }
+
+  return `${method}(${key}, ${value.join('.')})`;
+}
+
+function instrumentAuthOperation(operation: AuthOperationFn, isAdmin = false): AuthOperationFn {
+  return new Proxy(operation, {
+    apply(target, thisArg, argumentsList) {
+      const operationName = `auth${isAdmin ? '.admin' : ''}.${operation.name}`;
+
+      const client = getClient();
+      const name =
+        client && hasSpanStreamingEnabled(client)
+          ? // Usually, the operation name alone is not a valid span name according to conventions.
+            // However, for this span, we neither have a table, nor a namespace, since this is a Supabase-SDK
+            // operation that internally makes the respective request to the database.
+            // So I think we can interpret this as a "db.query.summary"-esque span name.
+            // Either way, it's definitely low-cardinality.
+            // see: https://conventions.sentry.dev/names/#db-queries
+            operationName
+          : // This name makes little sense semantically but preserving it for now to
+            // avoid a breaking change in the transaction path. Will be removed once we remove
+            // transactions.
+            `auth ${isAdmin ? '(admin) ' : ''}${operation.name}`;
+
+      // The span is ended by hand once the wrapped promise settles, so `startSpanManual` is used to keep
+      // `startSpan`'s automatic end from ending it a second time.
+      return startSpanManual(
+        {
+          name,
+          onlyIfParent: true,
+          attributes: {
+            [SENTRY_ORIGIN]: 'auto.db.supabase',
+            [SENTRY_OP]: DB,
+            [DB_SYSTEM_NAME]: 'postgresql',
+            [DB_OPERATION_NAME]: operationName,
+          },
+        },
+        span => {
+          return Reflect.apply(target, thisArg, argumentsList)
+            .then((res: unknown) => {
+              if (isObjectLike(res) && 'error' in res && res.error) {
+                span.setStatus({ code: SPAN_STATUS_ERROR });
+
+                captureException(res.error, {
+                  mechanism: {
+                    handled: false,
+                    type: 'auto.db.supabase.auth',
+                  },
+                });
+              } else {
+                span.setStatus({ code: SPAN_STATUS_OK });
+              }
+
+              span.end();
+              return res;
+            })
+            .catch((err: unknown) => {
+              span.setStatus({ code: SPAN_STATUS_ERROR });
+              span.end();
+
+              captureException(err, {
+                mechanism: {
+                  handled: false,
+                  type: 'auto.db.supabase.auth',
+                },
+              });
+
+              throw err;
+            })
+            .then(...argumentsList);
+        },
+      );
+    },
+  });
+}
+
+function instrumentSupabaseAuthClient(supabaseClientInstance: SupabaseClientInstance): void {
+  const auth = supabaseClientInstance.auth;
+
+  if (!auth || isInstrumented(supabaseClientInstance.auth)) {
+    return;
+  }
+
+  for (const operation of AUTH_OPERATIONS_TO_INSTRUMENT) {
+    const authOperation = auth[operation];
+
+    if (!authOperation) {
+      continue;
+    }
+
+    if (typeof supabaseClientInstance.auth[operation] === 'function') {
+      supabaseClientInstance.auth[operation] = instrumentAuthOperation(authOperation);
+    }
+  }
+
+  for (const operation of AUTH_ADMIN_OPERATIONS_TO_INSTRUMENT) {
+    const authOperation = auth.admin[operation];
+
+    if (!authOperation) {
+      continue;
+    }
+
+    if (typeof supabaseClientInstance.auth.admin[operation] === 'function') {
+      supabaseClientInstance.auth.admin[operation] = instrumentAuthOperation(authOperation, true);
+    }
+  }
+
+  markAsInstrumented(supabaseClientInstance.auth);
+}
+
+function instrumentSupabaseClientConstructor(SupabaseClient: unknown, _options: { sendOperationData?: boolean }): void {
+  if (isInstrumented((SupabaseClient as SupabaseClientConstructor).prototype.from)) {
+    return;
+  }
+
+  (SupabaseClient as SupabaseClientConstructor).prototype.from = new Proxy(
+    (SupabaseClient as SupabaseClientConstructor).prototype.from,
+    {
+      apply(target, thisArg, argumentsList) {
+        const rv = Reflect.apply(target, thisArg, argumentsList);
+        const PostgRESTQueryBuilder = (rv as PostgRESTQueryBuilder).constructor;
+
+        instrumentPostgRESTQueryBuilder(PostgRESTQueryBuilder as unknown as new () => PostgRESTQueryBuilder, _options);
+
+        return rv;
+      },
+    },
+  );
+
+  markAsInstrumented((SupabaseClient as SupabaseClientConstructor).prototype.from);
+}
+
+function instrumentPostgRESTFilterBuilder(
+  PostgRESTFilterBuilder: PostgRESTFilterBuilder['constructor'],
+  _options: { sendOperationData?: boolean },
+): void {
+  if (isInstrumented((PostgRESTFilterBuilder.prototype as unknown as PostgRESTProtoThenable).then)) {
+    return;
+  }
+
+  (PostgRESTFilterBuilder.prototype as unknown as PostgRESTProtoThenable).then = new Proxy(
+    (PostgRESTFilterBuilder.prototype as unknown as PostgRESTProtoThenable).then,
+    {
+      apply(target, thisArg, argumentsList) {
+        const operations = DB_OPERATIONS_TO_INSTRUMENT;
+        const typedThis = thisArg as PostgRESTFilterBuilder;
+        const operation = extractOperation(typedThis.method, typedThis.headers);
+
+        if (!operations.includes(operation)) {
+          return Reflect.apply(target, thisArg, argumentsList);
+        }
+
+        if (!typedThis?.url?.pathname || typeof typedThis.url.pathname !== 'string') {
+          return Reflect.apply(target, thisArg, argumentsList);
+        }
+
+        const pathParts = typedThis.url.pathname.split('/');
+        const table = pathParts.length > 0 ? pathParts[pathParts.length - 1] : '';
+
+        const queryItems: string[] = [];
+        for (const [key, value] of typedThis.url.searchParams.entries()) {
+          // It's possible to have multiple entries for the same key, eg. `id=eq.7&id=eq.3`,
+          // so we need to use array instead of object to collect them.
+          queryItems.push(translateFiltersIntoMethods(key, value));
+        }
+        const body: Record<string, unknown> = Object.create(null);
+        if (isPlainObject(typedThis.body)) {
+          for (const [key, value] of Object.entries(typedThis.body)) {
+            body[key] = value;
+          }
+        }
+
+        const client = getClient();
+        const shouldSendData =
+          _options.sendOperationData ?? client?.getDataCollectionOptions().databaseQueryData === true;
+        const bodyPayload = getMutationBodyPayloadForTelemetry(typedThis.body, body);
+
+        // Adding operation to the beginning of the description if it's not a `select` operation
+        // For example, it can be an `insert` or `update` operation but the query can be `select(...)`
+        // For `select` operations, we don't need repeat it in the description
+        const mutationPart =
+          operation === 'select'
+            ? ''
+            : `${operation}${hasMutationBodyForDescription(typedThis.body, body) ? '(...) ' : ''}`;
+        const queryPart = shouldSendData ? queryItems.join(' ') : queryItems.length > 0 ? '[redacted]' : '';
+        const descriptionMiddle = [mutationPart.trimEnd(), queryPart].filter(Boolean).join(' ');
+        const description = descriptionMiddle ? `${descriptionMiddle} from(${table})` : `from(${table})`;
+
+        const name =
+          client && hasSpanStreamingEnabled(client) ? `${operation}${table ? ` ${table}` : ''}` : description;
+
+        const attributes: Record<string, any> = {
+          'db.table': table,
+          'db.schema': typedThis.schema,
+          'db.url': typedThis.url.origin,
+          'db.sdk': getHeader(typedThis.headers, 'X-Client-Info'),
+          [DB_SYSTEM_NAME]: 'postgresql',
+          [DB_OPERATION_NAME]: operation,
+          [SENTRY_ORIGIN]: 'auto.db.supabase',
+          [SENTRY_OP]: DB,
+        };
+
+        if (queryItems.length && shouldSendData) {
+          attributes['db.query'] = queryItems;
+        }
+
+        if (bodyPayload !== undefined && shouldSendData) {
+          attributes['db.body'] = bodyPayload;
+        }
+
+        // Same as the auth wrapper above: the span is ended by hand, so avoid the automatic second end.
+        return startSpanManual(
+          {
+            name,
+            onlyIfParent: true,
+            attributes,
+          },
+          span => {
+            return (Reflect.apply(target, thisArg, []) as Promise<SupabaseResponse>)
+              .then(
+                (res: SupabaseResponse) => {
+                  if (span) {
+                    if (res && typeof res === 'object' && 'status' in res) {
+                      setHttpStatus(span, res.status || 500);
+                    }
+                    span.end();
+                  }
+
+                  if (res?.error) {
+                    const err = new Error(res.error.message) as SupabaseError;
+                    if (res.error.code) {
+                      err.code = res.error.code;
+                    }
+                    if (res.error.details) {
+                      err.details = res.error.details;
+                    }
+
+                    const supabaseContext: Record<string, any> = {};
+                    if (queryItems.length && shouldSendData) {
+                      supabaseContext.query = queryItems;
+                    }
+                    if (bodyPayload !== undefined && shouldSendData) {
+                      supabaseContext.body = bodyPayload;
+                    }
+
+                    captureException(err, scope => {
+                      scope.addEventProcessor(e => {
+                        addExceptionMechanism(e, {
+                          handled: false,
+                          type: 'auto.db.supabase.postgres',
+                        });
+
+                        return e;
+                      });
+
+                      scope.setContext('supabase', supabaseContext);
+
+                      return scope;
+                    });
+                  }
+
+                  const breadcrumb: SupabaseBreadcrumb = {
+                    type: 'supabase',
+                    category: `db.${operation}`,
+                    message: description,
+                  };
+
+                  const data: Record<string, unknown> = {};
+
+                  if (queryItems.length && shouldSendData) {
+                    data.query = queryItems;
+                  }
+
+                  if (bodyPayload !== undefined && shouldSendData) {
+                    data.body = bodyPayload;
+                  }
+
+                  if (Object.keys(data).length) {
+                    breadcrumb.data = data;
+                  }
+
+                  addBreadcrumb(breadcrumb);
+
+                  return res;
+                },
+                (err: Error) => {
+                  // TODO: shouldn't we capture this error?
+                  if (span) {
+                    setHttpStatus(span, 500);
+                    span.end();
+                  }
+                  throw err;
+                },
+              )
+              .then(...argumentsList);
+          },
+        );
+      },
+    },
+  );
+
+  markAsInstrumented((PostgRESTFilterBuilder.prototype as unknown as PostgRESTProtoThenable).then);
+}
+
+function instrumentPostgRESTQueryBuilder(
+  PostgRESTQueryBuilder: new () => PostgRESTQueryBuilder,
+  _options: { sendOperationData?: boolean },
+): void {
+  // We need to wrap _all_ operations despite them sharing the same `PostgRESTFilterBuilder`
+  // constructor, as we don't know which method will be called first, and we don't want to miss any calls.
+  for (const operation of DB_OPERATIONS_TO_INSTRUMENT) {
+    if (isInstrumented((PostgRESTQueryBuilder.prototype as Record<string, any>)[operation])) {
+      continue;
+    }
+
+    type PostgRESTOperation = keyof Pick<PostgRESTQueryBuilder, 'select' | 'insert' | 'upsert' | 'update' | 'delete'>;
+    (PostgRESTQueryBuilder.prototype as Record<string, any>)[operation as PostgRESTOperation] = new Proxy(
+      (PostgRESTQueryBuilder.prototype as Record<string, any>)[operation as PostgRESTOperation],
+      {
+        apply(target, thisArg, argumentsList) {
+          const rv = Reflect.apply(target, thisArg, argumentsList);
+          const PostgRESTFilterBuilder = (rv as PostgRESTFilterBuilder).constructor;
+
+          DEBUG_BUILD && debug.log(`Instrumenting ${operation} operation's PostgRESTFilterBuilder`);
+
+          instrumentPostgRESTFilterBuilder(PostgRESTFilterBuilder, _options);
+
+          return rv;
+        },
+      },
+    );
+
+    markAsInstrumented((PostgRESTQueryBuilder.prototype as Record<string, any>)[operation]);
+  }
+}
+
+export const instrumentSupabaseClient = (
+  supabaseClient: unknown,
+  options: { sendOperationData?: boolean } = {},
+): void => {
+  if (!supabaseClient) {
+    DEBUG_BUILD && debug.warn('Supabase integration was not installed because no Supabase client was provided.');
+    return;
+  }
+  const SupabaseClientConstructor =
+    supabaseClient.constructor === Function ? supabaseClient : supabaseClient.constructor;
+
+  instrumentSupabaseClientConstructor(SupabaseClientConstructor, options);
+  instrumentSupabaseAuthClient(supabaseClient as SupabaseClientInstance);
+};
+
+interface SupabaseIntegrationOptions {
+  supabaseClient: any;
+  /**
+   * Whether to attach PostgREST query filters and mutation body payloads
+   * to Sentry telemetry.
+   *
+   * Falls back to `dataCollection.databaseQueryData` when not set.
+   * @default undefined
+   */
+  sendOperationData?: boolean;
+}
+
+const INTEGRATION_NAME = 'Supabase' as const;
+
+const _supabaseIntegration = ((supabaseClient: unknown, options: { sendOperationData?: boolean }) => {
+  return {
+    setupOnce() {
+      instrumentSupabaseClient(supabaseClient, options);
+    },
+    name: INTEGRATION_NAME,
+  };
+}) satisfies IntegrationFn;
+
+export const supabaseIntegration = defineIntegration((options: SupabaseIntegrationOptions) => {
+  return _supabaseIntegration(options.supabaseClient, { sendOperationData: options.sendOperationData });
+}) satisfies IntegrationFn;
