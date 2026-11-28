@@ -1,0 +1,505 @@
+import { SENTRY_ORIGIN } from '@sentry/conventions/attributes';
+import * as sentryCore from '@sentry/core';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { instrumentDurableObjectStorage } from '../src/instrumentations/instrumentDurableObjectStorage';
+import * as traceLinks from '../src/utils/traceLinks';
+import { initTestClient, resetSdk } from './testUtils';
+
+vi.mock('../src/utils/traceLinks', async importOriginal => {
+  const actual = await importOriginal<typeof traceLinks>();
+  return {
+    ...actual,
+    storeSpanContext: vi.fn().mockResolvedValue(undefined),
+  };
+});
+
+describe('instrumentDurableObjectStorage', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    resetSdk();
+  });
+
+  describe('get', () => {
+    it('instruments get with single key', async () => {
+      const startSpanSpy = vi.spyOn(sentryCore, 'startSpan');
+      const mockStorage = createMockStorage();
+      const instrumented = instrumentDurableObjectStorage(mockStorage);
+
+      await instrumented.get('myKey');
+
+      expect(startSpanSpy).toHaveBeenCalledWith(
+        {
+          name: 'durable_object_storage_get',
+          attributes: {
+            'sentry.op': 'db',
+            [SENTRY_ORIGIN]: 'auto.db.cloudflare.durable_object',
+            'db.system.name': 'cloudflare.durable_object.storage',
+            'db.operation.name': 'get',
+          },
+        },
+        expect.any(Function),
+      );
+    });
+
+    it('instruments get with array of keys', async () => {
+      const startSpanSpy = vi.spyOn(sentryCore, 'startSpan');
+      const mockStorage = createMockStorage();
+      const instrumented = instrumentDurableObjectStorage(mockStorage);
+
+      await instrumented.get(['key1', 'key2', 'key3']);
+
+      expect(startSpanSpy).toHaveBeenCalledWith(
+        {
+          name: 'durable_object_storage_get',
+          attributes: {
+            'sentry.op': 'db',
+            [SENTRY_ORIGIN]: 'auto.db.cloudflare.durable_object',
+            'db.system.name': 'cloudflare.durable_object.storage',
+            'db.operation.name': 'get',
+          },
+        },
+        expect.any(Function),
+      );
+    });
+  });
+
+  describe('put', () => {
+    it('instruments put with single key', async () => {
+      const startSpanSpy = vi.spyOn(sentryCore, 'startSpan');
+      const mockStorage = createMockStorage();
+      const instrumented = instrumentDurableObjectStorage(mockStorage);
+
+      await instrumented.put('myKey', 'myValue');
+
+      expect(startSpanSpy).toHaveBeenCalledWith(
+        {
+          name: 'durable_object_storage_put',
+          attributes: {
+            'sentry.op': 'db',
+            [SENTRY_ORIGIN]: 'auto.db.cloudflare.durable_object',
+            'db.system.name': 'cloudflare.durable_object.storage',
+            'db.operation.name': 'put',
+          },
+        },
+        expect.any(Function),
+      );
+    });
+
+    it('instruments put with object entries', async () => {
+      const startSpanSpy = vi.spyOn(sentryCore, 'startSpan');
+      const mockStorage = createMockStorage();
+      const instrumented = instrumentDurableObjectStorage(mockStorage);
+
+      await instrumented.put({ key1: 'val1', key2: 'val2' });
+
+      expect(startSpanSpy).toHaveBeenCalledWith(
+        {
+          name: 'durable_object_storage_put',
+          attributes: {
+            'sentry.op': 'db',
+            [SENTRY_ORIGIN]: 'auto.db.cloudflare.durable_object',
+            'db.system.name': 'cloudflare.durable_object.storage',
+            'db.operation.name': 'put',
+          },
+        },
+        expect.any(Function),
+      );
+    });
+  });
+
+  describe('delete', () => {
+    it('instruments delete with single key', async () => {
+      const startSpanSpy = vi.spyOn(sentryCore, 'startSpan');
+      const mockStorage = createMockStorage();
+      const instrumented = instrumentDurableObjectStorage(mockStorage);
+
+      await instrumented.delete('myKey');
+
+      expect(startSpanSpy).toHaveBeenCalledWith(
+        {
+          name: 'durable_object_storage_delete',
+          attributes: {
+            'sentry.op': 'db',
+            [SENTRY_ORIGIN]: 'auto.db.cloudflare.durable_object',
+            'db.system.name': 'cloudflare.durable_object.storage',
+            'db.operation.name': 'delete',
+          },
+        },
+        expect.any(Function),
+      );
+    });
+
+    it('instruments delete with array of keys', async () => {
+      const startSpanSpy = vi.spyOn(sentryCore, 'startSpan');
+      const mockStorage = createMockStorage();
+      const instrumented = instrumentDurableObjectStorage(mockStorage);
+
+      await instrumented.delete(['key1', 'key2']);
+
+      expect(startSpanSpy).toHaveBeenCalledWith(
+        {
+          name: 'durable_object_storage_delete',
+          attributes: {
+            'sentry.op': 'db',
+            [SENTRY_ORIGIN]: 'auto.db.cloudflare.durable_object',
+            'db.system.name': 'cloudflare.durable_object.storage',
+            'db.operation.name': 'delete',
+          },
+        },
+        expect.any(Function),
+      );
+    });
+  });
+
+  describe('list', () => {
+    it('instruments list', async () => {
+      const startSpanSpy = vi.spyOn(sentryCore, 'startSpan');
+      const mockStorage = createMockStorage();
+      const instrumented = instrumentDurableObjectStorage(mockStorage);
+
+      await instrumented.list();
+
+      expect(startSpanSpy).toHaveBeenCalledWith(
+        {
+          name: 'durable_object_storage_list',
+          attributes: {
+            'sentry.op': 'db',
+            [SENTRY_ORIGIN]: 'auto.db.cloudflare.durable_object',
+            'db.system.name': 'cloudflare.durable_object.storage',
+            'db.operation.name': 'list',
+          },
+        },
+        expect.any(Function),
+      );
+    });
+  });
+
+  describe('alarm methods', () => {
+    it('instruments setAlarm', async () => {
+      const startSpanSpy = vi.spyOn(sentryCore, 'startSpan');
+      const mockStorage = createMockStorage();
+      const instrumented = instrumentDurableObjectStorage(mockStorage);
+
+      await instrumented.setAlarm(Date.now() + 1000);
+
+      expect(startSpanSpy).toHaveBeenCalledWith(
+        {
+          name: 'durable_object_storage_setAlarm',
+          attributes: {
+            'sentry.op': 'db',
+            [SENTRY_ORIGIN]: 'auto.db.cloudflare.durable_object',
+            'db.system.name': 'cloudflare.durable_object.storage',
+            'db.operation.name': 'setAlarm',
+          },
+        },
+        expect.any(Function),
+      );
+    });
+
+    it('stores span context when setAlarm is called', async () => {
+      const mockStorage = createMockStorage();
+      const waitUntil = vi.fn();
+      const instrumented = instrumentDurableObjectStorage(mockStorage, waitUntil);
+
+      await instrumented.setAlarm(Date.now() + 1000);
+
+      expect(waitUntil).toHaveBeenCalledTimes(1);
+      expect(traceLinks.storeSpanContext).toHaveBeenCalledWith(mockStorage, 'alarm');
+    });
+
+    it('calls teardown after promise resolves', async () => {
+      const callOrder: string[] = [];
+      let resolveStorage: () => void;
+      const storagePromise = new Promise<void>(resolve => {
+        resolveStorage = resolve;
+      });
+
+      const mockStorage = createMockStorage();
+      mockStorage.setAlarm = vi.fn().mockImplementation(() => {
+        callOrder.push('setAlarm started');
+        return storagePromise.then(() => {
+          callOrder.push('setAlarm resolved');
+        });
+      });
+
+      const waitUntil = vi.fn().mockImplementation(() => {
+        callOrder.push('waitUntil called');
+      });
+
+      const instrumented = instrumentDurableObjectStorage(mockStorage, waitUntil);
+      const resultPromise = instrumented.setAlarm(Date.now() + 1000);
+
+      expect(waitUntil).not.toHaveBeenCalled();
+      expect(callOrder).toEqual(['setAlarm started']);
+
+      resolveStorage!();
+      await resultPromise;
+
+      expect(waitUntil).toHaveBeenCalledTimes(1);
+      expect(callOrder).toEqual(['setAlarm started', 'setAlarm resolved', 'waitUntil called']);
+    });
+
+    it('calls teardown immediately for sync results', () => {
+      const callOrder: string[] = [];
+
+      const mockStorage = createMockStorage();
+      mockStorage.setAlarm = vi.fn().mockImplementation(() => {
+        callOrder.push('setAlarm executed');
+        return undefined;
+      });
+
+      const waitUntil = vi.fn().mockImplementation(() => {
+        callOrder.push('waitUntil called');
+      });
+
+      const instrumented = instrumentDurableObjectStorage(mockStorage, waitUntil);
+      instrumented.setAlarm(Date.now() + 1000);
+
+      expect(waitUntil).toHaveBeenCalledTimes(1);
+      expect(callOrder).toEqual(['setAlarm executed', 'waitUntil called']);
+    });
+
+    it('instruments getAlarm', async () => {
+      const startSpanSpy = vi.spyOn(sentryCore, 'startSpan');
+      const mockStorage = createMockStorage();
+      const instrumented = instrumentDurableObjectStorage(mockStorage);
+
+      await instrumented.getAlarm();
+
+      expect(startSpanSpy).toHaveBeenCalledWith(
+        {
+          name: 'durable_object_storage_getAlarm',
+          attributes: {
+            'sentry.op': 'db',
+            [SENTRY_ORIGIN]: 'auto.db.cloudflare.durable_object',
+            'db.system.name': 'cloudflare.durable_object.storage',
+            'db.operation.name': 'getAlarm',
+          },
+        },
+        expect.any(Function),
+      );
+    });
+
+    it('instruments deleteAlarm', async () => {
+      const startSpanSpy = vi.spyOn(sentryCore, 'startSpan');
+      const mockStorage = createMockStorage();
+      const instrumented = instrumentDurableObjectStorage(mockStorage);
+
+      await instrumented.deleteAlarm();
+
+      expect(startSpanSpy).toHaveBeenCalledWith(
+        {
+          name: 'durable_object_storage_deleteAlarm',
+          attributes: {
+            'sentry.op': 'db',
+            [SENTRY_ORIGIN]: 'auto.db.cloudflare.durable_object',
+            'db.system.name': 'cloudflare.durable_object.storage',
+            'db.operation.name': 'deleteAlarm',
+          },
+        },
+        expect.any(Function),
+      );
+    });
+  });
+
+  it('instruments sql exec', () => {
+    initTestClient({ tracesSampleRate: 1 });
+    const startSpanSpy = vi.spyOn(sentryCore, 'startSpan');
+    const mockStorage = createMockStorage();
+    const instrumented = instrumentDurableObjectStorage(mockStorage);
+
+    instrumented.sql.exec('SELECT 1');
+
+    expect(startSpanSpy).toHaveBeenCalledWith(
+      {
+        name: 'SELECT',
+        attributes: {
+          'sentry.op': 'db.query',
+          [SENTRY_ORIGIN]: 'auto.db.cloudflare.durable_object_sql',
+          'db.system.name': 'cloudflare-durable-object-sql',
+          'db.operation.name': 'exec',
+          'db.query.text': 'SELECT ?',
+          'db.query.summary': 'SELECT',
+          'cloudflare.durable_object.query.bindings': 0,
+        },
+      },
+      expect.any(Function),
+    );
+  });
+
+  describe('framework-internal KV keys', () => {
+    it('does not create a span for a cf_-prefixed get', async () => {
+      const startSpanSpy = vi.spyOn(sentryCore, 'startSpan');
+      const instrumented = instrumentDurableObjectStorage(createMockStorage());
+
+      await instrumented.get('cf_agents_state');
+
+      expect(startSpanSpy).not.toHaveBeenCalled();
+    });
+
+    it('does not create a span for a __ps_-prefixed get', async () => {
+      const startSpanSpy = vi.spyOn(sentryCore, 'startSpan');
+      const instrumented = instrumentDurableObjectStorage(createMockStorage());
+
+      await instrumented.get('__ps_name');
+
+      expect(startSpanSpy).not.toHaveBeenCalled();
+    });
+
+    it('does not create a span for cf:-prefixed chat-recovery keys', async () => {
+      const startSpanSpy = vi.spyOn(sentryCore, 'startSpan');
+      const instrumented = instrumentDurableObjectStorage(createMockStorage());
+
+      await instrumented.put('cf:chat-recovery:progress', 1);
+      await instrumented.get('cf:chat-recovery:incident:abc');
+      await instrumented.list({ prefix: 'cf:chat-recovery:incident:' });
+
+      expect(startSpanSpy).not.toHaveBeenCalled();
+    });
+
+    it('does not create a span for a cf_-prefixed put with object entries', async () => {
+      const startSpanSpy = vi.spyOn(sentryCore, 'startSpan');
+      const instrumented = instrumentDurableObjectStorage(createMockStorage());
+
+      await instrumented.put({ cf_agents_a: 1, cf_agents_b: 2 });
+
+      expect(startSpanSpy).not.toHaveBeenCalled();
+    });
+
+    it('does not create a span for a cf_-prefixed delete with an array of keys', async () => {
+      const startSpanSpy = vi.spyOn(sentryCore, 'startSpan');
+      const instrumented = instrumentDurableObjectStorage(createMockStorage());
+
+      await instrumented.delete(['cf_agents_a', 'cf_agents_b']);
+
+      expect(startSpanSpy).not.toHaveBeenCalled();
+    });
+
+    it('does not create a span for a list with a cf_ prefix', async () => {
+      const startSpanSpy = vi.spyOn(sentryCore, 'startSpan');
+      const instrumented = instrumentDurableObjectStorage(createMockStorage());
+
+      await instrumented.list({ prefix: 'cf_agents_' });
+
+      expect(startSpanSpy).not.toHaveBeenCalled();
+    });
+
+    it('still creates a span when a batch mixes framework and user keys', async () => {
+      const startSpanSpy = vi.spyOn(sentryCore, 'startSpan');
+      const instrumented = instrumentDurableObjectStorage(createMockStorage());
+
+      await instrumented.get(['cf_agents_state', 'myKey']);
+
+      expect(startSpanSpy).toHaveBeenCalled();
+    });
+
+    it('still creates a span for a list without a prefix', async () => {
+      const startSpanSpy = vi.spyOn(sentryCore, 'startSpan');
+      const instrumented = instrumentDurableObjectStorage(createMockStorage());
+
+      await instrumented.list();
+
+      expect(startSpanSpy).toHaveBeenCalled();
+    });
+
+    it('still creates a span for a user key', async () => {
+      const startSpanSpy = vi.spyOn(sentryCore, 'startSpan');
+      const instrumented = instrumentDurableObjectStorage(createMockStorage());
+
+      await instrumented.get('myKey');
+
+      expect(startSpanSpy).toHaveBeenCalled();
+    });
+  });
+
+  describe('non-instrumented methods', () => {
+    it('does not instrument deleteAll, sync, transaction', async () => {
+      const startSpanSpy = vi.spyOn(sentryCore, 'startSpan');
+      const mockStorage = createMockStorage();
+      const instrumented = instrumentDurableObjectStorage(mockStorage);
+
+      await instrumented.deleteAll();
+      await instrumented.sync();
+      await instrumented.transaction(async txn => txn);
+
+      expect(startSpanSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('sync KV instrumentation', () => {
+    it('instruments the kv property with a proxy', () => {
+      const startSpanSpy = vi.spyOn(sentryCore, 'startSpan');
+      const mockStorage = createMockStorage();
+      const instrumented = instrumentDurableObjectStorage(mockStorage);
+
+      instrumented.kv.get('myKey');
+
+      expect(startSpanSpy).toHaveBeenCalledWith(
+        {
+          name: 'durable_object_storage_kv_get',
+          attributes: {
+            'sentry.op': 'db',
+            [SENTRY_ORIGIN]: 'auto.db.cloudflare.durable_object',
+            'db.system.name': 'cloudflare-durable-object-sql',
+            'db.operation.name': 'get',
+          },
+        },
+        expect.any(Function),
+      );
+    });
+  });
+
+  describe('native getter preservation', () => {
+    it('preserves native getter `this` binding through the proxy', () => {
+      // Private fields simulate workerd's native brand check —
+      // accessing #sqlInstance on wrong `this` throws TypeError,
+      // like workerd's "Illegal invocation".
+      class BrandCheckedStorage {
+        #sqlInstance = { exec: () => {} };
+        get sql() {
+          return this.#sqlInstance;
+        }
+      }
+
+      const storage = new BrandCheckedStorage();
+      const instrumented = instrumentDurableObjectStorage(storage as any);
+
+      expect(() => (instrumented as any).sql).not.toThrow();
+    });
+  });
+
+  describe('error handling', () => {
+    it('propagates errors from storage operations', async () => {
+      const mockStorage = createMockStorage();
+      mockStorage.get = vi.fn().mockRejectedValue(new Error('Storage error'));
+      const instrumented = instrumentDurableObjectStorage(mockStorage);
+
+      await expect(instrumented.get('myKey')).rejects.toThrow('Storage error');
+    });
+  });
+});
+
+function createMockStorage(): any {
+  return {
+    get: vi.fn().mockResolvedValue(undefined),
+    put: vi.fn().mockResolvedValue(undefined),
+    delete: vi.fn().mockResolvedValue(false),
+    list: vi.fn().mockResolvedValue(new Map()),
+    getAlarm: vi.fn().mockResolvedValue(null),
+    setAlarm: vi.fn().mockResolvedValue(undefined),
+    deleteAlarm: vi.fn().mockResolvedValue(undefined),
+    deleteAll: vi.fn().mockResolvedValue(undefined),
+    sync: vi.fn().mockResolvedValue(undefined),
+    transaction: vi.fn().mockImplementation(async (cb: () => unknown) => cb()),
+    sql: {
+      exec: vi.fn().mockReturnValue({ rowsRead: 0, rowsWritten: 0, toArray: () => [] }),
+      databaseSize: 0,
+    },
+    kv: {
+      get: vi.fn().mockReturnValue(undefined),
+      put: vi.fn().mockReturnValue(undefined),
+      delete: vi.fn().mockReturnValue(false),
+      list: vi.fn().mockReturnValue([]),
+    },
+  };
+}

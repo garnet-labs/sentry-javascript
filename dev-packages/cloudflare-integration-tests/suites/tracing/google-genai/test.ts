@@ -1,0 +1,175 @@
+import { expect, it } from 'vitest';
+import type { SerializedStreamedSpan } from '@sentry/core';
+import {
+  GEN_AI_EMBEDDINGS_INPUT,
+  GEN_AI_INPUT_MESSAGES,
+  GEN_AI_OPERATION_NAME,
+  GEN_AI_OUTPUT_MESSAGES,
+  GEN_AI_PROVIDER_NAME,
+  GEN_AI_REQUEST_FREQUENCY_PENALTY,
+  GEN_AI_REQUEST_MAX_TOKENS,
+  GEN_AI_REQUEST_MODEL,
+  GEN_AI_REQUEST_PRESENCE_PENALTY,
+  GEN_AI_REQUEST_TEMPERATURE,
+  GEN_AI_REQUEST_TOP_K,
+  GEN_AI_REQUEST_TOP_P,
+  GEN_AI_RESPONSE_TEXT,
+  GEN_AI_SYSTEM_INSTRUCTIONS,
+  GEN_AI_TOOL_DEFINITIONS,
+  GEN_AI_USAGE_INPUT_TOKENS,
+  GEN_AI_USAGE_OUTPUT_TOKENS,
+  GEN_AI_USAGE_TOTAL_TOKENS,
+  SENTRY_SDK_NAME,
+  SENTRY_SDK_VERSION,
+  SENTRY_SEGMENT_ID,
+  SENTRY_SEGMENT_NAME,
+  SENTRY_TRACE_LIFECYCLE,
+  SENTRY_ENVIRONMENT,
+} from '@sentry/conventions/attributes';
+import { SDK_VERSION } from '@sentry/core';
+import { createRunner } from '../../../runner';
+import { getSpanOp, getSpansFromEnvelope } from '../../../spanUtils';
+
+// This test runs the `@google/genai` SDK on the Workers runtime (with a
+// canned global fetch) to verify the instrumentation works end-to-end on
+// Cloudflare, not just against a hand-written mock client.
+
+it('traces Google GenAI chat, generateContent, and embedContent calls', async ({ signal }) => {
+  const runner = createRunner(__dirname)
+    .ignore('event')
+    .expect(envelope => {
+      const spans = getSpansFromEnvelope(envelope);
+      const segmentSpan = spans.find(span => span.is_segment);
+      expect(segmentSpan?.name).toBe('GET /');
+
+      const genAiSpans = spans.filter(span => getSpanOp(span)?.startsWith('gen_ai.'));
+      expect(genAiSpans).toHaveLength(3);
+
+      const byName = (name: string): SerializedStreamedSpan =>
+        genAiSpans.find(span => span.name === name) as SerializedStreamedSpan;
+
+      expect(byName('chat gemini-1.5-pro')).toEqual({
+        trace_id: expect.any(String),
+        span_id: expect.any(String),
+        parent_span_id: expect.any(String),
+        name: 'chat gemini-1.5-pro',
+        start_timestamp: expect.any(Number),
+        end_timestamp: expect.any(Number),
+        status: 'ok',
+        is_segment: false,
+        attributes: {
+          'sentry.origin': { value: 'auto.ai.google_genai', type: 'string' },
+          'sentry.op': { value: 'gen_ai.chat', type: 'string' },
+          [GEN_AI_PROVIDER_NAME]: { value: 'google_genai', type: 'string' },
+          [GEN_AI_OPERATION_NAME]: { value: 'chat', type: 'string' },
+          [GEN_AI_REQUEST_MODEL]: { value: 'gemini-1.5-pro', type: 'string' },
+          // Set once on `chats.create()` and reused for every message the chat sends.
+          [GEN_AI_REQUEST_TEMPERATURE]: { value: 0.8, type: 'double' },
+          [GEN_AI_REQUEST_TOP_P]: { value: 0.9, type: 'double' },
+          [GEN_AI_REQUEST_TOP_K]: { value: 40, type: 'integer' },
+          [GEN_AI_REQUEST_MAX_TOKENS]: { value: 150, type: 'integer' },
+          [GEN_AI_REQUEST_FREQUENCY_PENALTY]: { value: 0.5, type: 'double' },
+          [GEN_AI_REQUEST_PRESENCE_PENALTY]: { value: 0.3, type: 'double' },
+          [GEN_AI_TOOL_DEFINITIONS]: {
+            value:
+              '[{"name":"controlLight","parametersJsonSchema":{"type":"object","properties":{"brightness":{"type":"number"},"colorTemperature":{"type":"string"}},"required":["brightness","colorTemperature"]}}]',
+            type: 'string',
+          },
+          // collect LLM input and outputs (default true)
+          [GEN_AI_SYSTEM_INSTRUCTIONS]: {
+            value: '[{"type":"text","content":"You are a friendly robot."}]',
+            type: 'string',
+          },
+          // The create `history` stays off the span; only the message being sent is reported.
+          [GEN_AI_INPUT_MESSAGES]: {
+            value: '[{"role":"user","parts":[{"type":"text","content":"Tell me a joke"}]}]',
+            type: 'string',
+          },
+          [GEN_AI_OUTPUT_MESSAGES]: {
+            value: '[{"role":"assistant","parts":[{"type":"text","content":"Hello from Google GenAI!"}]}]',
+            type: 'string',
+          },
+          [GEN_AI_RESPONSE_TEXT]: { value: 'Hello from Google GenAI!', type: 'string' },
+          [GEN_AI_USAGE_INPUT_TOKENS]: { value: 8, type: 'integer' },
+          [GEN_AI_USAGE_OUTPUT_TOKENS]: { value: 12, type: 'integer' },
+          [GEN_AI_USAGE_TOTAL_TOKENS]: { value: 20, type: 'integer' },
+          'sentry.is_localhost': { value: true, type: 'boolean' },
+          [SENTRY_TRACE_LIFECYCLE]: { value: 'stream', type: 'string' },
+          [SENTRY_SEGMENT_NAME]: { value: segmentSpan!.name, type: 'string' },
+          [SENTRY_SEGMENT_ID]: { value: segmentSpan!.span_id, type: 'string' },
+          [SENTRY_SDK_NAME]: { value: 'sentry.javascript.cloudflare', type: 'string' },
+          [SENTRY_SDK_VERSION]: { value: SDK_VERSION, type: 'string' },
+          [SENTRY_ENVIRONMENT]: { value: 'production', type: 'string' },
+        },
+      });
+
+      expect(byName('generate_content gemini-1.5-flash')).toEqual({
+        trace_id: expect.any(String),
+        span_id: expect.any(String),
+        parent_span_id: expect.any(String),
+        name: 'generate_content gemini-1.5-flash',
+        start_timestamp: expect.any(Number),
+        end_timestamp: expect.any(Number),
+        status: 'ok',
+        is_segment: false,
+        attributes: {
+          'sentry.origin': { value: 'auto.ai.google_genai', type: 'string' },
+          'sentry.op': { value: 'gen_ai.generate_content', type: 'string' },
+          [GEN_AI_PROVIDER_NAME]: { value: 'google_genai', type: 'string' },
+          [GEN_AI_OPERATION_NAME]: { value: 'generate_content', type: 'string' },
+          [GEN_AI_REQUEST_MODEL]: { value: 'gemini-1.5-flash', type: 'string' },
+          [GEN_AI_REQUEST_TEMPERATURE]: { value: 0.7, type: 'double' },
+          [GEN_AI_REQUEST_TOP_P]: { value: 0.9, type: 'double' },
+          [GEN_AI_REQUEST_MAX_TOKENS]: { value: 100, type: 'integer' },
+          [GEN_AI_INPUT_MESSAGES]: {
+            value: '[{"role":"user","parts":[{"type":"text","content":"What is the capital of France?"}]}]',
+            type: 'string',
+          },
+          [GEN_AI_OUTPUT_MESSAGES]: {
+            value: '[{"role":"assistant","parts":[{"type":"text","content":"Hello from Google GenAI!"}]}]',
+            type: 'string',
+          },
+          [GEN_AI_USAGE_INPUT_TOKENS]: { value: 8, type: 'integer' },
+          [GEN_AI_USAGE_OUTPUT_TOKENS]: { value: 12, type: 'integer' },
+          [GEN_AI_USAGE_TOTAL_TOKENS]: { value: 20, type: 'integer' },
+          [GEN_AI_RESPONSE_TEXT]: { value: 'Hello from Google GenAI!', type: 'string' },
+          'sentry.is_localhost': { value: true, type: 'boolean' },
+          [SENTRY_TRACE_LIFECYCLE]: { value: 'stream', type: 'string' },
+          [SENTRY_SEGMENT_NAME]: { value: segmentSpan!.name, type: 'string' },
+          [SENTRY_SEGMENT_ID]: { value: segmentSpan!.span_id, type: 'string' },
+          [SENTRY_SDK_NAME]: { value: 'sentry.javascript.cloudflare', type: 'string' },
+          [SENTRY_SDK_VERSION]: { value: SDK_VERSION, type: 'string' },
+          [SENTRY_ENVIRONMENT]: { value: 'production', type: 'string' },
+        },
+      });
+
+      expect(byName('embeddings text-embedding-004')).toEqual({
+        trace_id: expect.any(String),
+        span_id: expect.any(String),
+        parent_span_id: expect.any(String),
+        name: 'embeddings text-embedding-004',
+        start_timestamp: expect.any(Number),
+        end_timestamp: expect.any(Number),
+        status: 'ok',
+        is_segment: false,
+        attributes: {
+          'sentry.origin': { value: 'auto.ai.google_genai', type: 'string' },
+          'sentry.op': { value: 'gen_ai.embeddings', type: 'string' },
+          [GEN_AI_PROVIDER_NAME]: { value: 'google_genai', type: 'string' },
+          [GEN_AI_OPERATION_NAME]: { value: 'embeddings', type: 'string' },
+          [GEN_AI_REQUEST_MODEL]: { value: 'text-embedding-004', type: 'string' },
+          [GEN_AI_EMBEDDINGS_INPUT]: { value: 'Hello world', type: 'string' },
+          'sentry.is_localhost': { value: true, type: 'boolean' },
+          [SENTRY_TRACE_LIFECYCLE]: { value: 'stream', type: 'string' },
+          [SENTRY_SEGMENT_NAME]: { value: segmentSpan!.name, type: 'string' },
+          [SENTRY_SEGMENT_ID]: { value: segmentSpan!.span_id, type: 'string' },
+          [SENTRY_SDK_NAME]: { value: 'sentry.javascript.cloudflare', type: 'string' },
+          [SENTRY_SDK_VERSION]: { value: SDK_VERSION, type: 'string' },
+          [SENTRY_ENVIRONMENT]: { value: 'production', type: 'string' },
+        },
+      });
+    })
+    .start(signal);
+  await runner.makeRequest('get', '/');
+  await runner.completed();
+});

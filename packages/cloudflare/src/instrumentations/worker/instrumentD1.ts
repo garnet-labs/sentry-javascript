@@ -1,0 +1,242 @@
+/* eslint-disable @typescript-eslint/unbound-method */
+import type { D1Database, D1DatabaseSession, D1PreparedStatement, D1Response } from '@cloudflare/workers-types';
+import {
+  SENTRY_OP,
+  SENTRY_ORIGIN,
+  CLOUDFLARE_D1_DURATION,
+  CLOUDFLARE_D1_ROWS_READ,
+  CLOUDFLARE_D1_ROWS_WRITTEN,
+  DB_OPERATION_BATCH_SIZE,
+  DB_OPERATION_NAME,
+  DB_QUERY_SUMMARY,
+  DB_QUERY_TEXT,
+  DB_SYSTEM_NAME,
+} from '@sentry/conventions/attributes';
+import { DB_QUERY } from '@sentry/conventions/op';
+import type { Span, SpanAttributes, StartSpanOptions } from '@sentry/core';
+import { addBreadcrumb, getClient, hasSpanStreamingEnabled, SPAN_STATUS_ERROR, startSpan } from '@sentry/core';
+import { getSqlQuerySummary, sanitizeSqlQuery } from '@sentry/server-utils';
+import { ensureInstrumented } from '../../instrument';
+
+// Patching is based on internal Cloudflare D1 API
+// https://github.com/cloudflare/workerd/blob/cd5279e7b305003f1d9c851e73efa9d67e4b68b2/src/cloudflare/internal/d1-api.ts
+
+const patchedStatement = new WeakSet<D1PreparedStatement>();
+
+/**
+ * Patches the query methods of a Cloudflare D1 prepared statement with Sentry.
+ */
+function instrumentD1PreparedStatementQueries(statement: D1PreparedStatement, query: string): D1PreparedStatement {
+  if (patchedStatement.has(statement)) {
+    return statement;
+  }
+
+  const queryText = query ? sanitizeSqlQuery(query) : undefined;
+
+  // eslint-disable-next-line @typescript-eslint/unbound-method
+  statement.first = new Proxy(statement.first, {
+    apply(target, thisArg, args: Parameters<typeof statement.first>) {
+      return startSpan(createStartSpanOptions(queryText, 'first'), async () => {
+        const res = await Reflect.apply(target, thisArg, args);
+        createD1Breadcrumb(queryText, 'first');
+        return res;
+      });
+    },
+  });
+
+  // eslint-disable-next-line @typescript-eslint/unbound-method
+  statement.run = new Proxy(statement.run, {
+    apply(target, thisArg, args: Parameters<typeof statement.run>) {
+      return startSpan(createStartSpanOptions(queryText, 'run'), async span => {
+        const d1Response = await Reflect.apply(target, thisArg, args);
+        applyD1ReturnObjectToSpan(span, d1Response);
+        createD1Breadcrumb(queryText, 'run', d1Response);
+        return d1Response;
+      });
+    },
+  });
+
+  // eslint-disable-next-line @typescript-eslint/unbound-method
+  statement.all = new Proxy(statement.all, {
+    apply(target, thisArg, args: Parameters<typeof statement.all>) {
+      return startSpan(createStartSpanOptions(queryText, 'all'), async span => {
+        const d1Result = await Reflect.apply(target, thisArg, args);
+        applyD1ReturnObjectToSpan(span, d1Result);
+        createD1Breadcrumb(queryText, 'all', d1Result);
+        return d1Result;
+      });
+    },
+  });
+
+  // eslint-disable-next-line @typescript-eslint/unbound-method
+  statement.raw = new Proxy(statement.raw, {
+    apply(target, thisArg, args: Parameters<typeof statement.raw>) {
+      return startSpan(createStartSpanOptions(queryText, 'raw'), async () => {
+        const res = await Reflect.apply(target, thisArg, args);
+        createD1Breadcrumb(queryText, 'raw');
+        return res;
+      });
+    },
+  });
+
+  patchedStatement.add(statement);
+
+  return statement;
+}
+
+/**
+ * Instruments a Cloudflare D1 prepared statement with Sentry.
+ *
+ * This is meant to be used as a top-level call, under the hood it calls `instrumentD1PreparedStatementQueries`
+ * to patch the query methods. The reason for this abstraction is to ensure that the `bind` method is also patched.
+ */
+function instrumentD1PreparedStatement(statement: D1PreparedStatement, query: string): D1PreparedStatement {
+  // statement.bind() returns a new instance of D1PreparedStatement, so we have to patch it as well.
+  // eslint-disable-next-line @typescript-eslint/unbound-method
+  statement.bind = new Proxy(statement.bind, {
+    apply(target, thisArg, args: Parameters<typeof statement.bind>) {
+      return instrumentD1PreparedStatementQueries(Reflect.apply(target, thisArg, args), query);
+    },
+  });
+
+  return instrumentD1PreparedStatementQueries(statement, query);
+}
+
+/**
+ * Add D1Response meta information to a span.
+ *
+ * See: https://developers.cloudflare.com/d1/build-with-d1/d1-client-api/#return-object
+ */
+function applyD1ReturnObjectToSpan(span: Span, d1Result: D1Response): void {
+  if (!d1Result.success) {
+    span.setStatus({ code: SPAN_STATUS_ERROR });
+  }
+
+  span.setAttributes(getAttributesFromD1Response(d1Result));
+}
+
+function getAttributesFromD1Response(d1Result: D1Response): SpanAttributes {
+  return {
+    [CLOUDFLARE_D1_DURATION]: d1Result.meta.duration,
+    [CLOUDFLARE_D1_ROWS_READ]: d1Result.meta.rows_read,
+    [CLOUDFLARE_D1_ROWS_WRITTEN]: d1Result.meta.rows_written,
+  };
+}
+
+type D1QueryType = 'first' | 'run' | 'all' | 'raw' | 'batch' | 'exec';
+
+/** The message is the span's query text (already sanitized) or a static label such as `D1 batch`. */
+function createD1Breadcrumb(message: string | undefined, type: D1QueryType, d1Result?: D1Response): void {
+  addBreadcrumb({
+    category: 'query',
+    message,
+    data: {
+      ...(d1Result ? getAttributesFromD1Response(d1Result) : {}),
+      [DB_OPERATION_NAME]: type,
+    },
+  });
+}
+
+function createStartSpanOptions(queryText: string | undefined, type: D1QueryType): StartSpanOptions {
+  const querySummary = queryText ? getSqlQuerySummary(queryText) : undefined;
+
+  const client = getClient();
+  const name =
+    client && hasSpanStreamingEnabled(client) ? querySummary || 'cloudflare-d1' : (queryText ?? 'cloudflare-d1');
+
+  return {
+    name,
+    attributes: {
+      [SENTRY_OP]: DB_QUERY,
+      [DB_SYSTEM_NAME]: 'cloudflare-d1',
+      [DB_OPERATION_NAME]: type,
+      [DB_QUERY_TEXT]: queryText,
+      [DB_QUERY_SUMMARY]: querySummary,
+      [SENTRY_ORIGIN]: 'auto.db.cloudflare.d1',
+    },
+  };
+}
+
+function instrumentPrepare(
+  prepare: D1Database['prepare'] | D1DatabaseSession['prepare'],
+): D1Database['prepare'] | D1DatabaseSession['prepare'] {
+  return new Proxy(prepare, {
+    apply(target, thisArg, args: Parameters<typeof prepare>) {
+      const [query] = args;
+      return instrumentD1PreparedStatement(Reflect.apply(target, thisArg, args), query);
+    },
+  });
+}
+
+function instrumentBatch(
+  batch: D1Database['batch'] | D1DatabaseSession['batch'],
+): D1Database['batch'] | D1DatabaseSession['batch'] {
+  return new Proxy(batch, {
+    apply(target, thisArg, args: Parameters<typeof batch>) {
+      const statements = args[0];
+      // D1PreparedStatement exposes a `statement` property at runtime, but it's not in @cloudflare/workers-types.
+      // https://github.com/cloudflare/workerd/blob/dc12d7650b4f5d4f9ba6a47aa45fad769cdf8db4/src/cloudflare/internal/d1-api.ts#L210
+      const queryText = statements
+        .map(statement => (statement as unknown as { statement?: string }).statement ?? '')
+        .filter(Boolean)
+        .map(statement => sanitizeSqlQuery(statement))
+        .join('\n');
+
+      return startSpan(
+        {
+          name: 'D1 batch',
+          attributes: {
+            [SENTRY_OP]: DB_QUERY,
+            [DB_SYSTEM_NAME]: 'cloudflare-d1',
+            [DB_OPERATION_NAME]: 'batch',
+            [DB_QUERY_TEXT]: queryText || undefined,
+            [DB_OPERATION_BATCH_SIZE]: statements.length,
+            [SENTRY_ORIGIN]: 'auto.db.cloudflare.d1',
+          },
+        },
+        async () => {
+          const res = await Reflect.apply(target, thisArg, args);
+          createD1Breadcrumb('D1 batch', 'batch');
+          return res;
+        },
+      );
+    },
+  });
+}
+
+function instrumentD1Session(session: D1DatabaseSession): D1DatabaseSession {
+  session.prepare = instrumentPrepare(session.prepare);
+  session.batch = instrumentBatch(session.batch);
+  return session;
+}
+
+function _instrumentD1(db: D1Database): D1Database {
+  db.prepare = instrumentPrepare(db.prepare);
+  db.batch = instrumentBatch(db.batch);
+
+  db.exec = new Proxy(db.exec, {
+    apply(target, thisArg, args: Parameters<typeof db.exec>) {
+      const [query] = args;
+      const queryText = query ? sanitizeSqlQuery(query) : undefined;
+      return startSpan(createStartSpanOptions(queryText, 'exec'), async () => {
+        const res = await Reflect.apply(target, thisArg, args);
+        createD1Breadcrumb(queryText, 'exec');
+        return res;
+      });
+    },
+  });
+
+  if ('withSession' in db && typeof db.withSession === 'function') {
+    db.withSession = new Proxy(db.withSession, {
+      apply(target, thisArg, args: [unknown]) {
+        return instrumentD1Session(Reflect.apply(target, thisArg, args) as D1DatabaseSession);
+      },
+    });
+  }
+
+  return db;
+}
+
+export function instrumentD1(db: D1Database): D1Database {
+  return ensureInstrumented(db, _instrumentD1);
+}

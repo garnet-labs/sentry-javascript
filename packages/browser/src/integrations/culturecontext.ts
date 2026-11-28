@@ -1,0 +1,72 @@
+import { CULTURE_CALENDAR, CULTURE_LOCALE, CULTURE_TIMEZONE } from '@sentry/conventions/attributes';
+import type { CultureContext, IntegrationFn } from '@sentry/core';
+import { defineIntegration, safeSetSpanJSONAttributes } from '@sentry/core';
+import { WINDOW } from '../helpers';
+
+const INTEGRATION_NAME = 'CultureContext' as const;
+
+const _cultureContextIntegration = (() => {
+  return {
+    name: INTEGRATION_NAME,
+    preprocessEvent(event) {
+      const culture = getCultureContext();
+
+      if (culture) {
+        event.contexts = {
+          ...event.contexts,
+          culture: { ...culture, ...event.contexts?.culture },
+        };
+      }
+    },
+    processSegmentSpan(span) {
+      const culture = getCultureContext();
+
+      if (culture) {
+        safeSetSpanJSONAttributes(span, {
+          [CULTURE_LOCALE]: culture.locale,
+          [CULTURE_TIMEZONE]: culture.timezone,
+          [CULTURE_CALENDAR]: culture.calendar,
+        });
+      }
+    },
+  };
+}) satisfies IntegrationFn;
+
+/**
+ * Captures culture context from the browser.
+ *
+ * Enabled by default.
+ *
+ * @example
+ * ```js
+ * import * as Sentry from '@sentry/browser';
+ *
+ * Sentry.init({
+ *   integrations: [Sentry.cultureContextIntegration()],
+ * });
+ * ```
+ */
+export const cultureContextIntegration = defineIntegration(_cultureContextIntegration);
+
+/**
+ * Returns the culture context from the browser's Intl API.
+ */
+function getCultureContext(): CultureContext | undefined {
+  try {
+    const intl = (WINDOW as { Intl?: typeof Intl }).Intl;
+    if (!intl) {
+      return undefined;
+    }
+
+    const options = intl.DateTimeFormat().resolvedOptions();
+
+    return {
+      locale: options.locale,
+      timezone: options.timeZone,
+      calendar: options.calendar,
+    };
+  } catch {
+    // Ignore errors
+    return undefined;
+  }
+}
